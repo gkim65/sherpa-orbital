@@ -26,15 +26,12 @@
 - [x] **Validation tests**: `test_period3_ic_closes`, `test_period3_ic_three_periapses`
 
 ### Plots (Session 2) — `scripts/` folder
-- [ ] `scripts/plot_orbit.py`: reusable plotting functions:
-      - 3D trajectory in rotating frame (x, y, z in km)
-      - x-z and x-y projections with Enceladus sphere drawn to scale
-      - Altitude vs time (show periapsis/apoapsis bounds as dashed lines)
-      - Period-3 closure check: overlay 3 successive revolutions to verify they stack
-- [ ] **Reproduce Exhibit B-21** (MacKenzie §B.2.3): three-panel figure matching the paper:
-      - Panel (a): x-z plane trajectory (CR3BP black, initial guess)
-      - Panel (b): x-y groundtrack with periapsis 20–70 km band highlighted in red/blue
-      - Panel (c): periapsis altitude vs elapsed days over 24 revolutions (~12 days)
+- [x] `scripts/plot_orbit.py`: three-panel figure (Session 4):
+      - Panel (a): X-Z trajectory, time-coloured, Enceladus to scale, R_Enc axes
+      - Panel (b): Y-Z view (from Saturn toward Enceladus) — shows 31-km periapsis
+        clearance above north pole; X-Y projection misleadingly passes through body
+      - Panel (c): periapsis altitude vs days, CR3BP (flat 31 km) vs CR3BP+J2 (escapes)
+      - Saves to `figures/exhibit_b21.png`
 - [ ] CR3BP vs CR3BP+J2 divergence plot over 30 days (position error km vs time)
 
 ## Phase 2 — Spacecraft Models
