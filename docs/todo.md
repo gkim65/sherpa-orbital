@@ -7,13 +7,35 @@
 - [x] `integrator.py`: RK45 wrapper with apoapsis/periapsis/altitude/crash event detection
 - [x] `cr3bp_j2.py`: Enceladus J2 perturbation added to truth model
 - [x] `orbital_elements.py`: physical ↔ non-dim CR3BP normalizer, Keplerian elements helper
-- [ ] **Differential correction** to find a true closed period-3 L1 halo orbit IC
-  - Target: x₀ ≈ [1.0-μ + δ, 0, z_amp, 0, ẏ₀, 0] with single-shooting corrector
-  - Confirm ~12-hour orbit period in physical units
-- [ ] Validation test: reproduce period-3 halo with periapsis 20–70 km, apoapsis >400 km
-- [ ] `test_cr3bp.py`: Jacobi conservation + period ballpark + J2 divergence (written, needs passing ICs)
-- [ ] Matplotlib plot: trajectory in rotating frame (x-z plane, multiple revolutions)
-- [ ] CR3BP vs CR3BP+J2 divergence plot over 30 days
+
+### Session 1 Audit (Session 2) ✅ verified (no code changed)
+- [x] **Code audit**: rotating frame convention, J2 formula, event direction flags — all correct
+- [x] **Numerical validation**: 69 tests pass, Jacobi drift 1.9e-13 over 30 days
+- [x] **Confirm J2 source**: J2=5.435e-3 and R_Enc=252.1 km confirmed (Iess 2014)
+- ⚠️  **L1/L2 values will shift**: constants updated to JPL DE440 in Session 3 — recheck
+      L1 ≈ L* × (1−μ−γ1) and L2 with new MU/LU if needed
+
+### Orbit Generation ✅ Session 3
+- [x] **`src/utils/halo_ic.py`**: nondim CR3BP EOM+STM, multi-crossing half-period
+      propagator, 2×2 Newton corrector, seed scan, Richardson approx, characterise_orbit
+- [x] **`src/constants.py`**: updated to JPL DE440 (LU=238529 km, TU=18913.28 s,
+      MU=1.9011097e-7) to match the periodic orbit catalog
+- [x] **Period-3 IC found**: `PERIOD3_IC_ND` in halo_ic.py — JPL catalog seed corrected
+      in our system. Periapsis 31 km ✓, apoapsis 1065 km ✓, period 36 hr ✓, 3 periapsis
+      passes per orbit ✓, south polar ✓. Closure 0.0017 km. 76 tests pass.
+- [x] **Validation tests**: `test_period3_ic_closes`, `test_period3_ic_three_periapses`
+
+### Plots (Session 2) — `scripts/` folder
+- [ ] `scripts/plot_orbit.py`: reusable plotting functions:
+      - 3D trajectory in rotating frame (x, y, z in km)
+      - x-z and x-y projections with Enceladus sphere drawn to scale
+      - Altitude vs time (show periapsis/apoapsis bounds as dashed lines)
+      - Period-3 closure check: overlay 3 successive revolutions to verify they stack
+- [ ] **Reproduce Exhibit B-21** (MacKenzie §B.2.3): three-panel figure matching the paper:
+      - Panel (a): x-z plane trajectory (CR3BP black, initial guess)
+      - Panel (b): x-y groundtrack with periapsis 20–70 km band highlighted in red/blue
+      - Panel (c): periapsis altitude vs elapsed days over 24 revolutions (~12 days)
+- [ ] CR3BP vs CR3BP+J2 divergence plot over 30 days (position error km vs time)
 
 ## Phase 2 — Spacecraft Models
 

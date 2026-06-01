@@ -49,9 +49,12 @@ class TestOrbitalGeometry:
 
 class TestDerivedConstants:
     def test_omega_rad_s(self):
-        """OMEGA should equal sqrt(GM_total / a³) in rad/s."""
-        expected = math.sqrt((GM_SATURN + GM_ENCELADUS) / A_ENCELADUS**3)
-        assert abs(OMEGA - expected) / expected < 1e-12
+        """OMEGA = 1/TU_JPL matches sqrt(GM_total/a³) to within 0.1%."""
+        # OMEGA is now set directly from TU_JPL (18913.28 s) to be self-consistent
+        # with the JPL periodic orbit catalog, rather than derived from GM/a³.
+        # The two values agree to better than 0.1% (6e-4 relative error).
+        expected_from_kepler = math.sqrt((GM_SATURN + GM_ENCELADUS) / A_ENCELADUS**3)
+        assert abs(OMEGA - expected_from_kepler) / expected_from_kepler < 1e-3
 
     def test_omega_period_hours(self):
         """Orbital period 2π/OMEGA should be ≈ 32.9 hours (Enceladus orbit)."""
