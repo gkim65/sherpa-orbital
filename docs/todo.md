@@ -73,6 +73,14 @@
 
 ## Open Questions / Blockers
 
+- **Non-symmetric period-3 orbit** (MacKenzie panel (b) exact reproduction):
+  MacKenzie's 3 periapsis passes are ~120° apart in longitude because their orbit has
+  3 geometrically distinct 3D loops. Our CR3BP IC (from the period-tripling bifurcation)
+  is the *symmetric* degenerate case — all 3 loops identical, all passes co-located at
+  lat≈87°N. Enceladus is tidally locked so body-fixed = CR3BP frame; a frame rotation
+  does not help. Reproducing the MacKenzie panel requires a 6-variable multiple-shooting
+  corrector (no y=0 symmetry) seeded from the JPL ephemeris catalog. Future work.
+
 - Need a reliable halo orbit initial condition generator (differential corrector or
   existing dataset). Session 2 priority.
 - Stationkeeping event timing: Strategy 3 fires at "600-km altitude crossing".
