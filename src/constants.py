@@ -35,6 +35,15 @@ GM_SATURN: float    = _GM_TOTAL - GM_ENCELADUS  # km³/s²  (effective Saturn-sy
 R_ENCELADUS: float  = 252.1       # km  mean radius       (Iess et al. 2014)
 J2_ENCELADUS: float = 5.435e-3    # dimensionless          (Iess et al. 2014)
 
+# ── Saturn physical properties ────────────────────────────────────────────────
+# Used by the high-fidelity truth model only (cr3bp_saturn_j2.py). Saturn's
+# oblateness is the dominant non-point-mass perturbation in this system
+# (external review 2026-06-22); at Enceladus' orbital distance its J2
+# acceleration exceeds Enceladus' own J2 across most of the science orbit.
+# J2 is referenced to the equatorial radius R_SATURN.
+R_SATURN: float  = 60_268.0       # km  equatorial radius (1 bar)  (Jacobson et al. 2006, AJ 132:2520)
+J2_SATURN: float = 1.629071e-2    # dimensionless, normalized to R_SATURN (Jacobson et al. 2006, AJ 132:2520, SAT389 field)
+
 # ── Propulsion ────────────────────────────────────────────────────────────────
 THRUST_NOM: float = 22.0          # N   MR-106E monopropellant (MacKenzie 2020 §3.5)
 

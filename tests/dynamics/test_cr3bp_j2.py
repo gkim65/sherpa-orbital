@@ -106,3 +106,36 @@ class TestCR3BPJ2EOM:
         dstate_j2 = cr3bp_j2_eom(0.0, state_eq)
         # az should be the same when z=0
         assert abs(dstate_j2[5] - dstate_cr3bp[5]) < 1e-20
+
+
+class TestJ2SignPhysical:
+    """
+    Convention-free regression test for the J2 SIGN.
+
+    For an oblate body (equatorial bulge), the TOTAL gravity (monopole + J2) at a
+    fixed radius must be STRONGER at the equator than at the pole, because there
+    is extra mass in the equatorial plane. This is a physical fact independent of
+    any sign/potential convention, so it catches a global J2 sign flip that the
+    z-flip symmetry test cannot.
+    """
+
+    def _total_radial_accel(self, at_pole: bool, r_km: float = 500.0) -> float:
+        from src.dynamics.cr3bp import X_ENCELADUS
+        if at_pole:
+            p = np.array([X_ENCELADUS, 0.0, r_km])
+            rhat = np.array([0.0, 0.0, 1.0])
+        else:
+            p = np.array([X_ENCELADUS + r_km, 0.0, 0.0])
+            rhat = np.array([1.0, 0.0, 0.0])
+        mono = -GM_ENCELADUS / r_km**2 * rhat        # monopole, inward
+        a_total = mono + j2_acceleration(np.array([*p, 0, 0, 0]))
+        return float(np.dot(a_total, rhat))          # negative = inward
+
+    def test_equator_more_attractive_than_pole(self):
+        a_pole = self._total_radial_accel(at_pole=True)
+        a_eq = self._total_radial_accel(at_pole=False)
+        # More attractive = more negative radial accel at the equator.
+        assert a_eq < a_pole, (
+            f"Oblate body must pull harder at equator: "
+            f"a_eq={a_eq:.3e}, a_pole={a_pole:.3e} (J2 sign error?)"
+        )

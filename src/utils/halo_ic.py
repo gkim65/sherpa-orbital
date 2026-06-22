@@ -39,17 +39,25 @@ from src.constants import (
 from src.dynamics.cr3bp import cr3bp_eom, libration_points_x, jacobi_constant
 from src.dynamics.integrator import propagate, RTOL_ONBOARD, ATOL_ONBOARD
 
-# ── Verified period-3 southern L1 halo orbit IC ───────────────────────────────
+# ── Verified period-3 L1 halo orbit IC (southern-amplitude family) ────────────
 # Source: JPL Three-Body Periodic Orbits Catalog (DE440), corrected in our CR3BP.
-# MacKenzie et al. 2020 §B.2.3 science orbit — south polar, periapsis ~31 km altitude.
-# Converged to residual < 1e-12 using differential_corrector(n_crossings=2).
+# MacKenzie et al. 2020 §B.2.3 science orbit — periapsis ~31 km altitude,
+# apoapsis ~1065 km, period 35.99 hr, 3 periapsis passes per revolution.
+# Converged with differential_corrector(n_crossings=3).
 #
+# NOTE: the IC has z0<0 (southern out-of-plane amplitude), but the periapsis
+# (closest approach) of this symmetric period-3 bifurcation orbit falls at
+# ~+87° latitude (NORTH pole), not the south pole the mission targets. Placing
+# periapsis over the south pole requires the asymmetric 6-variable corrector
+# (Step A′, see docs/todo.md); this IC is the symmetric degenerate case.
+#
+# Closure over one full period (propagated, tolerance-independent): ~0.028 km.
 # Physical: x0=237911.1 km, z0=−1162.8 km, vy0=0.06895 km/s, T=35.99 hr
 # Nondim (our units: LU=238529.333 km, TU=18913.280 s):
 PERIOD3_IC_ND: np.ndarray = np.array([
     9.974083488926582e-01,   # x0 (nondim)
     0.0,                     # y0
-   -4.874948479304304e-03,   # z0 (nondim, negative = south polar)
+   -4.874948479304304e-03,   # z0 (nondim, negative = southern amplitude)
     0.0,                     # vx0
     5.466912598254453e-03,   # vy0 (nondim)
     0.0,                     # vz0
