@@ -158,25 +158,111 @@ def predict_apses(
     return peri_alt, apo_alt
 
 
+def predict_apse_states(
+    state0: np.ndarray,
+    n_revs: int,
+    period_s: float,
+    eom: Callable = cr3bp_eom,
+    rtol: float = RTOL_ONBOARD,
+    atol: float = ATOL_ONBOARD,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Predict the FIRST periapsis and apoapsis 6-states over ``n_revs`` revolutions.
+
+    Same propagation as ``predict_apses`` but returns the full Cartesian states
+    (not just altitudes) so the controller can bound the apse POSITION VECTORS —
+    MacKenzie et al. 2020 Strategy 3, which bounds |r_apse − r_apse,nominal|.
+
+    Returns
+    -------
+    peri_state, apo_state : np.ndarray, shape (6,)
+        First periapsis and first apoapsis state (km, km/s). An array of NaNs if
+        that apse is not reached within the horizon.
+    """
+    t_max = n_revs * period_s
+    peri_ev = make_periapsis_event(terminal=False)
+    apo_ev = make_apoapsis_event(terminal=False)
+    sol = propagate(
+        eom, state0, (0.0, t_max),
+        events=[peri_ev, apo_ev],
+        rtol=rtol, atol=atol,
+    )
+    nan6 = np.full(6, np.nan)
+    peri_state = sol.y_events[0][0] if len(sol.t_events[0]) > 0 else nan6
+    apo_state = sol.y_events[1][0] if len(sol.t_events[1]) > 0 else nan6
+    return peri_state, apo_state
+
+
+def nominal_apse_positions(
+    ref_ic: np.ndarray,
+    period_s: float,
+    eom: Callable = cr3bp_eom,
+    rtol: float = RTOL_ONBOARD,
+    atol: float = ATOL_ONBOARD,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Periapsis and apoapsis POSITION vectors of a nominal (reference) orbit.
+
+    Propagates the uncontrolled reference IC one revolution and records its first
+    periapsis/apoapsis positions. These are the r_apse,nominal targets for
+    MacKenzie Strategy 3 (apse-position bounding). Barycentre frame, km.
+
+    Returns
+    -------
+    r_peri_nom, r_apo_nom : np.ndarray, shape (3,)
+    """
+    peri_state, apo_state = predict_apse_states(
+        ref_ic, n_revs=1, period_s=period_s, eom=eom, rtol=rtol, atol=atol
+    )
+    return peri_state[:3].copy(), apo_state[:3].copy()
+
+
 def _apse_residual(
     state0: np.ndarray,
     dv: np.ndarray,
     n_revs: int,
     period_s: float,
     eom: Callable,
+    peri_target_km: float = PERIAPSIS_ALT_TARGET,
+    apo_target_km: float = APOAPSIS_ALT_TARGET,
+    mode: str = "altitude",
+    r_peri_nom: np.ndarray | None = None,
+    r_apo_nom: np.ndarray | None = None,
 ) -> np.ndarray:
     """
-    Residual r(ΔV) = [peri_alt - peri_target, apo_alt - apo_target] (km).
+    Residual r(ΔV) used by the Gauss-Newton burn solver.
+
+    Two targeting modes:
+
+    ``mode="altitude"`` (default — our original behaviour, MacKenzie-like
+        Strategy 1/2): 2-vector [peri_alt − peri_target, apo_alt − apo_target] (km).
+        ``peri_target_km`` / ``apo_target_km`` default to the MacKenzie period-3
+        halo bands; pass an orbit's own apse altitudes to hold that orbit.
+
+    ``mode="position"`` (MacKenzie Strategy 3 proper): 6-vector
+        [r_peri − r_peri_nom, r_apo − r_apo_nom] (km), bounding the full apse
+        POSITION VECTORS against the nominal orbit. ``r_peri_nom`` / ``r_apo_nom``
+        (3-vectors, barycentre frame) are required in this mode.
 
     The burn ΔV (km/s) is added to the velocity of ``state0`` and the apses are
-    predicted with the ONBOARD model. Used by the Gauss-Newton solver.
+    predicted with the ONBOARD model.
     """
     s = state0.copy()
     s[3:] = s[3:] + dv
+
+    if mode == "position":
+        if r_peri_nom is None or r_apo_nom is None:
+            raise ValueError("mode='position' requires r_peri_nom and r_apo_nom")
+        peri_state, apo_state = predict_apse_states(s, n_revs, period_s, eom=eom)
+        return np.concatenate([
+            peri_state[:3] - r_peri_nom,
+            apo_state[:3] - r_apo_nom,
+        ])
+
     peri_alt, apo_alt = predict_apses(s, n_revs, period_s, eom=eom)
     return np.array([
-        peri_alt - PERIAPSIS_ALT_TARGET,
-        apo_alt - APOAPSIS_ALT_TARGET,
+        peri_alt - peri_target_km,
+        apo_alt - apo_target_km,
     ])
 
 
@@ -189,14 +275,21 @@ def solve_burn(
     fd_step: float = 1e-6,
     damp: float = 0.8,
     tol_km: float = TARGET_TOL_KM,
+    peri_target_km: float = PERIAPSIS_ALT_TARGET,
+    apo_target_km: float = APOAPSIS_ALT_TARGET,
+    mode: str = "altitude",
+    r_peri_nom: np.ndarray | None = None,
+    r_apo_nom: np.ndarray | None = None,
 ) -> dict:
     """
-    Solve for the impulsive ΔV that re-targets the next periapsis/apoapsis altitudes.
+    Solve for the impulsive ΔV that re-targets the next periapsis/apoapsis apses.
 
-    Minimum-norm Gauss-Newton on a 3-control (ΔV ∈ ℝ³), 2-target (peri, apo) problem.
-    The Jacobian J = ∂[peri,apo]/∂ΔV (2×3) is built by forward finite differences; the
-    pseudo-inverse step ΔV ← ΔV − J⁺ r selects the minimum-norm correction, so the
-    solver naturally prefers cheap burns and the underdetermined system stays well posed.
+    Minimum-norm Gauss-Newton on a 3-control (ΔV ∈ ℝ³) problem. The residual is
+    2-D in ``mode="altitude"`` (peri/apo altitudes) or 6-D in ``mode="position"``
+    (peri/apo position vectors, MacKenzie Strategy 3). The Jacobian J = ∂r/∂ΔV
+    (m×3) is built by forward finite differences; the pseudo-inverse step
+    ΔV ← ΔV − J⁺ r selects the minimum-norm correction, so the solver prefers cheap
+    burns and the (under- or over-determined) system stays well posed via pinv.
 
     Planning uses the ONBOARD model (``eom`` default ``cr3bp_eom``); the truth model is
     NOT used here — that split is enforced by the caller.
@@ -219,6 +312,15 @@ def solve_burn(
         Step damping ∈ (0,1].
     tol_km : float
         Convergence tolerance on the apse residual (km).
+    peri_target_km, apo_target_km : float
+        Periapsis / apoapsis altitude targets (km), used in ``mode="altitude"``.
+        Default to the MacKenzie period-3 halo bands; set to an orbit's own apse
+        altitudes to hold that orbit (e.g. the Russell-Lara halo: ~24 / ~1053 km).
+    mode : str
+        "altitude" (default) or "position" (MacKenzie Strategy 3 proper).
+    r_peri_nom, r_apo_nom : np.ndarray (3,), optional
+        Nominal periapsis / apoapsis position vectors (km, barycentre frame),
+        required when ``mode="position"`` (see ``nominal_apse_positions``).
 
     Returns
     -------
@@ -229,8 +331,10 @@ def solve_burn(
         'residual_km': float — final ‖r‖ (km).
         'iterations' : int.
     """
+    res_kw = dict(mode=mode, r_peri_nom=r_peri_nom, r_apo_nom=r_apo_nom)
     dv = np.zeros(3)
-    r = _apse_residual(state0, dv, n_revs, period_s, eom)
+    r = _apse_residual(state0, dv, n_revs, period_s, eom,
+                       peri_target_km, apo_target_km, **res_kw)
 
     iters = 0
     for iters in range(1, max_iter + 1):
@@ -239,12 +343,13 @@ def solve_burn(
         if np.linalg.norm(r) < tol_km:
             break
 
-        # Finite-difference Jacobian J (2×3): columns = ∂r/∂ΔV_i.
-        J = np.zeros((2, 3))
+        # Finite-difference Jacobian J (m×3): columns = ∂r/∂ΔV_i (m = len(r)).
+        J = np.zeros((r.size, 3))
         for i in range(3):
             dv_p = dv.copy()
             dv_p[i] += fd_step
-            r_p = _apse_residual(state0, dv_p, n_revs, period_s, eom)
+            r_p = _apse_residual(state0, dv_p, n_revs, period_s, eom,
+                                 peri_target_km, apo_target_km, **res_kw)
             if not np.all(np.isfinite(r_p)):
                 J = None
                 break
@@ -255,7 +360,8 @@ def solve_burn(
         # Minimum-norm Gauss-Newton step: ΔV -= J⁺ r  (J⁺ = pinv, min-norm solution).
         step = np.linalg.pinv(J) @ r
         dv = dv - damp * step
-        r = _apse_residual(state0, dv, n_revs, period_s, eom)
+        r = _apse_residual(state0, dv, n_revs, period_s, eom,
+                           peri_target_km, apo_target_km, **res_kw)
 
     residual = float(np.linalg.norm(r)) if np.all(np.isfinite(r)) else np.inf
     return {
@@ -276,6 +382,11 @@ def run_mpc(
     rtol_truth: float = RTOL_TRUTH,
     atol_truth: float = ATOL_TRUTH,
     verbose: bool = False,
+    peri_target_km: float = PERIAPSIS_ALT_TARGET,
+    apo_target_km: float = APOAPSIS_ALT_TARGET,
+    mode: str = "altitude",
+    ref_ic: np.ndarray | None = None,
+    max_burns: int = 2000,
 ) -> dict:
     """
     Run the event-driven MPC stationkeeping loop against a TRUTH model.
@@ -305,6 +416,23 @@ def run_mpc(
         Truth-model integration tolerances.
     verbose : bool
         Print per-burn diagnostics.
+    peri_target_km, apo_target_km : float
+        Periapsis / apoapsis altitude targets (km), used when ``mode="altitude"``.
+        Default to the MacKenzie period-3 halo bands (42.05 / 1055 km). Set to an
+        orbit's own apse altitudes to stationkeep a different orbit — e.g. the
+        Russell-Lara halo (~24 / ~1053 km) — without editing the module constants.
+    mode : str
+        "altitude" (default; apse-altitude targeting, MacKenzie Strategy 1/2-like)
+        or "position" (MacKenzie Strategy 3 proper: bound the apse POSITION
+        vectors against the nominal orbit). ``mode="position"`` requires ``ref_ic``.
+    ref_ic : np.ndarray (6,), optional
+        Nominal (uncontrolled) orbit IC; its first periapsis/apoapsis positions
+        become the Strategy-3 targets. Defaults to ``state0`` when ``mode="position"``
+        and ``ref_ic`` is not given.
+    max_burns : int
+        Hard cap on executed burns (default 2000) — a safety guard so the loop can
+        never run unbounded. A normal 30-day run uses ~60 burns; hitting the cap
+        returns outcome ``'max_burns'`` and signals something is wrong upstream.
 
     Returns
     -------
@@ -312,7 +440,8 @@ def run_mpc(
         'survived'        : bool — reached the horizon without crashing or escaping.
         'outcome'         : str — 'held' (actively stationkept to horizon), 'idle'
                             (no crash but controller stopped triggering), 'crash'
-                            (periapsis < 5 km), or 'escape' (left the science orbit).
+                            (periapsis < 5 km), 'escape' (left the science orbit),
+                            or 'max_burns' (hit the safety burn cap).
         'survival_time_s' : float — time of loss (crash/escape), or ``horizon_s``.
         'controller_active_until_s' : float — last time the controller was triggering.
         'n_burns'         : int — number of burns executed.
@@ -327,7 +456,30 @@ def run_mpc(
     burns: list[dict] = []
     min_peri_alt = np.inf
 
+    # Strategy 3: compute the nominal apse position targets once, from the
+    # reference orbit (defaults to the initial state). Planning uses the onboard
+    # model so the targets live in the same model the burn solver predicts in.
+    r_peri_nom = r_apo_nom = None
+    if mode == "position":
+        ref = state0 if ref_ic is None else ref_ic
+        r_peri_nom, r_apo_nom = nominal_apse_positions(ref, period_s, eom=cr3bp_eom)
+
     while t_now < horizon_s:
+        # Safety guard: the loop advances t_now each iteration by construction, but
+        # cap the burn count so a pathological no-progress state can never spin
+        # forever (a real run holds ~2 burns/period, so 2000 ≈ 1000 periods).
+        if len(burns) >= max_burns:
+            return {
+                "survived": False,
+                "outcome": "max_burns",
+                "survival_time_s": t_now,
+                "controller_active_until_s": t_now,
+                "n_burns": len(burns),
+                "total_dv_ms": total_dv_ms,
+                "burns": burns,
+                "min_peri_alt_km": float(min_peri_alt) if np.isfinite(min_peri_alt) else np.nan,
+            }
+
         ctrl_ev = make_altitude_event(CONTROL_ALT_KM, terminal=True)
         crash_ev = make_crash_event(PERIAPSIS_CRASH_ALT)
         peri_ev = make_periapsis_event(terminal=False)
@@ -390,7 +542,10 @@ def run_mpc(
         state_ctrl = sol.y_events[0][0].copy()
         t_now += t_ctrl
 
-        burn = solve_burn(state_ctrl, period_s, n_revs=n_revs, eom=cr3bp_eom)
+        burn = solve_burn(state_ctrl, period_s, n_revs=n_revs, eom=cr3bp_eom,
+                          peri_target_km=peri_target_km,
+                          apo_target_km=apo_target_km,
+                          mode=mode, r_peri_nom=r_peri_nom, r_apo_nom=r_apo_nom)
         state_post = state_ctrl.copy()
         state_post[3:] = state_post[3:] + burn["dv"]
         total_dv_ms += burn["dv_mag_ms"]
