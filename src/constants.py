@@ -47,6 +47,18 @@ J2_SATURN: float = 1.629071e-2    # dimensionless, normalized to R_SATURN (Jacob
 # ── Propulsion ────────────────────────────────────────────────────────────────
 THRUST_NOM: float = 22.0          # N   MR-106E monopropellant (MacKenzie 2020 §3.5)
 
+# Specific impulse of the MR-106E 22-N monoprop thruster (MacKenzie 2020, Exhibit
+# 3-11 propulsion table: "Number of thrusters (specific impulse, Isp): ...
+# 8x - 22N (220 s)"). Used for ΔV -> propellant-mass bookkeeping (rocket equation);
+# not yet wired into baselines/mpc.py (see TODO(constants) marker there).
+ISP_MR106E: float = 220.0         # s   MR-106E specific impulse (MacKenzie 2020, Exhibit 3-11)
+
+# Spacecraft wet mass at launch (MacKenzie 2020 §3.4 / Exhibit 3-6, "Total Wet Mass
+# MPV" = 6610 kg). This is the launch wet mass including the 30% CBE margin; it is
+# an upper bound for the mass available during Enceladus-orbit stationkeeping
+# (post-cruise, post-orbit-insertion mass will be lower).
+M_SPACECRAFT_WET: float = 6610.0  # kg  Orbilander total wet mass at launch (MacKenzie 2020 §3.4)
+
 # ── CR3BP derived parameters ──────────────────────────────────────────────────
 MU: float = GM_ENCELADUS / _GM_TOTAL   # = _MU_JPL by construction
 
