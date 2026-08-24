@@ -1,135 +1,162 @@
-# SHERPA-RPA Direction 3 — Enceladus Orbilander POMDP Stationkeeping
+# SherpaOrbital — Enceladus Orbilander POMDP stationkeeping
 
-Offline POMDP-based autonomous stationkeeping simulator for the Enceladus Orbilander
-mission (MacKenzie et al. 2020). The spacecraft holds a period-3 L1 halo orbit around
-Enceladus — periapsis 31 km, apoapsis 1065 km, period 36 hr, 3 south-polar periapsis
-passes per orbit — and must stationkeep without ground contact.
+Offline POMDP stationkeeping for the Enceladus Orbilander mission concept
+(MacKenzie et al. 2020). The spacecraft holds a period-3 L1 halo orbit around Enceladus
+and must stationkeep without ground contact, trading **science** (sampling a range of
+periapsis altitudes) against **safety** (not crashing into Enceladus or escaping an
+unstable orbit).
 
-This is **SHERPA-RPA Direction 3**, targeting a POMDP controller that outperforms
-deterministic MPC and deep-RL baselines on long-duration (30-day) stationkeeping
-survival rate and fuel efficiency.
-
----
-
-## What's implemented
-
-### Phase 1 — CR3BP Orbital Simulator ✅
-
-| Module | Description |
-|--------|-------------|
-| `src/constants.py` | All physical constants (JPL DE440 unit system: LU=238529 km, TU=18913 s, μ=1.9011e-7) |
-| `src/dynamics/cr3bp.py` | Saturn-Enceladus CR3BP equations of motion, Jacobi constant, libration points |
-| `src/dynamics/cr3bp_j2.py` | CR3BP + Enceladus J2 oblateness perturbation (truth model) |
-| `src/dynamics/integrator.py` | RK45 wrapper with apoapsis/periapsis/altitude/crash event detection |
-| `src/utils/orbital_elements.py` | Physical ↔ non-dimensional state conversion, Keplerian elements |
-| `src/utils/halo_ic.py` | Differential corrector (Howell 1984) for period-3 southern L1 halo orbit; hardcoded verified IC (`PERIOD3_IC_ND`) |
-
-The period-3 science orbit is verified against MacKenzie §B.2.3:
-- Periapsis altitude: **31.0 km** (band: 19.8–64.3 km ✓)
-- Apoapsis altitude: **1064.8 km** (band: 1000–1110 km ✓)
-- Period: **35.99 hr** (~36 hr ✓)
-- Closure residual: **0.0017 km** after 1 Newton iteration
-
-### Figures ✅
-
-| Script | Output | Description |
-|--------|--------|-------------|
-| `scripts/plot_orbit.py` | `figures/exhibit_b21.png` | Reproduces MacKenzie Exhibit B-21: X-Z trajectory, Y-Z polar flyby view, periapsis altitude vs time (CR3BP vs CR3BP+J2, 24 revolutions) |
+This is SHERPA-RPA Direction 3.
 
 ---
 
-## Setup
+## Quick start
+
+```julia
+using Pkg
+Pkg.activate("experiments")     # from the repo root
+Pkg.instantiate()
+
+using SherpaOrbital, NativeSARSOP, POMDPs
+
+config = StationkeepingPOMDP()          # baseline scenario
+pomdp  = build_pomdp(config)
+policy = solve(SARSOPSolver(; precision = 1e-3, max_time = 30.0), pomdp)
+
+print_policy_table(policy, config)
+export_policy(policy, config)           # -> artifacts/policy.json
+```
+
+Or just run the worked example:
 
 ```bash
-# Clone
-git clone git@github.com:gkim65/sherpa-orbital.git
-cd sherpa-orbital
-
-# Install dependencies (Python 3.10+)
-pip install numpy scipy matplotlib pytest
+julia --project=experiments experiments/example.jl
 ```
-
-No package installation needed — scripts import `src/` directly via `sys.path`.
 
 ---
 
-## Running the code
+## The model
 
-### Generate the orbit figure (Exhibit B-21)
+|              | |
+|--------------|--|
+| **State**    | `(dev, cov)`. `dev` = apse-position deviation bin (`OK`/`DRIFT`/`FAR`, plus terminal `LOST`/`CRASHED`) — the safety variable. `cov` = 3-bit mask over science altitude bands (`LOW`/`MID`/`HIGH`) — the science variable. \|S\| = 3·2³ + 2 = 26 |
+| **Actions**  | `OBSERVE`, `CORRECT`, `EXCURSE_LOW`, `EXCURSE_MID`, `EXCURSE_HIGH`. \|A\| = 5 |
+| **Obs**      | Noisy read of the dev bin (Gaussian nav noise on the measured deviation). `cov` is known exactly. \|O\| = 5 |
+| **Reward**   | `+r_science` per newly sampled band, −fuel per burn, large − on crash/escape |
 
-```bash
-python scripts/plot_orbit.py
+Two things worth knowing about the formulation:
+
+**Actions encode intent, not a burn vector.** A fixed menu of burn directions was measured
+and shown to fail; the burn direction is solved live by the planner against the onboard
+model, so the POMDP only chooses *what to attempt*.
+
+**Science is banked only on survival.** An excursion adds its band to `cov` only if the
+pass did not go terminal. That coupling is what forces the policy to sequence excursions
+rather than attempt everything at once — and it is visible in the solved policy, which
+excurses toward whichever band is unsampled from `OK`, but always `CORRECT`s from
+`DRIFT`/`FAR`.
+
+### Editing the scenario
+
+Every hyperparameter is a keyword field with a literal default — the struct *is* the
+config (see [src/StationkeepingPOMDP.jl](src/StationkeepingPOMDP.jl)):
+
+```julia
+StationkeepingPOMDP(; r_science = 40.0)                     # value science more
+StationkeepingPOMDP(; dev_edges = (10.0, 50.0, 150.0))      # tighter safety bins
+StationkeepingPOMDP(; discount = 0.99, fuel_weight = 2.0)   # patient, fuel-conscious
 ```
-
-Outputs `figures/exhibit_b21.png` — a three-panel figure:
-- **(a) X-Z trajectory**: full 36-hr period in the CR3BP rotating frame, coloured by
-  elapsed time. All 3 loops of the period-3 orbit are geometrically superimposed in X-Z.
-- **(b) Y-Z view**: looking along −X (from Saturn toward Enceladus). Shows the
-  spacecraft skimming 31 km above the north pole — the clearance that is invisible
-  in the standard X-Y top-down projection.
-- **(c) Periapsis altitude vs time**: CR3BP (flat, periodic) vs CR3BP+J2 truth model
-  (escapes within ~2 revolutions without stationkeeping). This instability motivates
-  the POMDP controller.
-
-### Run tests
-
-```bash
-pytest                        # all tests (~2 s)
-pytest -m "not slow"          # skip slow differential-corrector tests
-pytest tests/dynamics/        # dynamics tests only
-pytest tests/utils/           # orbit IC tests only
-```
-
-**76 tests, 0 failures.**
 
 ---
 
-## Repository structure
+## Measured tables, not analytic guesses
+
+The dev-transition kernels are **measured** from CR3BP+J2 experiments, not derived in
+closed form. They live in [artifacts/tables.json](artifacts/tables.json) alongside their
+provenance (which experiment produced each row, and how much to trust it), and are loaded
+at model-build time:
+
+```julia
+tables = load_tables()          # validates: row-stochastic, correct dev ordering
+validate_tables(tables)
+```
+
+`artifacts/` is committed on purpose. These are a scientific provenance record — being
+able to see a probability change in a diff is how a re-measurement gets noticed.
+
+> **Current status:** the kernels are still hand-transcribed from the Python experiment
+> output rather than machine-generated, and the `DRIFT`/`FAR` rows rest on few trials.
+> See the `meta.caveats` field in the artifact. Replacing this with a Julia calibration
+> step that measures them directly is the next milestone.
+
+---
+
+## Repository layout
 
 ```
-sherpa-orbital/
-├── README.md
-├── CLAUDE.md                  # AI session protocol and code conventions
-├── docs/
-│   ├── project-brief.md
-│   ├── todo.md                # task list by phase
-│   └── session-log/           # per-session technical notes
-├── figures/
-│   └── exhibit_b21.png        # MacKenzie Exhibit B-21 reproduction
-├── scripts/
-│   └── plot_orbit.py          # orbit visualisation (run directly)
-├── src/
-│   ├── constants.py
-│   ├── dynamics/
-│   │   ├── cr3bp.py           # onboard model EOM
-│   │   ├── cr3bp_j2.py        # truth model EOM (adds J2)
-│   │   └── integrator.py      # RK45 wrapper + event detection
-│   ├── spacecraft/            # Phase 2 — thruster + nav models (upcoming)
-│   ├── environment/           # Phase 3 — Gymnasium env (upcoming)
-│   └── utils/
-│       ├── halo_ic.py         # differential corrector + verified IC
-│       └── orbital_elements.py
-└── tests/
-    ├── dynamics/
-    └── utils/
+Project.toml            Julia package (SherpaOrbital)
+Manifest.toml           committed — reproducible environment
+src/
+  SherpaOrbital.jl      module + exports
+  StationkeepingPOMDP.jl  the @kwdef config struct
+  states.jl             (dev, cov) space, binning, coverage bitmask
+  actions.jl            action set, excursion -> band mapping
+  observations.jl       O[s,o] — analytic Gaussian nav model
+  tables.jl             load/write/validate the measured kernels
+  transition.jl         T[s,a,s'] — includes the science-banking coupling
+  rewards.jl            r(s,a) — science / fuel / expected terminal cost
+  model.jl              build_pomdp
+  export.jl             solved policy -> JSON
+  common/report.jl      model + policy pretty-printing
+experiments/            own Project.toml — isolates the solver dependency
+  example.jl            worked end-to-end example
+artifacts/              measured tables + exported policy (committed)
+test/                   runtests.jl
+python-legacy/          the Python implementation being ported (see below)
+```
+
+The library declares **no solver dependency** — `NativeSARSOP` lives only in
+`experiments/Project.toml`, so anyone who wants the model without the solver can have it.
+
+---
+
+## Status: mid-port
+
+The physics (CR3BP dynamics, the halo-orbit differential corrector, the MPC baseline, the
+rollout harness) currently lives in `python-legacy/` and is being ported to Julia one
+module at a time. The Python side remains functional and is the numerical reference the
+port is validated against; it will be removed once the port is complete.
+
+Working today in Julia: the POMDP model, the solver pipeline, policy export, reporting.
+
+---
+
+## Tests
+
+```bash
+julia --project=. -e 'using Pkg; Pkg.test()'    # Julia
+cd python-legacy && pytest                      # Python reference
 ```
 
 ---
 
 ## Physics conventions
 
-- **Frame**: Saturn-Enceladus CR3BP rotating frame. Saturn at x = −μ, Enceladus at x = 1−μ.
-- **Units**: km, km/s, s throughout. Non-dimensional via LU/TU/VU from `constants.py`.
-- **Truth model**: CR3BP + Enceladus J2 (J2 = 5.435×10⁻³, Iess et al. 2014).
-- **Onboard model**: CR3BP only (the gap to truth is the uncertainty being studied).
-- **Integrator**: `scipy.solve_ivp` RK45. Truth: rtol=1e-10, atol=1e-12. Onboard: rtol=1e-8.
-
----
+- **Frame**: Saturn–Enceladus CR3BP rotating frame. Saturn at x = −μ, Enceladus at x = 1−μ.
+- **Units**: km, km/s, s. ΔV costs in m/s.
+- **Truth vs. onboard**: the truth model includes J2; the onboard model is CR3BP only.
+  The gap between them is the model uncertainty being studied — the two are deliberately
+  kept separate.
 
 ## Key references
 
-- MacKenzie et al. (2020). *Enceladus Orbilander Mission Concept Study*. §B.2.3.
-- Kim et al. (2025). POMDP/Bayesian network stationkeeping formulation.
+- MacKenzie et al. (2020). *Enceladus Orbilander Mission Concept Study*, §B.2.3 — orbit
+  parameters, thruster specs, stationkeeping strategy.
+- Kim et al. (2025) —  Life Detection POMDP 
 - Howell (1984). Three-Dimensional, Periodic, Halo Orbits. *Celestial Mechanics* 32(1).
 - Iess et al. (2014). The Gravity Field and Interior Structure of Enceladus. *Science*.
 - JPL Three-Body Periodic Orbits Catalog (DE440 ephemeris).
+
+## License
+
+MIT — see [LICENSE](LICENSE).

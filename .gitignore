@@ -1,11 +1,34 @@
+# ── Python ────────────────────────────────────────────────────────────────────
 **/__pycache__/**
-.pytest_cache
-**.pdf
-claude.md
-*.png
+.pytest_cache/
+*.py[cod]
+.venv/
 
-*.DS_Store
+# ── Julia ─────────────────────────────────────────────────────────────────────
+# Manifest.toml IS committed (root + experiments/) — it is the reproducibility record.
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+/docs/build/
 
-docs/**
-# Generated figure outputs (regenerate via scripts/)
+# ── Reference PDFs (large; not redistributable) ───────────────────────────────
+*.pdf
+
+# ── Generated figure outputs (regenerate via the plotting scripts) ────────────
 figures/
+*.png
+*.svg
+
+# ── Docs / session logs ───────────────────────────────────────────────────────
+# Working notes stay LOCAL. Do not commit docs unless explicitly asked.
+docs/
+
+# ── OS noise ──────────────────────────────────────────────────────────────────
+.DS_Store
+
+# NOTE: artifacts/ is deliberately NOT ignored. tables.json and policy.json are
+# committed on purpose: they are the provenance record for the measured model, and
+# reviewing a diff in them is how a re-measurement gets noticed.
+# Claude Code project instructions (local only)
+CLAUDE.md
+claude.md
