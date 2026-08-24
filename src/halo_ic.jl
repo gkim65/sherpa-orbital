@@ -397,9 +397,18 @@ end
 Single-shooting differential corrector for CR3BP halo orbits (Howell 1984).
 
 Free variables `x0` and `vy0` (non-dimensional); `z0` is fixed as the family parameter.
-Targets `vx_f = 0` and `vz_f = 0` at the `n_crossings`-th `y = 0` crossing, so the full
-period is `2 × t_cross`: `n_crossings = 1` is a simple halo, `n_crossings = 3` the period-3
-orbit of MacKenzie §B.2.3.
+Targets `vx_f = 0` and `vz_f = 0` at the `n_crossings`-th `y = 0` crossing: `n_crossings = 1`
+is a simple halo, `n_crossings = 3` the period-3 orbit of MacKenzie §B.2.3.
+
+!!! warning "period_nd / period_s are NaN when n_crossings > 1"
+    The full period is `2 × t_half` only for a single crossing. For more crossings
+    `t_half` also contains the intermediate `t_min` coasts inserted by
+    [`propagate_half_period_nd`](@ref), so doubling it overshoots — at `n_crossings = 3`
+    by exactly 5/3. Rather than return that plausible-but-wrong number (as the Python
+    reference does), both period fields are `NaN` for `n_crossings > 1`, so a caller gets
+    a loud failure instead of silently propagating 1.67 revolutions as one orbit. Use
+    `PERIOD3_PERIOD_S` for the period-3 science orbit, or `n × 2 × t_cross(n_crossings = 1)`.
+    `t_half_nd` is always returned if you need to compute it yourself.
 
 The Newton step uses the 2×2 STM sub-block (rows `vx = 4`, `vz = 6`; columns `x = 1`,
 `vy = 5`) and is scaled by `damp ∈ (0, 1]` to prevent overshoot. Iteration stops when
@@ -407,8 +416,8 @@ The Newton step uses the 2×2 STM sub-block (rows `vx = 4`, `vz = 6`; columns `x
 `max_iter`.
 
 Returns a NamedTuple with `ic_nd`, `ic` (physical, km/km/s), `period_nd`, `period_s`,
-`n_crossings`, `converged`, `iterations`, `residual`, and `error` (a message string, empty
-unless propagation failed).
+`t_half_nd`, `n_crossings`, `converged`, `iterations`, `residual`, and `error` (a message
+string, empty unless propagation failed).
 """
 function differential_corrector(
     x0_nd::Real,
@@ -447,11 +456,23 @@ function differential_corrector(
 
         if residual < tol
             ic_nd = [x0, 0.0, z0_nd, 0.0, vy0, 0.0]
+            # `2 × t_half` is the true period ONLY for n_crossings == 1. For more
+            # crossings, t_half includes the (n_crossings - 1) intermediate `t_min`
+            # coasts that `propagate_half_period_nd` inserts to avoid re-detecting the
+            # crossing it starts on, so `2 × t_half` overshoots (measured: exactly 5/3
+            # too large at n_crossings = 3). The Python reference returns that inflated
+            # value; we return NaN instead so a caller cannot silently propagate 1.67
+            # revolutions and call it one orbit. Deliberate divergence from the
+            # reference — see the 2026-08-24 halo-IC session log §5.
+            # Use PERIOD3_PERIOD_S, or n × 2 × t_cross(n_crossings = 1), until the
+            # general relation is derived and regression-tested.
+            multi = n_crossings > 1
             return (
                 ic_nd       = ic_nd,
                 ic          = nondim_to_cr3bp(ic_nd),
-                period_nd   = 2.0 * t_half,
-                period_s    = 2.0 * t_half * T_STAR,
+                period_nd   = multi ? NaN : 2.0 * t_half,
+                period_s    = multi ? NaN : 2.0 * t_half * T_STAR,
+                t_half_nd   = t_half,
                 n_crossings = Int(n_crossings),
                 converged   = true,
                 iterations  = i,
@@ -491,6 +512,7 @@ function _corrector_failure(x0, z0, vy0, iters, residual, n_crossings, error_msg
         ic          = nondim_to_cr3bp(ic_nd),
         period_nd   = NaN,
         period_s    = NaN,
+        t_half_nd   = NaN,
         n_crossings = Int(n_crossings),
         converged   = false,
         iterations  = Int(iters),
@@ -633,8 +655,30 @@ function find_halo_ic(;
     )
 
     if result.converged
-        info = characterise_orbit(result.ic, result.period_s; verbose = verbose)
-        return merge(result, info)
+        # `result.period_s` is NaN for n_crossings > 1 (its `2 × t_half` would include the
+        # intermediate coasts — see the differential_corrector docstring), so recover the
+        # true period from a single-crossing solve of the SAME converged IC and scale by
+        # the crossing count. Verified at n_crossings = 3: this reproduces
+        # PERIOD3_PERIOD_S (35.98811 hr vs the 35.988 hr constant).
+        period_s = result.period_s
+        if !isfinite(period_s)
+            single = differential_corrector(
+                result.ic_nd[1], result.ic_nd[3], result.ic_nd[5];
+                t_half_max_nd = t_half_max_nd, n_crossings = 1,
+                tol = tol, max_iter = max_iter, damp = damp, verbose = false,
+            )
+            single.converged || return merge(result, (
+                error = "converged at n_crossings=$(n_crossings) but the single-crossing " *
+                        "solve needed for the true period did not converge; period unknown",
+            ))
+            period_s = n_crossings * single.period_s
+        end
+        # `info` carries the period it was characterised over, so merging it last
+        # deliberately overrides the corrector's NaN with the true period. `find_halo_ic`
+        # therefore always reports a usable `period_s`; only the lower-level
+        # `differential_corrector` returns NaN.
+        info = characterise_orbit(result.ic, period_s; verbose = verbose)
+        return merge(result, (period_s = period_s, period_nd = period_s / T_STAR), info)
     end
     return result
 end
