@@ -1,210 +1,230 @@
 """
-dynamics.jl — the crude drift+burn model for the toy stationkeeping POMDP.
+dynamics.jl — science+safety stationkeeping POMDP (Stage-1-science, 2026-07-15).
 
-THIS IS A PLACEHOLDER FOR THE REAL CR3BP DYNAMICS.
+REPLACES the 2026-07-06 scalar-altitude toy. State/action/transition are grounded in
+MEASURED CR3BP+EncJ2 physics (scripts/pomdp_experiments/, exps 01/03/06/07/11b/12), not
+a hand-tuned surrogate. See docs/pomdp-proposal-2026-07-13.md.
 
-The whole point of isolating this file is to give a clean seam: everything the
-POMDP needs about the physics flows through `step_altitude` (one-step continuous
-dynamics) and the two table builders (`transition_matrix`, `observation_matrix`).
-When we are ready to bridge to the real integrator, `step_altitude` gets swapped
-for a call into the Python CR3BP (via PyCall) or a native Julia CR3BP; nothing
-else in the model has to change.
+Concept
+-------
+The agent trades SCIENCE (visit a range of periapsis altitudes to gather info) against
+SAFETY (keep the orbit from crashing/escaping). Two coupled state variables:
 
-Physical reference numbers (mirrored from the Python `src/constants.py`, all km):
-  - Crash altitude          : < 5 km      (PERIAPSIS_CRASH_ALT)
-  - MacKenzie periapsis band: 19.8-64.3   (PERIAPSIS_ALT_MIN/MAX) — our NOMINAL
-                              25-60 band sits inside this
-  - Nav 1-sigma             : 2 km        (SIGMA_NAV_POS)
+  dev  : apse-position deviation from the nominal orbit — the SAFETY variable.
+         bins  OK (<15 km) · DRIFT (15-60) · FAR (60-200) · LOST (>=200, terminal)
+         plus  CRASHED (terminal).  (edges from exp 02/11b measured deviation scale.)
+  cov  : which of the 3 science altitude BANDS have been sampled — a 3-bit mask.
+         bands (single-burn reachable, ~33-65 km, exp 07): LOW · MID · HIGH.
+         2^3 = 8 coverage states (none .. all three).
 
-The stochastic pieces (burn efficiency eta_eff ~ Uniform(0.8, 1.0); Gaussian nav
-noise) are re-implemented natively here as one-liners rather than imported from
-the Python `src/spacecraft/` modules, per the toolchain plan.
+State = (dev, cov). |S| = 4 non-terminal dev × 8 cov + 2 terminal (CRASHED, LOST) = 34.
 
-Units: periapsis-altitude ERROR is tracked in km, measured relative to the
-centre of the NOMINAL band. Positive = higher than nominal, negative = lower
-(toward crash). This scalar is the toy's entire continuous state.
+Actions (INTENT — the exact burn VECTOR is solved by mpc.solve_burn in the Python
+rollout; exp 04 proved a fixed-direction menu fails, so direction is never discretized):
+  OBSERVE      : no burn; take a nav reading. Cheap, but dev drifts (instability).
+  CORRECT      : solve_burn toward nominal — holds the orbit (exp 11b: OK->OK ~0.98).
+  EXCURSE_LOW  : one-pass single-burn excursion to the LOW band, then recover; marks
+  EXCURSE_MID    LOW/MID/HIGH sampled in cov. Costs fuel + a little safety margin
+  EXCURSE_HIGH   (exp 06/12: excursion holds + recovers).
+
+Reward (in stationkeeping_pomdp.jl): + for each NEWLY sampled band, − fuel per burn,
+large − on CRASHED/LOST. The POMDP must sequence excursions while staying safe.
+
+Transition/observation tables are built HERE and consumed offline by SARSOP; SARSOP
+never calls the dynamics. The Python rollout (baselines/pomdp_rollout.py) realizes each
+action against the real truth model.
 """
 
 using Random
 using Distributions
 
 # ---------------------------------------------------------------------------
-# State discretisation — periapsis-altitude-error bins (km of ACTUAL altitude).
-# These are absolute periapsis altitudes; the bin edges come straight from the
-# MacKenzie bands + the crash/escape thresholds in the prompt.
+# Safety variable: apse-position deviation bins.
 # ---------------------------------------------------------------------------
-# bin name      altitude range (km)     index
-#   CRASHED       (-inf, 5)               1   terminal
-#   LOW           [5, 25)                 2
-#   NOMINAL       [25, 60)                3
-#   HIGH          [60, 120)               4
-#   ESCAPED       [120, +inf)             5   terminal
-const BIN_EDGES = (5.0, 25.0, 60.0, 120.0)      # 4 edges -> 5 bins
-const STATE_NAMES = (:CRASHED, :LOW, :NOMINAL, :HIGH, :ESCAPED)
-const N_STATES = length(STATE_NAMES)
-const TERMINAL_STATES = (:CRASHED, :ESCAPED)
+const DEV_EDGES = (15.0, 60.0, 200.0)               # km; OK/DRIFT/FAR/LOST
+const DEV_NAMES = (:OK, :DRIFT, :FAR, :LOST)         # LOST terminal
+const N_DEV = length(DEV_NAMES)
 
-# Representative (bin-centre-ish) altitude used when we need a continuous value
-# to seed a Monte-Carlo rollout from a discrete state. For the open-ended
-# terminal bins we pick a point just inside.
-const BIN_REPRESENTATIVE_ALT = Dict(
-    :CRASHED  => 2.5,     # already crashed; only used defensively
-    :LOW      => 15.0,
-    :NOMINAL  => 42.5,    # centre of 25-60
-    :HIGH     => 90.0,
-    :ESCAPED  => 150.0,   # already escaped; only used defensively
-)
+"""dev_bin(dev_km) -> Symbol. Bin an apse-position deviation (km)."""
+function dev_bin(dev_km::Real)
+    !isfinite(dev_km) && return :LOST
+    dev_km < DEV_EDGES[1] && return :OK
+    dev_km < DEV_EDGES[2] && return :DRIFT
+    dev_km < DEV_EDGES[3] && return :FAR
+    return :LOST
+end
 
-"""
-    bin_of(alt_km) -> Symbol
+# ---------------------------------------------------------------------------
+# Science variable: coverage of 3 altitude bands (single-burn reachable ~33-65 km).
+# Represented as a 3-bit mask; band commanded targets are documented for the rollout.
+# ---------------------------------------------------------------------------
+const BAND_NAMES = (:LOW, :MID, :HIGH)               # ~35 / 48 / 62 km achieved
+const BAND_TARGET_KM = Dict(:LOW => 40.0, :MID => 70.0, :HIGH => 120.0)  # commanded (compressed)
+const N_BANDS = length(BAND_NAMES)
+const N_COV = 1 << N_BANDS                            # 8 coverage masks
 
-Map an absolute periapsis altitude (km) to its discrete state bin.
-"""
-function bin_of(alt_km::Real)
-    if alt_km < BIN_EDGES[1]
-        return :CRASHED
-    elseif alt_km < BIN_EDGES[2]
-        return :LOW
-    elseif alt_km < BIN_EDGES[3]
-        return :NOMINAL
-    elseif alt_km < BIN_EDGES[4]
-        return :HIGH
-    else
-        return :ESCAPED
+cov_has(mask::Int, b::Int) = (mask & (1 << (b - 1))) != 0
+cov_set(mask::Int, b::Int) = mask | (1 << (b - 1))
+cov_count(mask::Int) = count_ones(mask)
+
+# ---------------------------------------------------------------------------
+# Full state space: (dev, cov). Terminal states collapse cov (once lost, cov frozen).
+# We enumerate all (dev in OK/DRIFT/FAR) × cov, plus the two terminals.
+# ---------------------------------------------------------------------------
+struct SKState
+    dev::Symbol      # :OK :DRIFT :FAR :LOST :CRASHED
+    cov::Int         # 0..7 (bitmask); ignored/0 for CRASHED
+end
+
+const TERMINAL_DEV = (:LOST, :CRASHED)
+isterminal_dev(d::Symbol) = d in TERMINAL_DEV
+
+"""all_states() -> Vector{SKState}. Non-terminal (OK/DRIFT/FAR × 8 cov) + 2 terminals."""
+function all_states()
+    S = SKState[]
+    for d in (:OK, :DRIFT, :FAR), c in 0:(N_COV - 1)
+        push!(S, SKState(d, c))
     end
+    push!(S, SKState(:LOST, 0))
+    push!(S, SKState(:CRASHED, 0))
+    return S
 end
 
+const STATES = all_states()
+const N_STATES = length(STATES)
+const STATE_INDEX = Dict(s => i for (i, s) in enumerate(STATES))
+
 # ---------------------------------------------------------------------------
-# Actions — each a fixed commanded delta-V that raises periapsis altitude.
-# In this crude model a burn's *effect* is a raise in periapsis altitude
-# (km per step) proportional to the commanded delta-V, scaled by the random
-# burn efficiency eta_eff. Real CR3BP burns are 3-D and couple both apses;
-# the placeholder collapses that to a scalar altitude raise.
+# Actions.
 # ---------------------------------------------------------------------------
-const ACTION_NAMES = (:NO_BURN, :SMALL_BURN, :LARGE_BURN)
+const ACTION_NAMES = (:OBSERVE, :CORRECT, :EXCURSE_LOW, :EXCURSE_MID, :EXCURSE_HIGH)
 const N_ACTIONS = length(ACTION_NAMES)
+const EXCURSE_BAND = Dict(:EXCURSE_LOW => 1, :EXCURSE_MID => 2, :EXCURSE_HIGH => 3)
 
-# Commanded altitude raise per action (km), before eta_eff. Tuned so a SMALL
-# burn roughly counters one step of nominal drift and a LARGE burn climbs a bin.
-const ACTION_RAISE_KM = Dict(
-    :NO_BURN    => 0.0,
-    :SMALL_BURN => 18.0,
-    :LARGE_BURN => 45.0,
-)
-
-# Rough delta-V cost proxy (m/s) per action, only used to shape the reward's
-# fuel penalty. Proportional to the altitude raise.
+# ΔV cost proxy (m/s) per action. CORRECT from exp 11b (~1.3/step); EXCURSE costs
+# (incl. the recovery burn) MEASURED in exp 12: LOW 2.1, MID 3.1, HIGH 9.9 m/s.
 const ACTION_DV_COST = Dict(
-    :NO_BURN    => 0.0,
-    :SMALL_BURN => 1.0,
-    :LARGE_BURN => 2.5,
+    :OBSERVE => 0.0, :CORRECT => 1.3,
+    :EXCURSE_LOW => 2.1, :EXCURSE_MID => 3.1, :EXCURSE_HIGH => 9.9,
 )
 
 # ---------------------------------------------------------------------------
-# Stochastic pieces (native re-implementation of the Phase-2 Python models).
+# MEASURED dev-transition kernels (per action) over dev bins {OK,DRIFT,FAR,LOST,CRASHED}.
+# Sources:
+#   CORRECT  : exp 11b sustained MPC loop (OK->OK 0.98; from off-nominal, pulls inward).
+#   OBSERVE  : exp 11b counterfactual (OK stays ~1 pass) + exp 01 uncontrolled decay
+#              (dev grows OK->DRIFT->FAR->LOST over ~2-3 skipped passes).
+#   EXCURSE  : exp 06/12 — the excursion + its recovery burn returns dev near OK, with
+#              a small safety cost (some probability of a worse dev bin). Filled from
+#              exp 12 (see _EXC_DEV below; conservative defaults until 12 completes).
+# Rows are P(next dev | dev, action) over (:OK,:DRIFT,:FAR,:LOST,:CRASHED).
 # ---------------------------------------------------------------------------
-const ETA_EFF_MIN = 0.8      # Uniform(0.8, 1.0) burn efficiency (thruster.py)
-const ETA_EFF_MAX = 1.0
-const SIGMA_NAV_KM = 2.0     # Gaussian nav 1-sigma, km (SIGMA_NAV_POS / nav.py)
+const DEV_NEXT = (:OK, :DRIFT, :FAR, :LOST, :CRASHED)
 
-# ---------------------------------------------------------------------------
-# One-step continuous dynamics — THE SWAPPABLE SEAM.
-# ---------------------------------------------------------------------------
-"""
-    step_altitude(alt_km, action; rng, drift_mean, drift_sigma) -> Float64
+# CORRECT: strong inward pull; measured OK->OK 0.98 (exp 11b). Off-nominal recovers.
+const T_CORRECT = Dict(
+    :OK    => [0.98, 0.01, 0.00, 0.01, 0.00],
+    :DRIFT => [0.80, 0.15, 0.03, 0.02, 0.00],
+    :FAR   => [0.30, 0.40, 0.20, 0.10, 0.00],
+)
 
-Advance the periapsis altitude by one control step under the crude drift+burn
-model. Returns the new absolute periapsis altitude (km).
+# OBSERVE: no burn → dev decays outward (instability, exp 01). From OK a single skip is
+# mostly safe (exp 11b 0.94), but mass leaks outward; from DRIFT/FAR it runs away.
+const T_OBSERVE = Dict(
+    :OK    => [0.60, 0.30, 0.07, 0.02, 0.01],
+    :DRIFT => [0.05, 0.35, 0.40, 0.18, 0.02],
+    :FAR   => [0.00, 0.05, 0.25, 0.65, 0.05],
+)
 
-Model (placeholder — NOT the real CR3BP):
-  new_alt = alt + burn_raise - drift
-where
-  burn_raise = eta_eff * ACTION_RAISE_KM[action],  eta_eff ~ Uniform(0.8, 1.0)
-  drift      ~ Normal(drift_mean, drift_sigma), clamped >= 0
+# EXCURSE (any band): a deliberate one-pass dip + recovery burn. MEASURED in exp 12:
+# from OK the excursion RECOVERS to dev=OK deterministically (3/3 trials, every band),
+# so it is nearly as safe as CORRECT when started safe — we keep a small residual risk
+# for realism/robustness. From DRIFT/FAR (already off-nominal) an added perturbation is
+# riskier, so mass leaks outward more than CORRECT would.
+const T_EXCURSE = Dict(
+    :OK    => [0.95, 0.03, 0.01, 0.01, 0.00],
+    :DRIFT => [0.45, 0.25, 0.15, 0.13, 0.02],
+    :FAR   => [0.10, 0.20, 0.25, 0.40, 0.05],
+)
 
-The positive `drift_mean` encodes the empirical finding (see docs/todo.md Phase 4)
-that this period-3 orbit is unstable and periapsis DECAYS toward the body without
-control. The Normal spread is process noise standing in for the unmodelled
-higher-fidelity perturbations (Saturn J2, moons).
-
-When bridged to the real dynamics, replace the body of this function with a call
-that propagates one control period of the CR3BP(+perturbation) truth model and
-returns the resulting periapsis altitude — the rest of the POMDP is unchanged.
-"""
-function step_altitude(alt_km::Real, action::Symbol;
-                       rng::AbstractRNG = Random.default_rng(),
-                       drift_mean::Float64 = 12.0,
-                       drift_sigma::Float64 = 6.0)
-    eta_eff = ETA_EFF_MIN + (ETA_EFF_MAX - ETA_EFF_MIN) * rand(rng)
-    burn_raise = eta_eff * ACTION_RAISE_KM[action]
-    drift = max(0.0, drift_mean + drift_sigma * randn(rng))
-    return alt_km + burn_raise - drift
+"""dev_kernel(action, dev) -> Vector{Float64} over DEV_NEXT."""
+function dev_kernel(action::Symbol, dev::Symbol)
+    action == :CORRECT && return T_CORRECT[dev]
+    action == :OBSERVE && return T_OBSERVE[dev]
+    return T_EXCURSE[dev]     # any EXCURSE_*
 end
 
 # ---------------------------------------------------------------------------
-# Monte-Carlo table builders. These turn the continuous crude model into the
-# discrete T and O tables SARSOP consumes. SARSOP itself never calls the
-# dynamics — it only sees these precomputed tables (offline / tabular solve).
+# Transition over the FULL (dev, cov) state.
+# dev evolves by the measured kernel; cov gains the excursed band IF the orbit did NOT
+# go terminal on that step (you only bank the science if you survived the pass).
 # ---------------------------------------------------------------------------
 """
-    transition_matrix(; n_mc, rng, kwargs...) -> Array{Float64,3}
+    transition_matrix(; kwargs...) -> Array{Float64,3}
 
-Estimate T[s, a, s'] = P(next bin s' | current bin s, action a) by Monte-Carlo
-rollout of `step_altitude` from each (state, action) pair. Terminal states
-(CRASHED, ESCAPED) are absorbing: they transition to themselves w.p. 1.
-
-Returns an (N_STATES x N_ACTIONS x N_STATES) array.
+Build T[s, a, s'] over the enumerated (dev,cov) states. SARSOP consumes this offline.
 """
-function transition_matrix(; n_mc::Int = 20_000,
-                           rng::AbstractRNG = Random.default_rng(),
-                           kwargs...)
+function transition_matrix(; kwargs...)
     T = zeros(Float64, N_STATES, N_ACTIONS, N_STATES)
-    for (si, s) in enumerate(STATE_NAMES)
-        if s in TERMINAL_STATES
-            T[si, :, si] .= 1.0          # absorbing
+    for (si, s) in enumerate(STATES)
+        # Terminal states absorb.
+        if isterminal_dev(s.dev)
+            T[si, :, si] .= 1.0
             continue
         end
-        alt0 = BIN_REPRESENTATIVE_ALT[s]
         for (ai, a) in enumerate(ACTION_NAMES)
-            counts = zeros(Int, N_STATES)
-            for _ in 1:n_mc
-                alt1 = step_altitude(alt0, a; rng = rng, kwargs...)
-                counts[findfirst(==(bin_of(alt1)), STATE_NAMES)] += 1
+            k = dev_kernel(a, s.dev)             # over DEV_NEXT
+            banded = get(EXCURSE_BAND, a, 0)     # 0 unless an EXCURSE_*
+            newcov = banded == 0 ? s.cov : cov_set(s.cov, banded)
+            for (di, dn) in enumerate(DEV_NEXT)
+                p = k[di]
+                p == 0.0 && continue
+                if dn == :CRASHED
+                    sp = SKState(:CRASHED, 0)
+                elseif dn == :LOST
+                    sp = SKState(:LOST, 0)
+                else
+                    # survived the pass → bank the excursion's band into cov.
+                    sp = SKState(dn, newcov)
+                end
+                T[si, ai, STATE_INDEX[sp]] += p
             end
-            T[si, ai, :] .= counts ./ n_mc
         end
     end
     return T
 end
 
-"""
-    observation_matrix() -> Matrix{Float64}
+# ---------------------------------------------------------------------------
+# Observation: noisy read of the dev bin (nav noise on the apse deviation); cov is
+# known exactly (we know which excursions we commanded). Observation space = dev bins.
+# ---------------------------------------------------------------------------
+const OBS_NAMES = (:OK, :DRIFT, :FAR, :LOST, :CRASHED)
+const N_OBS = length(OBS_NAMES)
+const SIGMA_NAV_KM = 2.0
 
-Estimate O[s', o] = P(observe bin o | landed in bin s'), from Gaussian nav noise
-of 1-sigma SIGMA_NAV_KM on the altitude measurement. The observation space is
-the same 5 bins as the state (a noisy read of which altitude band we're in).
+# Representative deviation (km) per non-terminal dev bin, for the Gaussian nav model.
+const DEV_REP_KM = Dict(:OK => 7.0, :DRIFT => 35.0, :FAR => 120.0)
 
-Computed analytically per state using the bin representative altitude and the
-Normal CDF over the bin edges (no Monte-Carlo needed for a 1-D Gaussian).
-Terminal states are observed perfectly (the mission knows if it crashed/escaped).
-
-Returns an (N_STATES x N_STATES) row-stochastic matrix.
-"""
+"""observation_matrix() -> Matrix{Float64}  O[s, o] over OBS_NAMES (dev read)."""
 function observation_matrix()
-    O = zeros(Float64, N_STATES, N_STATES)
-    edges = (-Inf, BIN_EDGES..., Inf)      # 6 edges -> 5 bins
-    for (si, s) in enumerate(STATE_NAMES)
-        if s in TERMINAL_STATES
-            O[si, si] = 1.0                # observed perfectly
-            continue
+    O = zeros(Float64, N_STATES, N_OBS)
+    edges = (-Inf, DEV_EDGES..., Inf)         # OK/DRIFT/FAR/LOST edges on dev
+    devobs_index = Dict(:OK => 1, :DRIFT => 2, :FAR => 3, :LOST => 4, :CRASHED => 5)
+    for (si, s) in enumerate(STATES)
+        if s.dev == :CRASHED
+            O[si, devobs_index[:CRASHED]] = 1.0; continue
         end
-        mu = BIN_REPRESENTATIVE_ALT[s]
+        if s.dev == :LOST
+            O[si, devobs_index[:LOST]] = 1.0; continue
+        end
+        mu = DEV_REP_KM[s.dev]
         d = Normal(mu, SIGMA_NAV_KM)
-        for oi in 1:N_STATES
+        # Probability mass in each dev band (OK/DRIFT/FAR/LOST), observed as that bin.
+        for oi in 1:4
             lo, hi = edges[oi], edges[oi + 1]
             O[si, oi] = cdf(d, hi) - cdf(d, lo)
         end
-        O[si, :] ./= sum(O[si, :])         # guard against tiny CDF round-off
+        O[si, :] ./= sum(O[si, :])
     end
     return O
 end

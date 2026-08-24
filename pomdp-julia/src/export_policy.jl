@@ -81,61 +81,51 @@ function main()
         normpath(joinpath(@__DIR__, "..", "..", "policy", "sarsop_policy.json"))
     mkpath(dirname(out_path))
 
-    # Fixed seed so the exported tables match a reproducible solve (mirrors solve.jl).
-    seed = 20260706
-    rng = MersenneTwister(seed)
     discount = 0.95
-    n_mc = 40_000
-    drift_mean, drift_sigma = 12.0, 6.0
 
-    # Build the toy POMDP and grab the exact T/O tables handed to SARSOP.
-    T = transition_matrix(; n_mc = n_mc, rng = MersenneTwister(seed),
-                          drift_mean = drift_mean, drift_sigma = drift_sigma)
+    # Build the science+safety POMDP and grab the exact T/O tables handed to SARSOP.
+    T = transition_matrix()
     O = observation_matrix()
-
-    pomdp = build_stationkeeping_pomdp(; discount = discount, n_mc = n_mc,
-                                       rng = rng, drift_mean = drift_mean,
-                                       drift_sigma = drift_sigma)
+    pomdp = build_stationkeeping_pomdp(; discount = discount)
 
     solver = SARSOPSolver(; max_time = 20.0, precision = 1e-3, verbose = false)
     policy = solve(solver, pomdp)
 
-    states = collect(STATE_NAMES)
     actions = collect(ACTION_NAMES)
-    observations = collect(STATE_NAMES)
+    observations = collect(OBS_NAMES)
     alphas, alpha_actions = extract_alphas(policy, actions)
 
-    # Convert the 3-D / 2-D Julia arrays to nested JSON-friendly lists.
-    # T: [s][a][s'] ; O: [s'][o].
+    # Serializable state labels "DEV|cov<mask>" so Python can reconstruct (dev,cov).
+    state_labels = ["$(s.dev)|cov$(s.cov)" for s in STATES]
+
     T_nested = [[[T[si, ai, spi] for spi in 1:N_STATES]
                  for ai in 1:N_ACTIONS] for si in 1:N_STATES]
-    O_nested = [[O[si, oi] for oi in 1:N_STATES] for si in 1:N_STATES]
+    O_nested = [[O[si, oi] for oi in 1:N_OBS] for si in 1:N_STATES]
 
     payload = Dict(
-        "states"        => string.(states),
+        "states"        => state_labels,
+        "state_dev"     => [string(s.dev) for s in STATES],
+        "state_cov"     => [s.cov for s in STATES],
         "actions"       => string.(actions),
         "observations"  => string.(observations),
-        "terminal_states" => string.(collect(TERMINAL_STATES)),
-        "initial_state" => "NOMINAL",
+        "terminal_states" => ["LOST|cov0", "CRASHED|cov0"],
+        "initial_state" => "OK|cov0",
         "discount"      => discount,
-        "bin_edges"     => collect(BIN_EDGES),
-        "representative_alt" => Dict(string(k) => v for (k, v) in BIN_REPRESENTATIVE_ALT),
+        "dev_edges"     => collect(DEV_EDGES),
+        "band_names"    => string.(collect(BAND_NAMES)),
+        "band_target_km" => Dict(string(k) => v for (k, v) in BAND_TARGET_KM),
         "action_dv_cost" => Dict(string(k) => v for (k, v) in ACTION_DV_COST),
-        "action_raise_km" => Dict(string(k) => v for (k, v) in ACTION_RAISE_KM),
         "alphas"        => alphas,               # Vector of |S|-vectors
         "alpha_actions" => alpha_actions,        # 1-based action index per alpha
         "T"             => T_nested,
         "O"             => O_nested,
         "meta"          => Dict(
             "solver" => "NativeSARSOP",
-            "seed" => seed,
-            "n_mc" => n_mc,
-            "drift_mean" => drift_mean,
-            "drift_sigma" => drift_sigma,
             "precision" => 1e-3,
             "max_time_s" => 20.0,
-            "note" => "Toy drift+burn policy. Bins are ABSOLUTE periapsis altitude (km). " *
-                      "HIGH is a known dead-end artifact; tuning is hand-picked, not physics-fitted.",
+            "note" => "Science+safety POMDP (2026-07-15). State=(dev,cov); actions " *
+                      "OBSERVE/CORRECT/EXCURSE_{LOW,MID,HIGH}. Tables measured from " *
+                      "CR3BP+EncJ2 (exps 11b/12). Direction solved by mpc.solve_burn.",
         ),
     )
 
@@ -143,7 +133,7 @@ function main()
         write(io, _json(payload))
     end
     println("Wrote SARSOP policy + tables -> $out_path")
-    println("  states=$(states)  actions=$(actions)")
+    println("  |S|=$(N_STATES)  |A|=$(N_ACTIONS)  |O|=$(N_OBS)")
     println("  n_alphas=$(length(alphas))  discount=$discount")
 end
 

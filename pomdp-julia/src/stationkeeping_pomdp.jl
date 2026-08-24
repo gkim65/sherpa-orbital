@@ -1,22 +1,21 @@
 """
-stationkeeping_pomdp.jl — the toy Enceladus stationkeeping POMDP.
+stationkeeping_pomdp.jl — the science+safety Enceladus stationkeeping POMDP.
 
-A tiny, self-contained POMDP that proves the POMDPs.jl + NativeSARSOP toolchain
-and the stationkeeping formulation. NOT a fidelity model — the dynamics are the
-crude drift+burn placeholder in `dynamics.jl`.
+Trades SCIENCE (sample a range of periapsis altitudes) against SAFETY (don't crash or
+escape the unstable period-3 halo). Physics-grounded: state/action/transition come from
+measured CR3BP+EncJ2 experiments (see dynamics.jl + docs/pomdp-proposal-2026-07-13.md).
 
 Formulation
-  State   : periapsis-altitude bin  (CRASHED / LOW / NOMINAL / HIGH / ESCAPED)
-            CRASHED and ESCAPED are terminal.
-  Action  : NO_BURN / SMALL_BURN / LARGE_BURN  (fixed delta-V raises, applied
-            with random burn efficiency eta_eff ~ Uniform(0.8, 1.0)).
-  Obs     : noisy altitude bin (same 5 bins), from 2 km Gaussian nav noise ->
-            partial observability.
-  Reward  : reward for holding NOMINAL; penalise LOW, big penalty for CRASH /
-            ESCAPE; small fuel penalty proportional to delta-V spent.
-
-The T and O tables are Monte-Carlo / analytically precomputed in `dynamics.jl`;
-SARSOP consumes them offline and never touches the dynamics.
+  State   : (dev, cov)  — dev = apse-deviation safety bin (OK/DRIFT/FAR/LOST/CRASHED),
+            cov = 3-bit coverage mask over science altitude bands (LOW/MID/HIGH).
+            LOST and CRASHED are terminal.
+  Action  : OBSERVE / CORRECT / EXCURSE_LOW / EXCURSE_MID / EXCURSE_HIGH.
+            Direction of any burn is solved by mpc.solve_burn in the rollout (exp 04);
+            the action only picks INTENT.
+  Obs     : noisy dev bin (nav noise on the apse deviation); cov known exactly.
+  Reward  : + R_SCIENCE for each NEWLY sampled band, − fuel (ACTION_DV_COST),
+            large − on CRASHED / LOST. The agent must sequence excursions while staying
+            safe, and stop excursing once all bands are covered.
 """
 
 using POMDPs
@@ -28,70 +27,72 @@ include("dynamics.jl")
 # ---------------------------------------------------------------------------
 # Reward parameters.
 # ---------------------------------------------------------------------------
-const R_NOMINAL   =  10.0     # holding the target band
-const R_HIGH      =  -1.0     # safe but wasteful (too high / drifting out)
-const R_LOW       =  -5.0     # dangerous: one step from crash
-const R_CRASHED   = -100.0    # mission loss
-const R_ESCAPED   = -100.0    # mission loss
+const R_SCIENCE   =  20.0     # reward for sampling a band we had NOT sampled yet
+const R_STEP_OK   =   0.5     # small living reward for staying safe (non-terminal)
+const R_CRASHED   = -200.0    # mission loss
+const R_LOST      = -200.0    # mission loss (escape)
 const FUEL_WEIGHT =   1.0     # multiplies ACTION_DV_COST (m/s) as a penalty
 
-const STATE_REWARD = Dict(
-    :CRASHED => R_CRASHED,
-    :LOW     => R_LOW,
-    :NOMINAL => R_NOMINAL,
-    :HIGH    => R_HIGH,
-    :ESCAPED => R_ESCAPED,
-)
-
 """
-    build_stationkeeping_pomdp(; discount, n_mc, rng, drift_mean, drift_sigma)
+    build_stationkeeping_pomdp(; discount)
 
-Construct the toy stationkeeping POMDP as a DiscreteExplicitPOMDP-style
-QuickPOMDP with precomputed transition/observation tables.
+Construct the science+safety POMDP as a QuickPOMDP over the enumerated (dev,cov) states
+with the measured transition/observation tables from dynamics.jl.
 """
-function build_stationkeeping_pomdp(; discount::Float64 = 0.95,
-                                    n_mc::Int = 20_000,
-                                    rng = Random.default_rng(),
-                                    drift_mean::Float64 = 12.0,
-                                    drift_sigma::Float64 = 6.0)
-
-    T = transition_matrix(; n_mc = n_mc, rng = rng,
-                          drift_mean = drift_mean, drift_sigma = drift_sigma)
+function build_stationkeeping_pomdp(; discount::Float64 = 0.95, kwargs...)
+    T = transition_matrix(; kwargs...)
     O = observation_matrix()
 
-    states = collect(STATE_NAMES)
+    states = STATES                      # Vector{SKState}
     actions = collect(ACTION_NAMES)
-    observations = collect(STATE_NAMES)
+    observations = collect(OBS_NAMES)
 
-    sidx = Dict(s => i for (i, s) in enumerate(states))
+    sidx = STATE_INDEX
     aidx = Dict(a => i for (i, a) in enumerate(actions))
+
+    isterm(s::SKState) = isterminal_dev(s.dev)
+
+    # Indices of the terminal states, for the expected terminal-entry penalty.
+    i_crashed = sidx[SKState(:CRASHED, 0)]
+    i_lost    = sidx[SKState(:LOST, 0)]
+
+    # r(s,a): living reward + fuel penalty + science for a first-time band + the
+    # EXPECTED penalty for transitioning INTO a terminal state this step. Encoding the
+    # crash/escape cost as its expectation over T[s,a,·] is exact for expected-reward
+    # planning and is the standard QuickPOMDP-compatible way to penalize terminal entry.
+    function reward(s::SKState, a::Symbol)
+        isterm(s) && return 0.0
+        r = R_STEP_OK - FUEL_WEIGHT * ACTION_DV_COST[a]
+        banded = get(EXCURSE_BAND, a, 0)
+        if banded != 0 && !cov_has(s.cov, banded)
+            r += R_SCIENCE                 # first time sampling this band
+        end
+        row = T[sidx[s], aidx[a], :]
+        r += row[i_crashed] * R_CRASHED + row[i_lost] * R_LOST
+        return r
+    end
 
     return QuickPOMDP(
         states = states,
         actions = actions,
         observations = observations,
         discount = discount,
-        isterminal = s -> s in TERMINAL_STATES,
+        isterminal = isterm,
 
-        # Start every episode holding NOMINAL (the injected orbit).
-        initialstate = Deterministic(:NOMINAL),
+        # Start: on the nominal orbit (dev OK), no bands sampled yet.
+        initialstate = Deterministic(SKState(:OK, 0)),
 
-        # T[s,a,:] over next states.
         transition = function (s, a)
             row = T[sidx[s], aidx[a], :]
             return SparseCat(states, row)
         end,
 
-        # O depends only on the landed state s' here (nav noise on altitude).
+        # Observation depends on the landed state's dev bin (nav noise); cov exact.
         observation = function (a, sp)
             row = O[sidx[sp], :]
             return SparseCat(observations, row)
         end,
 
-        # Reward = state-holding reward - fuel penalty. No reward once terminal.
-        reward = function (s, a)
-            s in TERMINAL_STATES && return 0.0
-            return STATE_REWARD[s] - FUEL_WEIGHT * ACTION_DV_COST[a]
-        end,
+        reward = reward,
     )
 end

@@ -7,3 +7,5 @@ claude.md
 *.DS_Store
 
 docs/**
+# Generated figure outputs (regenerate via scripts/)
+figures/
