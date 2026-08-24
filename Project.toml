@@ -4,9 +4,11 @@ version = "0.1.0"
 authors = ["Grace Kim <gkim65@stanford.edu>"]
 
 [deps]
+DiffEqCallbacks = "459566f4-90b8-5000-8ac3-15dfb0a30def"
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
 JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
 POMDPTools = "7588e00f-9cae-40de-98dc-e0c70c48cdd7"
 POMDPs = "a93abf59-7444-517b-a68a-c42f96afdd7d"
 Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
@@ -14,9 +16,11 @@ QuickPOMDPs = "8af83fb2-a731-493c-9049-9e19dbce6165"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 
 [compat]
+DiffEqCallbacks = "4.19.2"
 Distributions = "0.25.131"
 JSON = "1.7.1"
 LinearAlgebra = "1.12.0"
+OrdinaryDiffEq = "7.7.0"
 POMDPTools = "1.1.0"
 POMDPs = "1.0.0"
 Printf = "1.11.0"

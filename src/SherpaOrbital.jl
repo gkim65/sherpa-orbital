@@ -22,10 +22,19 @@ module SherpaOrbital
 
 using Distributions
 using JSON
+using OrdinaryDiffEq
 using POMDPs
 using POMDPTools
 using QuickPOMDPs
 using Printf
+
+# Physics layer: constants, then dynamics (truth/onboard split preserved), then
+# propagation. Nothing below may hardcode a physical constant.
+include("constants.jl")
+include("dynamics/cr3bp.jl")
+include("dynamics/cr3bp_j2.jl")
+include("dynamics/cr3bp_saturn_j2.jl")
+include("dynamics/integrator.jl")
 
 # Configuration struct first: everything below dispatches on it.
 include("StationkeepingPOMDP.jl")
@@ -40,6 +49,21 @@ include("export.jl")
 include("common/report.jl")
 
 export
+    # dynamics — onboard model (CR3BP) and truth models (+J2). Kept separate.
+    cr3bp_eom!,
+    cr3bp_j2_eom!,
+    cr3bp_saturn_enc_j2_eom!,
+    jacobi_constant,
+    libration_points_x,
+    # propagation + events
+    propagate,
+    propagate_to_apoapsis,
+    propagate_to_periapsis,
+    propagate_n_orbits,
+    collect_apses,
+    r_enceladus,
+    rdot_enceladus,
+    altitude,
     # configuration + model
     StationkeepingPOMDP,
     build_pomdp,
