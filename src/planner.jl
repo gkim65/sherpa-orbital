@@ -12,9 +12,8 @@ planner believes and what the world does is the model uncertainty the POMDP abso
 truth EOM appearing in this file would silently erase the project's central quantity.
 
 The `eom` keyword exists ONLY so an ablation study can deliberately hand the planner a
-perfect model and measure what that is worth (`scripts/mpc_planner_ablation.py` in the
-Python reference measured this: a perfect onboard model does not extend survival —
-the failure is instability-dominated). It defaults to the onboard model.
+perfect model and measure what that is worth. Measured: a perfect onboard model does not
+extend survival — the failure is instability-dominated. It defaults to the onboard model.
 
 Burn solver
 -----------
@@ -118,37 +117,6 @@ function predict_apses(
     return peri_alt, apo_alt
 end
 
-"""
-    nominal_apse_positions(ref_ic, period_s; eom!, rtol, atol) -> (r_peri_nom, r_apo_nom)
-
-Periapsis and apoapsis POSITION vectors (3-vectors, km, barycentre frame) of a nominal
-reference orbit.
-
-Propagates the uncontrolled reference IC for one revolution under the onboard model and
-records its first periapsis/apoapsis positions. These are the `r_apse,nominal` targets for
-MacKenzie Strategy 3 apse-position bounding — see `mode = :position` in
-[`solve_burn`](@ref).
-
-⚠️ DEPRECATED — window-based. Use [`next_apse_positions`](@ref) instead.
-
-Reports only apses falling inside the `period_s` window, so a window too short to contain an
-apoapsis returns `[NaN, NaN, NaN]`, which poisons the apoapsis half of the `:position`
-residual. Retained only as the comparison anchor for `scratch/compare/ref_planner.json`,
-whose frozen reference entries have no other counterpart now that the Python source is gone.
-New code should not call it; if this function is ever removed, retire those JSON entries in
-the same commit.
-"""
-function nominal_apse_positions(
-    ref_ic::AbstractVector{<:Real},
-    period_s::Real;
-    eom! = cr3bp_eom!,
-    rtol::Real = RTOL_ONBOARD,
-    atol::Real = ATOL_ONBOARD,
-)
-    peri_state, apo_state = predict_apse_states(ref_ic, 1, period_s;
-                                                eom! = eom!, rtol = rtol, atol = atol)
-    return copy(peri_state[1:3]), copy(apo_state[1:3])
-end
 
 """
     next_apses(state0, n_peri, n_apo; eom!, rtol, atol, t_guess, max_expansions)
@@ -161,10 +129,10 @@ Asks for a COUNT, not a time window: it propagates in expanding chunks until it 
 apses requested, and throws if they cannot be found within the safety horizon. There is no
 empty-return path to mistake for a valid answer.
 
-Prefer this over the window-based [`nominal_apse_positions`](@ref), where a window too short
-to contain an apse yields `NaN`. That is not hypothetical on this orbit: the period-3 orbit
-has 3 periapses but only 2 apoapses, so the `T/3` control interval falls 0.136 s short of the
-first apoapsis.
+A window-based search (ask for a time span, take whatever apses fall inside) is the trap this
+replaces: on this orbit the period-3 halo has 3 periapses but only 2 apoapses, so the `T/3`
+control interval falls 0.136 s short of the first apoapsis and a window search comes back
+empty.
 
   - `t_guess` — first chunk length (s); a hint, not a bound. Later chunks double.
   - `max_expansions` — doubling limit before erroring. Horizon searched is
@@ -212,7 +180,7 @@ end
 POSITION vectors (3-vectors, km, barycentre frame) of the next periapsis and next apoapsis
 ahead of `state0`, via [`next_apses`](@ref).
 
-This is the count-based replacement for [`nominal_apse_positions`](@ref): it takes no time
+Count-based: it takes no time
 window, so it cannot return a `NaN` target from a too-short horizon. Both returned vectors
 are guaranteed finite — `next_apses` throws rather than reporting a missing apse.
 """
@@ -245,7 +213,7 @@ data. Bad targets are a SETUP error, so they are raised where they are introduce
 
 Three rejections, one per way a target has actually gone wrong in this project:
 
- 1. **Non-finite** — the window-based [`nominal_apse_positions`](@ref) returns `NaN` when
+ 1. **Non-finite** — a window-based apse search returns `NaN` when
     its window is too short to contain an apse (the `T/3` defect). `NaN` poisons its half of
     the residual and `solve_burn` cannot converge.
 
@@ -329,7 +297,6 @@ Two targeting modes:
   - `mode = :position` (Strategy 3 proper) — the 6-vector
     `[r_peri − r_peri_nom, r_apo − r_apo_nom]` (km), bounding the full apse position
     vectors against the nominal orbit. `r_peri_nom` and `r_apo_nom` are required
-    (see [`nominal_apse_positions`](@ref)).
 """
 function apse_residual(
     state0::AbstractVector{<:Real},

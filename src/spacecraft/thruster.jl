@@ -22,10 +22,9 @@ A minimal stand-in for burn execution error, not a full thruster degradation mod
 random-walk degradation model is explicitly deferred (`docs/todo.md` Phase 2).
 
 RNG DISCIPLINE. Every sampler takes an explicit `rng::AbstractRNG` and never touches the
-global RNG, so a rollout's stochastic stream is a function of its own seed alone. Note this
-port CANNOT be bit-compared against the Python reference: `numpy.random.default_rng`
-(PCG64) and Julia's `Xoshiro` are different generators, so identical seeds give different
-streams. The port is validated DISTRIBUTIONALLY instead — see `scratch/compare/`.
+global RNG, so a rollout's stochastic stream is a function of its own seed alone.
+These samplers are validated DISTRIBUTIONALLY (sample statistics against the analytic law),
+not by bit-comparison — see `scratch/compare/compare_spacecraft.jl`.
 """
 
 # Uniform burn-efficiency bounds (Phase 3 spec, docs/todo.md: "sample halo IC +

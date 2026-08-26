@@ -112,7 +112,7 @@ function libration_points_x()
     x_L1 = (1.0 - mu - gamma_L1) * L_STAR
     x_L2 = (1.0 - mu + gamma_L2) * L_STAR
 
-    # L3 (beyond Saturn): low-order series, as in the Python reference.
+    # L3 (beyond Saturn): low-order series.
     gamma_L3_guess = 1.0 - 7mu / 12
     x_L3 = -(mu + gamma_L3_guess) * L_STAR
 

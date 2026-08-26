@@ -61,7 +61,7 @@ ic_nondim_to_physical(x_nd::Real, y_nd::Real, z_nd::Real,
 
 # ── Distance helpers in the CR3BP frame ──────────────────────────────────────
 # These duplicate `r_enceladus`/`altitude` from dynamics/integrator.jl under the names
-# used by the Python reference, so ported call sites read the same.
+# the conventional ordering, so call sites read the same.
 
 """
     r_from_enceladus(state) -> Float64

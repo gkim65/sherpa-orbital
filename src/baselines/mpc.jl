@@ -25,7 +25,7 @@ Fuel metric
 -----------
 Reported as ΔV (m/s). `ISP_MR106E` and `M_SPACECRAFT_WET` are in `constants.jl` but are not
 yet wired: the ΔV → propellant-mass conversion via the rocket equation is still a TODO,
-carried over from the Python reference.
+carried over from the original formulation.
 
 References
   MacKenzie, S. M. et al. (2020). Enceladus Orbilander: A Flagship Mission Concept for
@@ -106,12 +106,9 @@ function run_mpc(
     r_apo_nom = nothing
     if mode === :position
         ref = ref_ic === nothing ? state0 : ref_ic
-        # Count-based apse search. `period_s` is the CONTROL cadence (T/3 for the period-3
-        # orbit) and is NOT a valid apse-search window: the orbit has 3 periapses but only 2
-        # apoapses, so T/3 lands 0.136 s short of the first apoapsis and the old
-        # window-based nominal_apse_positions returned a NaN apoapsis target.
-        # The `mode = :altitude` default never reached this branch, which is why the
-        # Session-3 run_mpc reference signature is unaffected.
+        # `period_s` is the CONTROL cadence (T/3), not a valid apse-search window: the
+        # period-3 orbit has 3 periapses but only 2 apoapses, so T/3 falls short of the
+        # first apoapsis. Hence the count-based search here.
         r_peri_nom, r_apo_nom = next_apse_positions(ref; eom! = cr3bp_eom!)
     end
 

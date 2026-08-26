@@ -16,7 +16,7 @@ committed artifact becomes a machine-generated record with a reproducible proven
      presented as characterising the intended south-polar orbit.
   2. THE ORBIT IS VIOLENTLY UNSTABLE. It escapes in ~2 revs uncontrolled, so the OBSERVE
      rows are dominated by that instability rather than by model uncertainty (see the
-     Session-3 planner-model ablation: failure is instability-dominated).
+     planner-model ablation: failure is instability-dominated).
   3. FAR IS BARELY REACHABLE UNDER A HOLDING CONTROLLER. The sustained CORRECT loop keeps
      dev small by construction, so the loop visits OK constantly, DRIFT occasionally, and
      FAR almost never. Rows are reported WITH THEIR TRIAL COUNTS and a row measured from
@@ -26,7 +26,7 @@ committed artifact becomes a machine-generated record with a reproducible proven
      section [D]. A non-converged `solve_burn` returns ΔV = 0, i.e. CORRECT degenerates
      into OBSERVE. That is recorded per row as `n_nonconverged`.
 
-METHOD (mirrors python-legacy/scripts/pomdp_experiments/11b and 12)
+METHOD
   CORRECT : run the sustained shell-cadence CORRECT loop and log dev_before → dev_after.
   OBSERVE : from the SAME visited shell states, coast one pass with NO burn — a
             counterfactual "what if we had observed instead", so both rows condition on the

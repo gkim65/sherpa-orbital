@@ -120,7 +120,6 @@ export
     escape_callback,
     predict_apses,
     predict_apse_states,
-    nominal_apse_positions,
     next_apses,
     next_apse_positions,
     validate_apse_targets,

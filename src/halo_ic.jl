@@ -31,7 +31,7 @@ not inherit the scipy-vs-`ContinuousCallback` "event at `t0`" difference documen
 `dynamics/integrator.jl`. Do not "simplify" the coasts away — they are the crossing-counting
 logic.
 
-⚠️ KNOWN DEFECT, carried over from the Python reference. The converged period-3 IC has
+⚠️ KNOWN DEFECT. The converged period-3 IC has
 `z0 < 0` (southern out-of-plane amplitude), but the closest approach of this symmetric
 period-3 bifurcation orbit falls at ~+87° latitude — the NORTH pole — not the south pole
 the science case targets. Placing periapsis over the south pole needs the asymmetric
@@ -96,7 +96,7 @@ Augmented non-dimensional EOM: 6 state components followed by the 36 flattened S
 components (42 total), with `dΦ/dt = A(t) Φ` where `A` is the Jacobian of
 [`cr3bp_nd`](@ref).
 
-The STM is stored column-major (Julia `reshape` order); the Python reference stores it
+The STM is stored column-major (Julia `reshape` order); a row-major reference stores it
 row-major. The two agree because `A Φ` is computed from the reshaped matrix in both, but
 any code reading raw elements out of the flat vector must use the matching order.
 """

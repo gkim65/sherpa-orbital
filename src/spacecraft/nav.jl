@@ -53,8 +53,8 @@ standard deviation `sigma_r`.
   - `sigma_r` — 1σ altitude noise (km); default `SIGMA_NAV_POS` (MacKenzie 2020 §C.1).
 
 Returns the noisy altitude (km). Note the observation is unbounded below: a small true
-altitude can be observed as negative. That matches the Python reference, and is the
-caller's business — the rollout harness bins `abs(·)` of a deviation, not an altitude.
+altitude can be observed as negative. That is the caller's business — the rollout harness
+bins `abs(·)` of a deviation, not an altitude.
 """
 observe_altitude(
     true_altitude_km::Real,
@@ -70,9 +70,8 @@ belief filter in the rollout harness.
 
 A deviation is a non-negative magnitude, so the noisy read is folded with `abs`: the
 underlying scalar Gaussian model is the same one `observe_altitude` uses, but a negative
-draw is reflected rather than passed through to the binner. This reproduces
-`abs(dev_km + rng.normal(0, sigma_nav_km))` in the Python reference's rollout
-(`baselines/pomdp_rollout.py`), where the fold lived at the call site.
+draw is reflected rather than passed through to the binner. The fold lives here rather
+than at the call site so every consumer gets the same convention.
 """
 observe_deviation(
     true_dev_km::Real,

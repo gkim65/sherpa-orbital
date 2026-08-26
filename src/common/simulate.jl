@@ -31,7 +31,7 @@ Each control step:
      state (a belief, for SARSOP; nothing, for MPC).
 
 RELATIONSHIP TO `run_mpc`
-`run_mpc` in `baselines/mpc.jl` is retained UNCHANGED as the validated Session-3 reference
+`run_mpc` in `baselines/mpc.jl` is retained UNCHANGED as the validated reference
 — it is what reproduces the documented "escape @ 77.96 hr, 5 burns, 37.579 m/s" signature.
 `simulate` with an `MPCController` is the harness-unified path; the two are cross-checked
 numerically in `scratch/compare/compare_simulate.jl`. They are not expected to agree
@@ -101,10 +101,9 @@ controller_type(::MPCController) = "MPC"
 function controller_setup!(c::MPCController, state0::AbstractVector, period_s::Real)
     if c.mode === :position
         ref = c.ref_ic === nothing ? state0 : c.ref_ic
-        # Count-based, NOT the period-shaped nominal_apse_positions: callers pass
-        # period_s = T/3, which is the inter-periapsis interval and falls 0.136 s short of
-        # the first apoapsis, yielding a NaN target. `period_s` is still the CONTROL cadence
-        # and is passed to solve_burn below; it is just not a valid apse-search window.
+        # `period_s` is the CONTROL cadence (T/3), not a valid apse-search window: the
+        # period-3 orbit has 3 periapses but only 2 apoapses, so T/3 falls short of the
+        # first apoapsis. Hence the count-based search here.
         c.r_peri_nom, c.r_apo_nom = next_apse_positions(ref; eom! = cr3bp_eom!)
     end
     return nothing
