@@ -136,16 +136,9 @@ const CFG = StationkeepingPOMDP()
         repeat = r(SKState(:OK, cov_set(0, 1)), :EXCURSE_LOW)
         @test fresh - repeat ≈ CFG.r_science
 
-        # Fuel is a cost: CORRECT is charged r_fuel, OBSERVE is not. Asserted on the
-        # FUEL TERM directly rather than on the two totals.
-        #
-        # ⚠️ The totals do NOT order the intuitive way, and the original `- 50` fudge
-        # here was hiding that rather than smoothing a rounding error. Measured:
-        # OBSERVE from (:OK, 7) = -5.5 vs CORRECT = -2.8, i.e. the free action is WORSE.
-        # Cause: from :OK, OBSERVE carries transition risk that CORRECT removes, and that
-        # risk outweighs CORRECT's fuel cost. That is the model working as intended --
-        # stationkeeping is worth paying for -- so the old comment ("the free action beats
-        # an equally-safe paid one") was simply false: the two actions are NOT equally safe.
+        # Fuel is charged to CORRECT and not to OBSERVE. Tested on the fuel term itself,
+        # not on the two totals: OBSERVE does NOT score better overall, because from :OK
+        # it carries drift risk that CORRECT removes.
         cfg0 = StationkeepingPOMDP(; fuel_weight = 0.0)
         no_fuel = SherpaOrbital.reward_function(cfg0, model_tables(cfg0)[1])
         @test no_fuel(SKState(:OK, 7), :CORRECT) > r(SKState(:OK, 7), :CORRECT)

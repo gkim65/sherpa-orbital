@@ -129,22 +129,14 @@ records its first periapsis/apoapsis positions. These are the `r_apse,nominal` t
 MacKenzie Strategy 3 apse-position bounding — see `mode = :position` in
 [`solve_burn`](@ref).
 
-⚠️ WINDOW-BASED, AND THAT IS A DEFECT. Prefer [`next_apse_positions`](@ref), which asks for
-an apse COUNT and cannot come back empty. This function reports only the apses that fall
-inside the `period_s` window, so a window too short to contain an apoapsis yields
-`[NaN, NaN, NaN]` — which then poisons the apoapsis half of the `:position` residual,
-makes `solve_burn` return ΔV = 0 with `residual = Inf`, and silently degrades a CORRECT
-action into an OBSERVE.
+⚠️ DEPRECATED — window-based. Use [`next_apse_positions`](@ref) instead.
 
-That is not hypothetical: every caller passes `PERIOD3_PERIOD_S / 3`, and the period-3 orbit
-has 3 periapses but only 2 apoapses, so `T/3` is the inter-periapsis interval and falls
-0.136 s SHORT of the first apoapsis. The Python reference masks this — the period-3 IC sits
-exactly at apoapsis (ṙ(0) = 0), scipy reports a phantom `t = 0` root, and Python returns the
-IC's own position while reporting `converged = True` on a circular zero residual. Julia's
-`ContinuousCallback` requires a sign change, correctly ignores `t = 0`, and finds nothing.
-
-Retained so the Session-3-validated numbers stay reproducible and the Python comparison
-harness has something to compare against. New code should not call it.
+Reports only apses falling inside the `period_s` window, so a window too short to contain an
+apoapsis returns `[NaN, NaN, NaN]`, which poisons the apoapsis half of the `:position`
+residual. Retained only as the comparison anchor for `scratch/compare/ref_planner.json`,
+whose frozen reference entries have no other counterpart now that the Python source is gone.
+New code should not call it; if this function is ever removed, retire those JSON entries in
+the same commit.
 """
 function nominal_apse_positions(
     ref_ic::AbstractVector{<:Real},
@@ -165,32 +157,21 @@ end
 Collect the next `n_peri` periapsis and `n_apo` apoapsis passages ahead of `state0` under
 the onboard model, as two vectors of `(t, state)` pairs. Barycentre frame, km / km/s.
 
-⚠️ WHY THIS EXISTS — ask for a COUNT, not a time window.
+Asks for a COUNT, not a time window: it propagates in expanding chunks until it has the
+apses requested, and throws if they cannot be found within the safety horizon. There is no
+empty-return path to mistake for a valid answer.
 
-[`collect_apses`](@ref) and the period-shaped [`nominal_apse_positions`](@ref) take a time
-WINDOW and report whichever apses happen to fall inside it. That pushes the burden onto the
-caller: to get "the next periapsis and the next apoapsis" you must supply a window long
-enough to contain both, and *guess how long that is*. Guess short and you silently get
-nothing back — a `NaN` apse in Julia, or (in the Python reference) a phantom `t = 0` root
-reported as a real apse.
+Prefer this over the window-based [`nominal_apse_positions`](@ref), where a window too short
+to contain an apse yields `NaN`. That is not hypothetical on this orbit: the period-3 orbit
+has 3 periapses but only 2 apoapses, so the `T/3` control interval falls 0.136 s short of the
+first apoapsis.
 
-That guess is wrong for the orbit this project flies. Callers pass `PERIOD3_PERIOD_S / 3`
-because a control decision happens at every periapsis approach, but the period-3 orbit has
-**3 periapses and only 2 apoapses** per period, so `T/3` is the *inter-periapsis* interval,
-NOT an apse-to-apse revolution — it lands 0.136 s short of the first apoapsis. See the
-`nominal_apse_positions` docstring for the full failure chain.
+  - `t_guess` — first chunk length (s); a hint, not a bound. Later chunks double.
+  - `max_expansions` — doubling limit before erroring. Horizon searched is
+    `t_guess × (2^max_expansions − 1)`.
 
-This function removes the guess: it propagates in expanding chunks until it actually HAS the
-apses requested, and throws if they genuinely cannot be found within the safety horizon.
-There is no "returned nothing" path to mistake for a valid answer.
-
-  - `t_guess` — first chunk length (s); a period-scale hint, not a bound. Later chunks
-    double. Defaults to `PERIOD3_PERIOD_S`.
-  - `max_expansions` — chunk-doubling limit before erroring. The total horizon searched is
-    `t_guess × (2^max_expansions − 1)`, so the default 6 covers 63 × `t_guess`.
-
-Escape is the expected reason for failure: a spacecraft on its way out has no next apoapsis,
-and the error names the horizon searched so a caller can tell that apart from a bad IC.
+Escape is the expected failure: a departing spacecraft has no next apoapsis, and the error
+names the horizon searched.
 """
 function next_apses(
     state0::AbstractVector{<:Real},
