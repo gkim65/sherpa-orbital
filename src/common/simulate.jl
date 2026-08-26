@@ -101,8 +101,11 @@ controller_type(::MPCController) = "MPC"
 function controller_setup!(c::MPCController, state0::AbstractVector, period_s::Real)
     if c.mode === :position
         ref = c.ref_ic === nothing ? state0 : c.ref_ic
-        c.r_peri_nom, c.r_apo_nom =
-            nominal_apse_positions(ref, period_s; eom! = cr3bp_eom!)
+        # Count-based, NOT the period-shaped nominal_apse_positions: callers pass
+        # period_s = T/3, which is the inter-periapsis interval and falls 0.136 s short of
+        # the first apoapsis, yielding a NaN target. `period_s` is still the CONTROL cadence
+        # and is passed to solve_burn below; it is just not a valid apse-search window.
+        c.r_peri_nom, c.r_apo_nom = next_apse_positions(ref; eom! = cr3bp_eom!)
     end
     return nothing
 end
@@ -274,7 +277,9 @@ end
 
 function controller_setup!(c::SARSOPController, state0::AbstractVector, period_s::Real)
     ref = c.ref_ic === nothing ? state0 : c.ref_ic
-    c.r_peri_nom, c.r_apo_nom = nominal_apse_positions(ref, period_s; eom! = cr3bp_eom!)
+    # Count-based — see the MPCController setup above for why period_s is not a valid
+    # apse-search window.
+    c.r_peri_nom, c.r_apo_nom = next_apse_positions(ref; eom! = cr3bp_eom!)
     c.apo_nom_alt_km = norm(_enc_relative(c.r_apo_nom)) - R_ENCELADUS
     return nothing
 end
@@ -367,8 +372,29 @@ no per-baseline special-casing:
   - `type` — `"MPC"` / `"SARSOP"`
   - `survived`, `outcome` — `:held`, `:idle`, `:crash`, `:escape`, `:max_steps`
   - `survival_time_s`, `n_steps`, `n_burns`, `total_dv_ms`
+  - `n_solves`, `n_failed_solves` — how many control steps ran a burn solve, and how many of
+    those did not converge. ⚠️ ALWAYS CHECK THESE before reading any other number. A failed
+    solve returns ΔV = 0, so a run in which every solve failed is a run with no control at
+    all, yet it reports a plausible `n_steps` and a `survived = true` outcome. This is not
+    hypothetical: it is how the `T/3` NaN-apoapsis defect produced a full calibration table
+    of quietly uncontrolled rollouts. `n_failed_solves == n_solves > 0` means the result
+    describes an uncontrolled coast, whatever the outcome field says.
   - `min_peri_alt_km` — smallest periapsis altitude visited (km)
-  - `science_cov`, `n_bands` — coverage bitmask and its popcount (0 for MPC)
+  - `science_cov`, `n_bands` — coverage bitmask and its popcount (0 for MPC).
+    ⚠️ AN UPPER BOUND, NOT A MEASUREMENT. A band is banked because the excursion was
+    COMMANDED and the pass survived to a periapsis — the achieved altitude is never checked
+    against the band. With the `:position` targeting floor at ~10 km (see the planner notes)
+    a commanded excursion can easily land outside its band and still be counted. Use
+    `peri_alts_km` to check where the passes actually went. Gating the bitmask on achieved
+    altitude is deliberately NOT done here: it would make `cov` stochastic and only
+    partially observed, which breaks the exact-observation assumption behind
+    `policy_reconcentrate_cov!` and would require re-measuring every transition kernel.
+  - `peri_alts_km`, `peri_lats_deg` — achieved periapsis altitude (km) and latitude (deg)
+    per control step. Latitude is what the south-polar science case turns on and is
+    invisible in an altitude or a deviation norm.
+  - `max_dev_trans_km` — largest TRANSVERSE (along-track + out-of-plane) periapsis
+    deviation. Altitude errors are radial; this is the part of a position miss that a
+    radius cannot see, and it is where most of the `:position` residual lives.
   - `steps` — per-step trace records
 """
 function simulate(
@@ -394,16 +420,24 @@ function simulate(
     min_peri_alt = Inf
     steps        = NamedTuple[]
 
+    # Failed-solve bookkeeping. A non-converged solve_burn returns ΔV = 0, which is
+    # INDISTINGUISHABLE from a deliberate decision not to burn — so a run whose every burn
+    # failed looks, in the summary, exactly like a run that chose to coast. These counters
+    # are what make those two outcomes different at a glance. `n_solves` is the denominator:
+    # `n_failed_solves` alone cannot tell "0 of 0" from "0 of 40".
+    n_solves        = 0
+    n_failed_solves = 0
+
     controller_setup!(controller, state, period_s)
 
     # The deviation metric is the same one the POMDP's dev bins are defined on: the
     # apse-POSITION deviation from the nominal periapsis. Computed here (not in the
     # controller) so both baselines report the identical quantity.
-    r_peri_nom, _ = nominal_apse_positions(
+    r_peri_nom, _ = next_apse_positions(
         controller isa MPCController && controller.ref_ic !== nothing ? controller.ref_ic :
         controller isa SARSOPController && controller.ref_ic !== nothing ? controller.ref_ic :
-        state0,
-        period_s; eom! = cr3bp_eom!)
+        state0;
+        eom! = cr3bp_eom!)
     dev_of(u) = norm(u[1:3] .- r_peri_nom)
 
     finish(outcome, t_loss, survived) = (
@@ -413,8 +447,17 @@ function simulate(
         survival_time_s = t_loss,
         n_steps         = length(steps),
         n_burns         = n_burns,
+        n_solves        = n_solves,
+        n_failed_solves = n_failed_solves,
         total_dv_ms     = total_dv_ms,
         min_peri_alt_km = isfinite(min_peri_alt) ? min_peri_alt : NaN,
+        # Achieved-geometry summary. `peri_alts_km` is the per-pass altitude sequence, so a
+        # commanded science excursion can be checked against where it actually went rather
+        # than trusted because it was commanded (see the science_cov caveat below).
+        peri_alts_km    = [s.peri_alt_km for s in steps],
+        peri_lats_deg   = [s.peri_lat_deg for s in steps],
+        max_dev_trans_km = isempty(steps) ? NaN :
+            maximum(s -> isfinite(s.dev_transverse_km) ? s.dev_transverse_km : -Inf, steps),
         science_cov     = _controller_cov(controller),
         n_bands         = cov_count(_controller_cov(controller)),
         steps           = steps,
@@ -438,6 +481,14 @@ function simulate(
         # 2. Ask the controller for a command (ONBOARD planning only).
         dv_cmd, label, extra = controller_command(controller, shell.u, period_s)
 
+        # Count only steps that actually ran a solve. OBSERVE is a genuine no-burn DECISION,
+        # not a solve, and folding it in would dilute the failure rate that these counters
+        # exist to expose.
+        if label !== :OBSERVE
+            n_solves += 1
+            extra.converged || (n_failed_solves += 1)
+        end
+
         # 3. Execute it.
         dv_applied, eta_eff = noisy_thruster ? apply_dv_noisy(dv_cmd, rng) :
                                                (apply_dv(dv_cmd), 1.0)
@@ -455,8 +506,15 @@ function simulate(
         if peri.outcome !== :ok
             peri.outcome === :crash && (min_peri_alt = min(min_peri_alt, PERIAPSIS_CRASH_ALT))
             # Record the step that led to the loss before returning.
+            # Same field schema as the nominal push below — a lost leg has no achieved
+            # periapsis, so the position fields are NaN rather than absent. Keeping the
+            # schema uniform means a trace can be tabulated without per-row branching.
             push!(steps, (t_s = t_now, action = label, dv_ms = dv_ms, eta_eff = eta_eff,
                           true_dev_km = NaN, converged = extra.converged,
+                          residual_km = extra.residual_km,
+                          peri_alt_km = NaN, peri_lat_deg = NaN, peri_lon_deg = NaN,
+                          peri_pos = fill(NaN, 3),
+                          dev_radial_km = NaN, dev_transverse_km = NaN,
                           extra = (true_bin = uppercase(String(peri.outcome)),
                                    obs_bin  = uppercase(String(peri.outcome)),
                                    cov = _controller_cov(controller))))
@@ -471,8 +529,33 @@ function simulate(
         dev_km = dev_of(state)
         obs_extra = controller_observe!(controller, state, dev_km, label, extra, rng)
 
+        # Record WHERE the periapsis actually landed, not just how far off it was.
+        # `true_dev_km` is a single norm, and altitude is a single radius — between them
+        # they cannot distinguish "right place" from "right distance, wrong direction".
+        # Two errors are invisible in altitude alone and both matter here:
+        #   * along-track (phase) error — correct altitude at the wrong point on the orbit,
+        #     which is most of the ~10 km position residual the :position mode cannot null;
+        #   * out-of-plane (z) error — the latitude of the periapsis pass, i.e. exactly the
+        #     quantity the south-polar science case turns on (the IC's periapsis is at
+        #     +87 deg NORTH, a known open defect). A z-error cannot show up in a radius.
+        # Logged per step so a run can be audited after the fact rather than re-run.
+        rel_peri  = _enc_relative(state)
+        peri_alt  = altitude(state)
+        peri_lat  = asind(clamp(rel_peri[3] / norm(rel_peri), -1.0, 1.0))
+        peri_lon  = atand(rel_peri[2], rel_peri[1])
+        dev_vec   = state[1:3] .- r_peri_nom
+        # Radial / transverse split of the deviation: how much of the miss is altitude
+        # (radial) versus along-track+out-of-plane (transverse, invisible to altitude).
+        r_hat     = rel_peri ./ norm(rel_peri)
+        dev_rad   = dot(dev_vec, r_hat)
+        dev_trans = norm(dev_vec .- dev_rad .* r_hat)
+
         push!(steps, (t_s = t_now, action = label, dv_ms = dv_ms, eta_eff = eta_eff,
                       true_dev_km = dev_km, converged = extra.converged,
+                      residual_km = extra.residual_km,
+                      peri_alt_km = peri_alt, peri_lat_deg = peri_lat,
+                      peri_lon_deg = peri_lon, peri_pos = copy(state[1:3]),
+                      dev_radial_km = dev_rad, dev_transverse_km = dev_trans,
                       extra = obs_extra))
 
         verbose && @printf("  step %3d t=%7.2f hr  dev=%8.2f km  %-13s ΔV=%6.2f m/s  η=%.3f\n",
@@ -534,13 +617,22 @@ _terminal_periapsis_callback_arg(rec::_EventRecord) = _terminal_periapsis_callba
 
 Aggregate repeated stochastic rollouts into survival rate + medians, mirroring the Python
 reference's `summarize`. `survived` counts `:held` and `:idle` (no crash, no escape).
+
+`failed_solve_rate` is the fraction of all attempted burn solves across all rollouts that did
+not converge. ⚠️ Read it FIRST: a survival rate computed over rollouts whose burns all failed
+is measuring an uncontrolled coast, not a controller. A value near 1.0 invalidates every
+other field here rather than qualifying it.
 """
 function summarize_rollouts(results::AbstractVector)
     n = length(results)
     n == 0 && return (n = 0, survival_rate = NaN, min_peri_median = NaN,
-                      dv_median = NaN, surv_time_median_d = NaN, bands_median = NaN)
+                      dv_median = NaN, surv_time_median_d = NaN, bands_median = NaN,
+                      n_solves = 0, n_failed_solves = 0, failed_solve_rate = NaN)
     survived = count(r -> r.outcome in (:held, :idle), results)
     peris = [r.min_peri_alt_km for r in results if isfinite(r.min_peri_alt_km)]
+    # `get` so a caller can still summarize result NamedTuples from an older run.
+    tot_solves = sum(r -> get(r, :n_solves, 0), results)
+    tot_failed = sum(r -> get(r, :n_failed_solves, 0), results)
     return (
         n                  = n,
         survival_rate      = survived / n,
@@ -548,5 +640,8 @@ function summarize_rollouts(results::AbstractVector)
         dv_median          = median([r.total_dv_ms for r in results]),
         surv_time_median_d = median([r.survival_time_s for r in results]) / 86400.0,
         bands_median       = median([r.n_bands for r in results]),
+        n_solves           = tot_solves,
+        n_failed_solves    = tot_failed,
+        failed_solve_rate  = tot_solves == 0 ? NaN : tot_failed / tot_solves,
     )
 end

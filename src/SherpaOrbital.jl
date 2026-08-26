@@ -121,6 +121,9 @@ export
     predict_apses,
     predict_apse_states,
     nominal_apse_positions,
+    next_apses,
+    next_apse_positions,
+    validate_apse_targets,
     apse_residual,
     solve_burn,
     # baselines — truth-model-agnostic (the truth EOM is an argument)

@@ -110,7 +110,10 @@ function calibrate_tables(;
     period_s = float(period_s)
     one_rev_s = period_s / 3          # 3 periapsis passes per period-3 orbit
 
-    r_peri_nom, r_apo_nom = nominal_apse_positions(ic, one_rev_s; eom! = cr3bp_eom!)
+    # Count-based apse search: `one_rev_s = T/3` is the inter-periapsis CONTROL cadence, not
+    # an apse-to-apse revolution — as a search window it lands 0.136 s short of the first
+    # apoapsis and yields a NaN target, which silently zeroes every CORRECT burn.
+    r_peri_nom, r_apo_nom = next_apse_positions(ic; eom! = cr3bp_eom!)
     apo_nom_alt = norm(_enc_relative(r_apo_nom)) - R_ENCELADUS
 
     bin_of(d) = !isfinite(d) ? :LOST :

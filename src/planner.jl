@@ -128,6 +128,23 @@ Propagates the uncontrolled reference IC for one revolution under the onboard mo
 records its first periapsis/apoapsis positions. These are the `r_apse,nominal` targets for
 MacKenzie Strategy 3 apse-position bounding — see `mode = :position` in
 [`solve_burn`](@ref).
+
+⚠️ WINDOW-BASED, AND THAT IS A DEFECT. Prefer [`next_apse_positions`](@ref), which asks for
+an apse COUNT and cannot come back empty. This function reports only the apses that fall
+inside the `period_s` window, so a window too short to contain an apoapsis yields
+`[NaN, NaN, NaN]` — which then poisons the apoapsis half of the `:position` residual,
+makes `solve_burn` return ΔV = 0 with `residual = Inf`, and silently degrades a CORRECT
+action into an OBSERVE.
+
+That is not hypothetical: every caller passes `PERIOD3_PERIOD_S / 3`, and the period-3 orbit
+has 3 periapses but only 2 apoapses, so `T/3` is the inter-periapsis interval and falls
+0.136 s SHORT of the first apoapsis. The Python reference masks this — the period-3 IC sits
+exactly at apoapsis (ṙ(0) = 0), scipy reports a phantom `t = 0` root, and Python returns the
+IC's own position while reporting `converged = True` on a circular zero residual. Julia's
+`ContinuousCallback` requires a sign change, correctly ignores `t = 0`, and finds nothing.
+
+Retained so the Session-3-validated numbers stay reproducible and the Python comparison
+harness has something to compare against. New code should not call it.
 """
 function nominal_apse_positions(
     ref_ic::AbstractVector{<:Real},
@@ -139,6 +156,179 @@ function nominal_apse_positions(
     peri_state, apo_state = predict_apse_states(ref_ic, 1, period_s;
                                                 eom! = eom!, rtol = rtol, atol = atol)
     return copy(peri_state[1:3]), copy(apo_state[1:3])
+end
+
+"""
+    next_apses(state0, n_peri, n_apo; eom!, rtol, atol, t_guess, max_expansions)
+        -> (peri, apo)
+
+Collect the next `n_peri` periapsis and `n_apo` apoapsis passages ahead of `state0` under
+the onboard model, as two vectors of `(t, state)` pairs. Barycentre frame, km / km/s.
+
+⚠️ WHY THIS EXISTS — ask for a COUNT, not a time window.
+
+[`collect_apses`](@ref) and the period-shaped [`nominal_apse_positions`](@ref) take a time
+WINDOW and report whichever apses happen to fall inside it. That pushes the burden onto the
+caller: to get "the next periapsis and the next apoapsis" you must supply a window long
+enough to contain both, and *guess how long that is*. Guess short and you silently get
+nothing back — a `NaN` apse in Julia, or (in the Python reference) a phantom `t = 0` root
+reported as a real apse.
+
+That guess is wrong for the orbit this project flies. Callers pass `PERIOD3_PERIOD_S / 3`
+because a control decision happens at every periapsis approach, but the period-3 orbit has
+**3 periapses and only 2 apoapses** per period, so `T/3` is the *inter-periapsis* interval,
+NOT an apse-to-apse revolution — it lands 0.136 s short of the first apoapsis. See the
+`nominal_apse_positions` docstring for the full failure chain.
+
+This function removes the guess: it propagates in expanding chunks until it actually HAS the
+apses requested, and throws if they genuinely cannot be found within the safety horizon.
+There is no "returned nothing" path to mistake for a valid answer.
+
+  - `t_guess` — first chunk length (s); a period-scale hint, not a bound. Later chunks
+    double. Defaults to `PERIOD3_PERIOD_S`.
+  - `max_expansions` — chunk-doubling limit before erroring. The total horizon searched is
+    `t_guess × (2^max_expansions − 1)`, so the default 6 covers 63 × `t_guess`.
+
+Escape is the expected reason for failure: a spacecraft on its way out has no next apoapsis,
+and the error names the horizon searched so a caller can tell that apart from a bad IC.
+"""
+function next_apses(
+    state0::AbstractVector{<:Real},
+    n_peri::Integer = 1,
+    n_apo::Integer = 1;
+    eom! = cr3bp_eom!,
+    rtol::Real = RTOL_ONBOARD,
+    atol::Real = ATOL_ONBOARD,
+    t_guess::Real = PERIOD3_PERIOD_S,
+    max_expansions::Integer = 6,
+)
+    (n_peri >= 0 && n_apo >= 0) ||
+        throw(ArgumentError("apse counts must be non-negative, got n_peri=$n_peri, n_apo=$n_apo"))
+    t_guess > 0 || throw(ArgumentError("t_guess must be positive, got $t_guess"))
+
+    # Re-propagating from `state0` over a growing horizon (rather than resuming) keeps the
+    # apse times referenced to t = 0 and the integration identical to a single long call,
+    # so a caller's answer never depends on where the chunk boundaries happened to land.
+    horizon = float(t_guess)
+    for _ in 0:max_expansions
+        peri, apo = collect_apses(eom!, state0, horizon; rtol = rtol, atol = atol)
+        if length(peri) >= n_peri && length(apo) >= n_apo
+            return peri[1:n_peri], apo[1:n_apo]
+        end
+        horizon *= 2
+    end
+
+    searched = float(t_guess) * (2^(max_expansions + 1) - 1)
+    error("next_apses: could not find $n_peri periapsis / $n_apo apoapsis passages " *
+          "within $(searched) s (~$(round(searched / 3600, digits = 2)) hr) of the initial " *
+          "state. The trajectory most likely escaped or crashed. " *
+          "state0 = $(collect(float.(state0)))")
+end
+
+"""
+    next_apse_positions(state0, n_peri, n_apo; kwargs...) -> (r_peri, r_apo)
+
+POSITION vectors (3-vectors, km, barycentre frame) of the next periapsis and next apoapsis
+ahead of `state0`, via [`next_apses`](@ref).
+
+This is the count-based replacement for [`nominal_apse_positions`](@ref): it takes no time
+window, so it cannot return a `NaN` target from a too-short horizon. Both returned vectors
+are guaranteed finite — `next_apses` throws rather than reporting a missing apse.
+"""
+function next_apse_positions(
+    state0::AbstractVector{<:Real};
+    eom! = cr3bp_eom!,
+    rtol::Real = RTOL_ONBOARD,
+    atol::Real = ATOL_ONBOARD,
+    t_guess::Real = PERIOD3_PERIOD_S,
+    max_expansions::Integer = 6,
+)
+    peri, apo = next_apses(state0, 1, 1; eom! = eom!, rtol = rtol, atol = atol,
+                           t_guess = t_guess, max_expansions = max_expansions)
+    return copy(peri[1][2][1:3]), copy(apo[1][2][1:3])
+end
+
+# ── Target validation ─────────────────────────────────────────────────────────
+
+"""
+    validate_apse_targets(state0, r_peri_nom, r_apo_nom; max_alt_km, phantom_tol_km)
+
+Throw if the `mode = :position` nominal apse targets are not a usable pair of targets.
+Returns `nothing` on success. Called by [`solve_burn`](@ref) BEFORE any solving.
+
+⚠️ WHY A BAD TARGET MUST THROW RATHER THAN BE SOLVED. A `:position` solve against a bad
+target does not fail visibly — it returns ΔV = 0, which is indistinguishable from a
+deliberate decision not to burn, so a CORRECT action silently degrades into an OBSERVE. A
+whole calibration run can come back with every burn quietly disabled and still look like
+data. Bad targets are a SETUP error, so they are raised where they are introduced.
+
+Three rejections, one per way a target has actually gone wrong in this project:
+
+ 1. **Non-finite** — the window-based [`nominal_apse_positions`](@ref) returns `NaN` when
+    its window is too short to contain an apse (the `T/3` defect). `NaN` poisons its half of
+    the residual and `solve_burn` cannot converge.
+
+ 2. **Equal to `state0`'s own position** (within `phantom_tol_km`) — the signature of the
+    Python reference's phantom `t = 0` root. scipy reports an apse at `t = 0` for a state
+    that starts at an apse, so the "target" is the current position: the residual compares a
+    phantom target against a phantom prediction, scores exactly 0.0, and reports
+    `converged = true` having planned nothing. A `converged` flag alone does NOT catch this,
+    which is why this check exists as well as the flag.
+
+ 3. **Implausibly high altitude** (above `max_alt_km`) — a count-based apse search
+    ([`next_apses`](@ref)) always finds *an* apse, because a spacecraft that has left the
+    science orbit is still bound to Saturn and its Enceladus-relative radius keeps
+    oscillating. Those apses are real apses of the trajectory but not of the orbit we are
+    holding: a 1 km/s kick yields an "apoapsis" at ~420,000 km altitude, ~7500× nominal.
+    Guaranteeing a finite target is not the same as guaranteeing a meaningful one, so the
+    count-based fix needs this bound to avoid trading a loud `NaN` for a quiet absurdity.
+
+`phantom_tol_km` defaults to `EVENT_TOL`-scale rather than 0: a correctly-found apse very
+near the current state (the period-3 apoapses are near-degenerate in radius) sits ~1e-06 km
+away, whereas a true phantom is at *exactly* 0.0. The default separates those by orders of
+magnitude while staying far below `TARGET_TOL_KM`.
+"""
+function validate_apse_targets(
+    state0::AbstractVector{<:Real},
+    r_peri_nom::Union{AbstractVector{<:Real},Nothing},
+    r_apo_nom::Union{AbstractVector{<:Real},Nothing};
+    max_alt_km::Real = ESCAPE_ALT_KM,
+    phantom_tol_km::Real = 1.0e-9,
+)
+    (r_peri_nom === nothing || r_apo_nom === nothing) &&
+        throw(ArgumentError("mode = :position requires r_peri_nom and r_apo_nom"))
+
+    r0 = collect(float.(state0[1:3]))
+    for (name, r) in (("r_peri_nom", r_peri_nom), ("r_apo_nom", r_apo_nom))
+        length(r) >= 3 || throw(ArgumentError("$name must have at least 3 components"))
+        rr = collect(float.(r[1:3]))
+
+        all(isfinite, rr) || error(
+            "validate_apse_targets: $name = $rr is not finite. A window-based apse search " *
+            "found no apse inside its horizon — use next_apse_positions, which takes an " *
+            "apse COUNT and cannot come back empty.")
+
+        d0 = norm(rr .- r0)
+        d0 > phantom_tol_km || error(
+            "validate_apse_targets: $name is $(d0) km from state0's own position " *
+            "(tol $(phantom_tol_km) km) — this is the phantom t = 0 apse signature, not a " *
+            "target. Solving against it yields a circular zero residual and a false " *
+            "converged = true.")
+
+        alt = norm(_planner_enc_relative(rr)) - R_ENCELADUS
+        alt <= max_alt_km || error(
+            "validate_apse_targets: $name is at altitude $(alt) km, above the " *
+            "max_alt_km = $(max_alt_km) km bound. This apse belongs to a trajectory that " *
+            "has left the science orbit, not to the orbit being held.")
+    end
+    return nothing
+end
+
+"""Enceladus-relative position from a barycentre-frame position vector (km)."""
+function _planner_enc_relative(r::AbstractVector{<:Real})
+    out = collect(float.(r[1:3]))
+    out[1] -= X_ENCELADUS
+    return out
 end
 
 # ── Residual ──────────────────────────────────────────────────────────────────
@@ -228,7 +418,14 @@ function solve_burn(
     mode::Symbol = :altitude,
     r_peri_nom::Union{AbstractVector{<:Real},Nothing} = nothing,
     r_apo_nom::Union{AbstractVector{<:Real},Nothing} = nothing,
+    validate_targets::Bool = true,
 )
+    # Bad :position targets are a SETUP error, not a burn to attempt — see
+    # validate_apse_targets. Checked before any propagation so the failure surfaces where it
+    # was introduced rather than as a silent ΔV = 0.
+    mode === :position && validate_targets &&
+        validate_apse_targets(state0, r_peri_nom, r_apo_nom)
+
     resid(dv) = apse_residual(state0, dv, n_revs, period_s, eom!;
                               peri_target_km = peri_target_km,
                               apo_target_km = apo_target_km,

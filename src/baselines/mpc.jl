@@ -106,7 +106,13 @@ function run_mpc(
     r_apo_nom = nothing
     if mode === :position
         ref = ref_ic === nothing ? state0 : ref_ic
-        r_peri_nom, r_apo_nom = nominal_apse_positions(ref, period_s; eom! = cr3bp_eom!)
+        # Count-based apse search. `period_s` is the CONTROL cadence (T/3 for the period-3
+        # orbit) and is NOT a valid apse-search window: the orbit has 3 periapses but only 2
+        # apoapses, so T/3 lands 0.136 s short of the first apoapsis and the old
+        # window-based nominal_apse_positions returned a NaN apoapsis target.
+        # The `mode = :altitude` default never reached this branch, which is why the
+        # Session-3 run_mpc reference signature is unaffected.
+        r_peri_nom, r_apo_nom = next_apse_positions(ref; eom! = cr3bp_eom!)
     end
 
     # Assembled once per outcome so every early return reports the same fields.
