@@ -1,6 +1,6 @@
 """
 Reproduce Russell & Lara (2009) Fig. 9 — the south-pole-grazing L1 halo —
-and compare the same orbit propagated in our barycentric CR3BP+J2 model.
+in their Hill + J2/J3 model. Hill-only; see the FROZEN note below.
 
 Russell, R. P., & Lara, M. (2009). "On the design of an Enceladus science
 orbit." Acta Astronautica 65, 27-39.
@@ -13,22 +13,25 @@ osculating orbital elements (right). We reproduce:
   Panel (c): osculating a, e, i vs time over one period (their right plot).
              Elements are computed from the ROTATING-frame velocity — the
              convention under which our values match their Table 2 exactly
-             (a=1195.7 km, e=0.756). See src/constants_russell_lara.py.
-  Panel (d): MODEL-GAP comparison. Periapsis altitude vs time for the same IC
-             in (i) their Hill+J2/J3 model and (ii) our barycentric CR3BP+J2
-             truth model, showing how much the full-3-body + different-J2 model
-             shifts the orbit over a few revolutions.
+             (a=1195.7 km, e=0.756). See constants_russell_lara.py.
+  Panel (d): Hill-model altitude history over 3 periods.
 
-Run:
-    python scripts/reproduce_rl_fig9.py
+FROZEN (Session 5). Panel (d) ORIGINALLY held a model-gap comparison against our
+barycentric CR3BP+EncJ2 truth model. That panel was removed when python-legacy/
+was deleted, since it imported the CR3BP modules. Its last recorded result is
+quoted in README.md; this script is now Hill-only and needs numpy + matplotlib +
+scipy alone.
+
+Run (from this directory):
+    python reproduce_rl_fig9.py
 Output:
-    figures/rl_fig9.png
+    rl_fig9.png (written alongside this script)
 
 NOTE ON FIDELITY: we propagate with the dominant, unambiguous J2+J3 zonal field.
 Russell-Lara's C22 phase convention is underspecified in the paper and could not
 be matched to sub-km one-period closure; J2+J3 reproduces the orbit's character
 (period, altitude band, shape) which is what Fig. 9 conveys. One-period closure
-is ~17 km. See src/dynamics/hill_nonspherical.py for the full discussion.
+is ~17 km. See hill_nonspherical.py for the full discussion.
 """
 
 import os
@@ -39,16 +42,17 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from scipy.integrate import solve_ivp
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# FROZEN (Session 5): this directory is self-contained and imports only its own two
+# modules, which sit alongside this file. The former `src.*` imports (src.constants,
+# src.dynamics.cr3bp, src.dynamics.cr3bp_j2) pointed into python-legacy/, now deleted;
+# the CR3BP comparison panel that needed them has been removed. See README.md.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.constants_russell_lara import (
+from constants_russell_lara import (
     IC_HALO_RL, N_RL, GM_ENCELADUS_RL, R_ENCELADUS_RL,
     A0_HALO_RL, E0_HALO_RL, rl_ic_to_rotating,
 )
-from src.dynamics.hill_nonspherical import hill_nonspherical_eom
-from src.constants import OMEGA, R_ENCELADUS, L_STAR
-from src.dynamics.cr3bp import X_ENCELADUS
-from src.dynamics.cr3bp_j2 import cr3bp_j2_eom
+from hill_nonspherical import hill_nonspherical_eom
 
 PERIOD_S = 12.0 * 3600.0   # ~one period (their halo closes near 12 hr)
 
@@ -73,33 +77,6 @@ def osc_elements_rotframe(state: np.ndarray, n: float, GM: float) -> tuple:
     return a, e, i
 
 
-def rl_to_barycentric_cr3bp(ic_table: np.ndarray) -> np.ndarray:
-    """
-    Convert a Russell-Lara Table 2 IC into a barycentric CR3BP physical state.
-
-    Steps:
-      1. Position: shift Enceladus-centred → barycentric (x += X_ENCELADUS).
-         Both frames have +x pointing away from Saturn, so no rotation.
-      2. Velocity: Table 2 velocity is ENCELADUS-CENTRED inertial (see
-         rl_ic_to_rotating). Convert to the rotating-frame RELATIVE velocity
-         about Enceladus: v_rot = v_inertial − ω × r_enc, using the relative
-         (Enceladus-centred) position — NOT the barycentric position, which
-         would add a spurious ~12 km/s from the 238 529 km lever arm.
-         The rotating-frame relative velocity is identical whether the frame
-         origin is the barycentre or Enceladus, so this value drops straight
-         into the barycentric CR3BP state.
-
-    NOTE: we use OMEGA (our system rate) for consistency with cr3bp_j2_eom.
-    OMEGA and Russell-Lara's N_RL differ by ~0.3%, a negligible perturbation
-    relative to the model gap being studied.
-    """
-    s = ic_table.copy()
-    r_enc = s[:3]
-    v_inertial = s[3:]
-    r_bary = r_enc + np.array([X_ENCELADUS, 0.0, 0.0])
-    v_rot = v_inertial - np.cross(np.array([0.0, 0.0, OMEGA]), r_enc)
-    return np.concatenate([r_bary, v_rot])
-
 
 def main() -> None:
     # ── Their Hill model ─────────────────────────────────────────────────────
@@ -116,14 +93,9 @@ def main() -> None:
         a_t.append(a); e_t.append(e); i_t.append(i)
     a_t, e_t, i_t = np.array(a_t), np.array(e_t), np.array(i_t)
 
-    # ── Our barycentric CR3BP+J2 model (same IC) ─────────────────────────────
-    ic_cr3bp = rl_to_barycentric_cr3bp(IC_HALO_RL)
-    sol_c = solve_ivp(cr3bp_j2_eom, [0.0, 3 * PERIOD_S], ic_cr3bp,
-                      t_eval=np.linspace(0, 3 * PERIOD_S, 3000),
-                      rtol=1e-10, atol=1e-12, max_step=200.0)
-    dx = sol_c.y[0] - X_ENCELADUS
-    alt_cr3bp = np.sqrt(dx**2 + sol_c.y[1]**2 + sol_c.y[2]**2) - R_ENCELADUS
-    # Hill model out to 3 periods too, for the comparison panel
+    # ── Hill model out to 3 periods, for the altitude-history panel ───────────
+    # (The barycentric CR3BP+EncJ2 comparison that used to share this panel was
+    #  removed with python-legacy/. Its last recorded result is in README.md.)
     sol_h3 = solve_ivp(hill_nonspherical_eom, [0.0, 3 * PERIOD_S], ic_hill,
                        t_eval=np.linspace(0, 3 * PERIOD_S, 3000),
                        rtol=1e-11, atol=1e-13, max_step=200.0)
@@ -164,30 +136,26 @@ def main() -> None:
     ax = fig.add_subplot(2, 2, 4)
     ax.plot(sol_h3.t / 3600.0, alt_hill3, color="navy",
             label="Russell-Lara Hill + J2/J3")
-    ax.plot(sol_c.t / 3600.0, alt_cr3bp, color="crimson",
-            label="our barycentric CR3BP + EncJ2")
     ax.axhline(0.0, color="gray", lw=0.8, ls=":")
     ax.set_xlabel("time (hr)"); ax.set_ylabel("altitude above Enceladus (km)")
-    ax.set_title("(d) Model gap: same IC, two models")
+    ax.set_title("(d) Altitude history over 3 periods (Hill)")
     ax.legend(fontsize=8); ax.grid(alpha=0.3)
 
     fig.suptitle("Russell & Lara (2009) Fig. 9 reproduction — Enceladus L1 halo",
                  fontsize=13)
     fig.tight_layout(rect=(0, 0, 1, 0.97))
-    out = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                       "figures", "rl_fig9.png")
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rl_fig9.png")
     fig.savefig(out, dpi=130)
     print(f"saved {out}")
 
-    # Console summary
+    # Console summary. The two [CR3BP] lines that used to appear here needed the deleted
+    # python-legacy/ pipeline; their last recorded values are quoted in README.md.
     print(f"[Hill]   1-period closure altitude band: "
           f"{alt_hill.min():.1f}..{alt_hill.max():.1f} km")
     print(f"[Hill]   osc a {a_t.min():.0f}..{a_t.max():.0f} km, "
           f"e {e_t.min():.3f}..{e_t.max():.3f}, i {i_t.min():.1f}..{i_t.max():.1f} deg")
-    print(f"[CR3BP]  altitude over 3 periods: "
-          f"{alt_cr3bp.min():.1f}..{alt_cr3bp.max():.1f} km")
-    impacted = alt_cr3bp.min() < 0.0
-    print(f"[CR3BP]  impacts within 3 periods (~36 hr): {impacted}")
+    print(f"[Hill]   altitude over 3 periods: "
+          f"{alt_hill3.min():.1f}..{alt_hill3.max():.1f} km")
 
 
 def _enceladus_circle(ax, R: float) -> None:

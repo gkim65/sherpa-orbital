@@ -112,7 +112,9 @@ experiments/            own Project.toml — isolates the solver dependency
   example.jl            worked end-to-end example
 artifacts/              measured tables + exported policy (committed)
 test/                   runtests.jl
-python-legacy/          the Python implementation being ported (see below)
+legacy/                 frozen Python, NOT part of the pipeline (see below)
+  russell-lara/         Russell & Lara (2009) Hill-problem study, frozen
+  figures-reference/    matplotlib originals kept as Makie-port specs
 ```
 
 The library declares **no solver dependency** — `NativeSARSOP` lives only in
@@ -120,23 +122,34 @@ The library declares **no solver dependency** — `NativeSARSOP` lives only in
 
 ---
 
-## Status: mid-port
+## Status: port complete — the pipeline is 100% Julia
 
-The physics (CR3BP dynamics, the halo-orbit differential corrector, the MPC baseline, the
-rollout harness) currently lives in `python-legacy/` and is being ported to Julia one
-module at a time. The Python side remains functional and is the numerical reference the
-port is validated against; it will be removed once the port is complete.
+`python-legacy/` was **deleted** in Session 5. Every module in the live pipeline (CR3BP
+dynamics, the halo-orbit differential corrector, the planner, the MPC baseline, the
+spacecraft models, the unified rollout harness, calibration, the POMDP model and solver
+pipeline) is Julia.
 
-Working today in Julia: the POMDP model, the solver pipeline, policy export, reporting.
+The Python reference is preserved as **frozen JSON dumps** in `scratch/compare/ref_*.json`
+(gitignored, local). The `compare_*.jl` scripts diff Julia against those dumps and read
+nothing else; the `ref_*.py` dumpers are retained as provenance and no longer run. See
+`scratch/compare/README.md` for the pre-deletion audit and the list of retired rows.
+
+What remains in `legacy/` is deliberately NOT ported: the Russell & Lara Hill-problem
+study (a separate dynamical model, frozen, numpy-only) and the matplotlib figure scripts,
+kept as specifications for a Makie port.
 
 ---
 
 ## Tests
 
 ```bash
-julia --project=. -e 'using Pkg; Pkg.test()'    # Julia
-cd python-legacy && pytest                      # Python reference
+julia --project=. -e 'using Pkg; Pkg.test()'    # 59/59
 ```
+
+The suite covers the **POMDP model layer** (state space, dev binning, actions, measured
+tables, transition/observation matrices, rewards, config plumbing). The physics layer is
+cross-checked by `scratch/compare/*.jl` against the frozen Python dumps rather than by
+unit tests — see the Session-5 log for why that split is deliberate and when it changes.
 
 ---
 

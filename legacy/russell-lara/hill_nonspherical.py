@@ -46,7 +46,7 @@ References
 
 import numpy as np
 
-from src.constants_russell_lara import (
+from constants_russell_lara import (
     GM_ENCELADUS_RL, R_ENCELADUS_RL, N_RL,
     J2_RL, J3_RL, C22_RL,
 )

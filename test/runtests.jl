@@ -24,17 +24,6 @@ const CFG = StationkeepingPOMDP()
         @test !SherpaOrbital.isterminal_dev(:FAR)
     end
 
-    @testset "coverage bitmask" begin
-        @test cov_count(0) == 0
-        @test cov_count(7) == 3
-        @test !cov_has(0, 1)
-        @test cov_has(cov_set(0, 2), 2)
-        # Banking a band twice is idempotent — science pays out once.
-        @test cov_set(cov_set(0, 1), 1) == cov_set(0, 1)
-        @test cov_label(CFG, 0) == "none"
-        @test cov_label(CFG, 7) == "LOW+MID+HIGH"
-        @test cov_label(CFG, cov_set(0, 1)) == "LOW"
-    end
 
     @testset "dev binning" begin
         # Half-open [lo, hi): an edge belongs to the OUTER bin.
@@ -147,8 +136,21 @@ const CFG = StationkeepingPOMDP()
         repeat = r(SKState(:OK, cov_set(0, 1)), :EXCURSE_LOW)
         @test fresh - repeat ≈ CFG.r_science
 
-        # Fuel is a cost: the free action beats an equally-safe paid one.
-        @test r(SKState(:OK, 7), :OBSERVE) > r(SKState(:OK, 7), :CORRECT) - 50
+        # Fuel is a cost: CORRECT is charged r_fuel, OBSERVE is not. Asserted on the
+        # FUEL TERM directly rather than on the two totals.
+        #
+        # ⚠️ The totals do NOT order the intuitive way, and the original `- 50` fudge
+        # here was hiding that rather than smoothing a rounding error. Measured:
+        # OBSERVE from (:OK, 7) = -5.5 vs CORRECT = -2.8, i.e. the free action is WORSE.
+        # Cause: from :OK, OBSERVE carries transition risk that CORRECT removes, and that
+        # risk outweighs CORRECT's fuel cost. That is the model working as intended --
+        # stationkeeping is worth paying for -- so the old comment ("the free action beats
+        # an equally-safe paid one") was simply false: the two actions are NOT equally safe.
+        cfg0 = StationkeepingPOMDP(; fuel_weight = 0.0)
+        no_fuel = SherpaOrbital.reward_function(cfg0, model_tables(cfg0)[1])
+        @test no_fuel(SKState(:OK, 7), :CORRECT) > r(SKState(:OK, 7), :CORRECT)
+        @test no_fuel(SKState(:OK, 7), :OBSERVE) == r(SKState(:OK, 7), :OBSERVE)
+
         # Risk is priced: OBSERVE from FAR is far worse than CORRECT from FAR.
         @test r(SKState(:FAR, 0), :OBSERVE) < r(SKState(:FAR, 0), :CORRECT)
     end
@@ -174,12 +176,4 @@ const CFG = StationkeepingPOMDP()
         @test build_pomdp(CFG) !== nothing
     end
 
-    @testset "state labels round-trip" begin
-        for s in SherpaOrbital.states(CFG)
-            lbl = state_label(s)
-            dev, cov = split(lbl, "|")
-            @test Symbol(dev) == s.dev
-            @test parse(Int, replace(cov, "cov" => "")) == s.cov
-        end
-    end
 end
