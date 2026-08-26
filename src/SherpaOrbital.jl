@@ -28,6 +28,8 @@ using POMDPs
 using POMDPTools
 using QuickPOMDPs
 using Printf
+using Random
+using Statistics
 
 # Physics layer: constants, then dynamics (truth/onboard split preserved), then
 # propagation. Nothing below may hardcode a physical constant.
@@ -47,6 +49,12 @@ include("halo_ic.jl")
 include("planner.jl")
 include("baselines/mpc.jl")
 
+# Spacecraft models. Deliberately upstream of the dynamics: they map commanded ΔV → applied
+# ΔV and true state → noisy observation, and never call an integrator. Both are stochastic
+# and take an explicit `rng`; neither touches the global RNG.
+include("spacecraft/thruster.jl")
+include("spacecraft/nav.jl")
+
 # Configuration struct first: everything below dispatches on it.
 include("StationkeepingPOMDP.jl")
 include("states.jl")
@@ -58,6 +66,14 @@ include("rewards.jl")
 include("model.jl")
 include("export.jl")
 include("common/report.jl")
+
+# The unified rollout harness. Last, because a SARSOP controller consumes the exported
+# policy artifact and the (dev, cov) state helpers above.
+include("common/simulate.jl")
+
+# Calibration: MEASURE the transition kernels from the truth model. Depends on the coast
+# helpers and geometry in common/simulate.jl, so it comes last.
+include("calibration/calibrate.jl")
 
 export
     # dynamics — onboard model (CR3BP) and truth models (+J2). Kept separate.
@@ -109,6 +125,27 @@ export
     solve_burn,
     # baselines — truth-model-agnostic (the truth EOM is an argument)
     run_mpc,
+    # spacecraft models (stochastic; explicit rng, never the global one)
+    ETA_EFF_MIN,
+    ETA_EFF_MAX,
+    apply_dv,
+    apply_dv_noisy,
+    sample_eta_eff,
+    observe_position,
+    observe_altitude,
+    observe_deviation,
+    # unified rollout harness — one world, controller swapped by type
+    AbstractController,
+    MPCController,
+    SARSOPController,
+    controller_type,
+    load_policy,
+    simulate,
+    summarize_rollouts,
+    # calibration — measure the kernels rather than transcribe them
+    CalibrationRow,
+    calibrate_tables,
+    MIN_TRIALS_TRUSTED,
     # configuration + model
     StationkeepingPOMDP,
     build_pomdp,

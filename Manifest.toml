@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "0d274e1860fb9f564a0dacf8052d42b32a86df9c"
+project_hash = "c2b4235fce4c8c3e92392f439028e3e6d51684e1"
 
 [[deps.ADTypes]]
 deps = ["PrecompileTools"]
@@ -1513,7 +1513,7 @@ uuid = "efcf1570-3423-57d1-acb7-fd33fddbac46"
 version = "1.1.2"
 
 [[deps.SherpaOrbital]]
-deps = ["Distributions", "JSON", "LinearAlgebra", "OrdinaryDiffEq", "POMDPTools", "POMDPs", "Printf", "QuickPOMDPs", "Random"]
+deps = ["DiffEqCallbacks", "Distributions", "JSON", "LinearAlgebra", "OrdinaryDiffEq", "POMDPTools", "POMDPs", "Printf", "QuickPOMDPs", "Random"]
 path = "."
 uuid = "eb7ccab0-25f8-475c-86aa-72039429dcb1"
 version = "0.1.0"
