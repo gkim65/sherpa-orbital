@@ -8,7 +8,7 @@ degrading 2–3× (~1 km) under the conservative parameter set (Exhibit C-9). Th
 onboard-belief navigation noise is the round, slightly conservative `SIGMA_NAV_POS = 2 km`,
 cited to §C.1 in `constants.jl`.
 
-⚠️ OPEN ITEM (docs/todo.md Phase 2): σ_nav = 2 km is conservative relative to MacKenzie
+⚠️ OPEN ITEM (`docs/todo.md`, standing cautions): σ_nav = 2 km is conservative vs MacKenzie
 §C.1.1.2 (~0.3–1 km). Left as-is here — the port must reproduce the reference, not
 re-tune it.
 

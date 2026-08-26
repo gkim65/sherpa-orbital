@@ -19,7 +19,7 @@ coupling) are modelled as a single scalar efficiency factor η_eff:
     ΔV_applied = η_eff · ΔV_commanded
 
 A minimal stand-in for burn execution error, not a full thruster degradation model — the
-random-walk degradation model is explicitly deferred (`docs/todo.md` Phase 2).
+random-walk degradation model is explicitly deferred (`docs/todo.md`, open scope questions).
 
 RNG DISCIPLINE. Every sampler takes an explicit `rng::AbstractRNG` and never touches the
 global RNG, so a rollout's stochastic stream is a function of its own seed alone.
@@ -27,7 +27,7 @@ These samplers are validated DISTRIBUTIONALLY (sample statistics against the ana
 not by bit-comparison — see `scratch/compare/compare_spacecraft.jl`.
 """
 
-# Uniform burn-efficiency bounds (Phase 3 spec, docs/todo.md: "sample halo IC +
+# Uniform burn-efficiency bounds (original spec: "sample halo IC +
 # eta_eff ~ Uniform(0.8, 1.0)").
 const ETA_EFF_MIN = 0.8
 const ETA_EFF_MAX = 1.0

@@ -35,7 +35,8 @@ logic.
 `z0 < 0` (southern out-of-plane amplitude), but the closest approach of this symmetric
 period-3 bifurcation orbit falls at ~+87° latitude — the NORTH pole — not the south pole
 the science case targets. Placing periapsis over the south pole needs the asymmetric
-6-variable corrector ("Step A′", `docs/todo.md`); this IC is the symmetric degenerate case.
+6-variable corrector ("Step A′", `docs/todo.md` blocking item 2); this IC is the symmetric
+degenerate case.
 
 References
   Richardson, D. L. (1980). "Analytic Construction of Periodic Orbits about the Collinear
