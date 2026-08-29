@@ -1,5 +1,6 @@
 using Test
 using SherpaOrbital
+using LinearAlgebra: norm
 
 const CFG = StationkeepingPOMDP()
 
@@ -209,6 +210,84 @@ const CFG = StationkeepingPOMDP()
         # Mirrored orbit has identical stability.
         @test stability_index(monodromy_matrix(PERIOD1_SOUTH_IC_ND,
                                                HALO_PERIOD_S / SherpaOrbital.T_STAR)) ≈ 1.0 atol = 1e-6
+    end
+
+    @testset "family continuation and retargeting" begin
+        # A short table keeps the suite fast; the full 181-member default takes ~2 min.
+        # dx < 0 raises periapsis, so this spans roughly 31–45 km.
+        tbl = halo_family_table(; n_steps = 14)
+        @test length(tbl) == 15
+
+        # Every member must be a genuine periodic orbit, in the SOUTH hemisphere. Closure is
+        # the property a radially-scaled "reference" does not have, and the whole point of
+        # using the corrector rather than _scale_to_altitude.
+        @test all(m -> m.info.closure_km < 1e-3, tbl)
+        @test all(m -> m.info.periapsis_lat_deg < 0, tbl)
+
+        # Periapsis altitude must be strictly monotone in the family parameter, otherwise
+        # retarget_to_altitude's secant has no bracket to work with.
+        alts = [m.info.periapsis_alt_km for m in tbl]
+        @test issorted(alts)
+        @test alts[1] ≈ 30.9753 atol = 1e-2
+
+        # The first member reproduces the shipped IC (x0 step k = 0).
+        @test tbl[1].ic_nd ≈ collect(PERIOD1_SOUTH_IC_ND) atol = 1e-9
+
+        # Retargeting hits a commanded altitude inside the span, to far better than the
+        # ~1 km targeting tolerance. Measured 2026-08-29: better than 0.0003 km.
+        target = 0.5 * (alts[1] + alts[end])
+        m = retarget_to_altitude(tbl, target)
+        @test m !== nothing
+        @test m.info.periapsis_alt_km ≈ target atol = 1e-2
+        @test m.info.closure_km < 1e-3
+        @test m.info.periapsis_lat_deg < 0
+
+        # Outside the continued family is `nothing` — a real answer ("no orbit there"), not
+        # an error and not a silently-wrong nearest member.
+        @test retarget_to_altitude(tbl, 5000.0) === nothing
+        @test retarget_to_altitude(tbl, 1.0) === nothing
+
+        # The x0-parameterised corrector reproduces the shipped member from its own seed.
+        r = corrector_free_z0(PERIOD1_SOUTH_IC_ND[1], PERIOD1_SOUTH_IC_ND[3],
+                              PERIOD1_SOUTH_IC_ND[5])
+        @test r.converged
+        @test r.residual < 1e-10
+    end
+
+    @testset "MPCController retarget toggle" begin
+        ic = nondim_to_cr3bp(collect(PERIOD1_SOUTH_IC_ND))
+        # Small explicit table (spans ~31-45 km) so the suite does not pay the ~2 min cost of
+        # continuing the full 181-member default family three times over.
+        tbl = halo_family_table(; n_steps = 14)
+        mid = 0.5 * (tbl[1].info.periapsis_alt_km + tbl[end].info.periapsis_alt_km)
+
+        # DEFAULT IS PINNED. target_alt_km = nothing must leave the pre-2026-08-29 behaviour
+        # untouched: targets come from ref_ic and no family member is looked up. Every
+        # measurement before that date depends on this staying true.
+        c_pinned = MPCController(; ref_ic = collect(ic), mode = :position)
+        @test c_pinned.target_alt_km === nothing
+        SherpaOrbital.controller_setup!(c_pinned, ic, PERIOD1_TRIPLE_PERIOD_S)
+        @test c_pinned.ref_member === nothing
+        @test c_pinned.r_peri_nom !== nothing
+
+        # With the toggle set, the targets come from a real family member at that altitude.
+        c_rt = MPCController(; ref_ic = collect(ic), mode = :position,
+                             target_alt_km = mid, family_table = tbl)
+        SherpaOrbital.controller_setup!(c_rt, ic, PERIOD1_TRIPLE_PERIOD_S)
+        @test c_rt.ref_member !== nothing
+        @test c_rt.ref_member.info.periapsis_alt_km ≈ mid atol = 1e-2
+        @test c_rt.ref_member.info.periapsis_lat_deg < 0
+
+        # The two must actually differ — a toggle that changes nothing is the failure mode
+        # this whole session existed to find (the pinned reference ignored the command).
+        @test norm(c_rt.r_peri_nom - c_pinned.r_peri_nom) > 1.0
+
+        # An unreachable altitude is a SETUP error and must throw, not quietly fall back to
+        # the pinned reference and report a run that ignored the command.
+        c_bad = MPCController(; ref_ic = collect(ic), mode = :position,
+                              target_alt_km = 5000.0, family_table = tbl)
+        @test_throws ErrorException SherpaOrbital.controller_setup!(
+            c_bad, ic, PERIOD1_TRIPLE_PERIOD_S)
     end
 
 end

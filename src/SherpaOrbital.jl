@@ -112,6 +112,13 @@ export
     richardson_ic,
     seed_scan,
     differential_corrector,
+    # family continuation — x0 as the family parameter (see corrector_free_z0's note on why
+    # differential_corrector's z0-fixed split cannot continue the family)
+    corrector_free_z0,
+    halo_family_member,
+    halo_family_table,
+    halo_family_table_cached,
+    retarget_to_altitude,
     monodromy_matrix,
     stability_index,
     stability_index_trace,

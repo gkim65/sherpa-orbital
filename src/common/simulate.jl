@@ -84,6 +84,42 @@ caches in `controller_setup!`.
   - `mode` — `:position` (Strategy 3 proper, apse POSITION-vector bounding; MacKenzie's
     working strategy) or `:altitude` (Strategy 1/2, which MacKenzie says fails).
   - `n_revs` — multiple-shooting horizon `N_m` for `solve_burn`.
+  - `target_alt_km` — commanded periapsis altitude (km), or `nothing` (DEFAULT) to hold
+    whatever orbit `ref_ic` is. **This is the retargeting toggle** — see below.
+  - `family_table` — a prebuilt [`halo_family_table`](@ref) to retarget against. `nothing`
+    uses [`halo_family_table_cached`](@ref). Pass one to control the altitude span or
+    resolution; the default family spans ~31–248 km and costs ~2 min to continue cold.
+
+## Commanding an off-nominal periapsis altitude (`target_alt_km`)
+
+`nothing` (the default) is the PINNED reference: the nominal apse targets are computed once
+from `ref_ic` and never updated. Every measurement taken before 2026-08-29 used this path, and
+it is left as the default so those numbers reproduce bit-for-bit.
+
+Set `target_alt_km` and `controller_setup!` instead looks up a GENUINE L1-halo family member at
+that altitude ([`retarget_to_altitude`](@ref)) and takes the nominal apse targets from it, so
+`CORRECT` defends the commanded orbit rather than pulling back to `ref_ic`. Measured noise-free
+over 30 days from the 31 km IC (`Xoshiro(0)`, `cr3bp_j2_eom!` truth):
+
+| commanded | pinned (`nothing`) | retargeted (`target_alt_km`) |
+|---|---|---|
+| 50 km | 37.17 km, 75.73 m/s | **56.01 km**, 80.66 m/s |
+| 70 km | 37.17 km, 75.73 m/s | **75.86 km**, 88.02 m/s |
+
+The pinned column is bit-identical whatever is commanded — it ignores the command entirely.
+
+⚠️ **The achieved altitude runs ~6 km HIGH**, and that is the pre-existing single-impulse
+`:position` residual floor, not a retargeting error: the bias is +6.19 km at the nominal 31 km
+and DECREASES to +5.75 km at 120 km (a retargeting fault would grow with distance). Command
+~6 km low if you need the achieved value, and see `docs/todo.md` candidate C for the floor.
+
+⚠️ **A transfer ceiling exists near 148 km commanded from the 31 km IC**, and it is a limit on
+TRANSFER authority, not on the orbit: 150 km escapes at 2.84 d when transferred from 31 km but
+holds the full 30 days when started on its own IC (113.62 m/s). Above ~200 km the onboard
+prediction loses an apse, `solve_burn` returns ΔV = 0, and the run is an uncontrolled coast —
+check `n_failed_solves` before reading any outcome there.
+
+⚠️ Every number above is NOISE-FREE and therefore an UPPER BOUND, not a feasibility claim.
 """
 Base.@kwdef mutable struct MPCController <: AbstractController
     ref_ic::Union{Nothing,Vector{Float64}} = nothing
@@ -91,9 +127,18 @@ Base.@kwdef mutable struct MPCController <: AbstractController
     n_revs::Int                            = 3
     peri_target_km::Float64                = PERIAPSIS_ALT_TARGET
     apo_target_km::Float64                 = APOAPSIS_ALT_TARGET
+    # Retargeting toggle: nothing = pinned reference (pre-2026-08-29 behaviour, the default).
+    target_alt_km::Union{Nothing,Float64}  = nothing
+    # Prebuilt family table to retarget against. `nothing` uses `halo_family_table_cached()`.
+    # Pass one to control the span/resolution, or to keep a test fast — continuing the default
+    # 181-member family costs ~2 min on a cold cache.
+    family_table::Union{Nothing,Vector{NamedTuple}} = nothing
     # Filled by controller_setup!.
     r_peri_nom::Union{Nothing,Vector{Float64}} = nothing
     r_apo_nom::Union{Nothing,Vector{Float64}}  = nothing
+    # The family member the targets came from, when retargeting. Recorded so a run can be
+    # audited: `nothing` here means the run was pinned, whatever was requested.
+    ref_member::Union{Nothing,NamedTuple}      = nothing
 end
 
 controller_type(::MPCController) = "MPC"
@@ -101,6 +146,23 @@ controller_type(::MPCController) = "MPC"
 function controller_setup!(c::MPCController, state0::AbstractVector, period_s::Real)
     if c.mode === :position
         ref = c.ref_ic === nothing ? state0 : c.ref_ic
+
+        # Retargeting path (opt-in). The reference must be a REAL family member: a radially
+        # scaled apse vector is not a solution of the dynamics and does not produce a
+        # holdable orbit (measured 2026-08-26 — every scaled attempt escaped, two with
+        # negative periapsis). Throw rather than silently fall back to the pinned reference,
+        # which would report a plausible run that ignored the command.
+        if c.target_alt_km !== nothing
+            table = c.family_table === nothing ? halo_family_table_cached() : c.family_table
+            member = retarget_to_altitude(table, c.target_alt_km)
+            member === nothing && error(
+                "MPCController: the continued L1 halo family contains no member at " *
+                "periapsis altitude $(c.target_alt_km) km, so there is no orbit to hold " *
+                "there. Widen halo_family_table's span, or command an altitude inside it.")
+            c.ref_member = member
+            ref = member.ic
+        end
+
         # `period_s` is the CONTROL cadence (T/3), not a valid apse-search window: the
         # period-3 orbit has 3 periapses but only 2 apoapses, so T/3 falls short of the
         # first apoapsis. Hence the count-based search here.
@@ -337,6 +399,16 @@ end
 Scale a nominal apse POSITION vector radially about Enceladus to altitude `alt_km`,
 returning a barycentre-frame position. Used to place an excursion's periapsis target
 without changing the orbit's geometry, only its radius.
+
+⚠️ **A SCALED VECTOR IS NOT A REFERENCE ORBIT — do not use this to build one.** The result is
+not a solution of the dynamics, so nothing can settle onto it: measured 2026-08-26, every
+scaled-apoapsis reference escaped, two with NEGATIVE periapsis. It works here only because an
+`EXCURSE_*` target is a one-pass waypoint that the next `CORRECT` immediately abandons.
+
+To hold a commanded altitude, use [`retarget_to_altitude`](@ref), which returns a genuine
+L1-halo family member (closing to ~3e-05 km) — or `MPCController`'s `target_alt_km` toggle,
+which wraps it. Retained for the SARSOP `EXCURSE_*` path, which still targets waypoints;
+rewiring that to family members is a separate step (`docs/todo.md`).
 """
 function _scale_to_altitude(r_nom::AbstractVector{<:Real}, alt_km::Real)
     rr  = _enc_relative(r_nom)
@@ -391,6 +463,9 @@ no per-baseline special-casing:
   - `peri_alts_km`, `peri_lats_deg` — achieved periapsis altitude (km) and latitude (deg)
     per control step. Latitude is what the south-polar science case turns on and is
     invisible in an altitude or a deviation norm.
+  - `final_state` — the full final 6-state (km, km/s). Lets a rollout be CHAINED, which
+    `steps[].peri_pos` (position only) cannot support — needed for a staged transfer that
+    advances the commanded altitude one rung at a time.
   - `max_dev_trans_km` — largest TRANSVERSE (along-track + out-of-plane) periapsis
     deviation. Altitude errors are radial; this is the part of a position miss that a
     radius cannot see, and it is where most of the `:position` residual lives.
@@ -459,6 +534,11 @@ function simulate(
             maximum(s -> isfinite(s.dev_transverse_km) ? s.dev_transverse_km : -Inf, steps),
         science_cov     = _controller_cov(controller),
         n_bands         = cov_count(_controller_cov(controller)),
+        # Full final 6-state (km, km/s), so a rollout can be CHAINED — e.g. a staged transfer
+        # that advances the reference one rung at a time and hands the achieved state forward.
+        # `steps[].peri_pos` is position only, which is not enough to resume propagation.
+        # Empty when a leg ended with no usable state (`:none`).
+        final_state     = copy(state),
         steps           = steps,
     )
 

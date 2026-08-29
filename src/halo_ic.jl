@@ -584,6 +584,240 @@ function differential_corrector(
     return _corrector_failure(x0, z0_nd, vy0, max_iter, residual, n_crossings, "")
 end
 
+# ── Family continuation: x0 as the family parameter ──────────────────────────
+#
+# ⚠️ WHY A SECOND CORRECTOR EXISTS, RATHER THAN A KEYWORD ON THE FIRST.
+# [`differential_corrector`](@ref) frees `(x0, vy0)` and holds `z0` as the family parameter.
+# That parameterisation CANNOT CONTINUE THIS FAMILY: measured 2026-08-29, stepping `z0` away
+# from the shipped member leaves `vz_f` pinned at ~-2.7e-04, and it will not null at any
+# damping (0.7 / 0.9 / 1.0), any tolerance (1e-09 / 1e-11), or 200 iterations. The 2x2 Newton
+# has no root off the shipped `z0`, so every continuation step reports a corrector failure
+# and the family looks empty when it is not.
+#
+# Swapping which variable is held fixed — free `(z0, vy0)`, step `x0` — traces the family
+# cleanly: 181 members from periapsis 30.975 km to 248.255 km, latitude -87.03 deg to
+# -66.40 deg, every one closing to ~3e-05 km.
+#
+# `differential_corrector` is left EXACTLY as it is because it is what every pre-2026-08-29
+# measurement was taken with, and it remains the right tool for refining a single member at a
+# known `z0`. This is added capability, not a replacement.
+
+"""
+    corrector_free_z0(x0_nd, z0_seed_nd, vy0_seed_nd; tol, max_iter, damp, t_half_max_nd,
+                      n_crossings) -> NamedTuple
+
+Single-shooting corrector with `x0` as the FAMILY PARAMETER: free variables `z0` and `vy0`,
+targeting `vx_f = vz_f = 0` at the `n_crossings`-th `y = 0` crossing.
+
+This is the transpose of [`differential_corrector`](@ref)'s variable split, and it is the one
+that can walk along the family — see the comment above for the measurement showing the
+`z0`-fixed parameterisation cannot. Use this to continue in `x0`; use
+[`differential_corrector`](@ref) to polish a member at a fixed `z0`.
+
+`z0_seed_nd` / `vy0_seed_nd` are the Newton seed and should come from the PREVIOUS converged
+member when continuing — a cold seed far from the family does not converge.
+
+Returns `(x0_nd, z0_nd, vy0_nd, ic_nd, ic, t_half_nd, period_s, converged, residual)`.
+The Newton step uses STM rows `vx = 4`, `vz = 6` against columns `z = 3`, `vy = 5`.
+"""
+function corrector_free_z0(
+    x0_nd::Real,
+    z0_seed_nd::Real,
+    vy0_seed_nd::Real;
+    tol::Real = 1e-10,
+    max_iter::Integer = 150,
+    damp::Real = 0.7,
+    t_half_max_nd::Real = 20.0,
+    n_crossings::Integer = 1,
+)
+    x0 = float(x0_nd)
+    v = [float(z0_seed_nd), float(vy0_seed_nd)]
+    residual = Inf
+
+    for _ in 1:max_iter
+        state_f, phi, t_half = try
+            propagate_half_period_nd(x0, v[1], v[2];
+                                     n_crossings = n_crossings, t_half_max = t_half_max_nd)
+        catch e
+            e isa ErrorException || rethrow()
+            return (x0_nd = x0, z0_nd = v[1], vy0_nd = v[2], ic_nd = Float64[], ic = Float64[],
+                    t_half_nd = NaN, period_s = NaN, converged = false, residual = residual)
+        end
+
+        vx_f, vz_f = state_f[4], state_f[6]
+        residual = abs(vx_f) + abs(vz_f)
+
+        if residual < tol
+            ic_nd = [x0, 0.0, v[1], 0.0, v[2], 0.0]
+            return (x0_nd = x0, z0_nd = v[1], vy0_nd = v[2],
+                    ic_nd = ic_nd, ic = nondim_to_cr3bp(ic_nd),
+                    t_half_nd = t_half, period_s = 2.0 * t_half * T_STAR,
+                    converged = true, residual = residual)
+        end
+
+        # Free variables z0, vy0 -> STM columns 3 and 5.
+        M = [phi[4, 3]  phi[4, 5]
+             phi[6, 3]  phi[6, 5]]
+        cond(M) > 1e12 && break
+        delta = try
+            M \ [vx_f, vz_f]
+        catch e
+            e isa LinearAlgebra.SingularException || rethrow()
+            break
+        end
+        v .-= damp .* delta
+    end
+
+    return (x0_nd = x0, z0_nd = v[1], vy0_nd = v[2], ic_nd = Float64[], ic = Float64[],
+            t_half_nd = NaN, period_s = NaN, converged = false, residual = residual)
+end
+
+"""
+    halo_family_member(x0_nd, z0_seed_nd, vy0_seed_nd; kwargs...) -> Union{NamedTuple,Nothing}
+
+One converged halo-family member at family parameter `x0_nd`, characterised. `nothing` if the
+corrector did not converge.
+
+Returns `(x0, ic_nd, ic, period_s, z0, vy0, residual, info)` where `info` is the
+[`characterise_orbit`](@ref) NamedTuple (periapsis/apoapsis altitude, latitude, closure, ...).
+"""
+function halo_family_member(x0_nd::Real, z0_seed_nd::Real, vy0_seed_nd::Real; kwargs...)
+    r = corrector_free_z0(x0_nd, z0_seed_nd, vy0_seed_nd; kwargs...)
+    r.converged || return nothing
+    return (
+        x0       = r.x0_nd,
+        ic_nd    = r.ic_nd,
+        ic       = r.ic,
+        period_s = r.period_s,
+        z0       = r.z0_nd,
+        vy0      = r.vy0_nd,
+        residual = r.residual,
+        info     = characterise_orbit(r.ic, r.period_s; verbose = false),
+    )
+end
+
+"""
+    halo_family_table(; ic_nd, dx, n_steps, kwargs...) -> Vector{NamedTuple}
+
+Continue the L1 halo family from `ic_nd`, stepping the family parameter `x0` by `dx` and
+seeding each member from its PREDECESSOR. Returns the converged members in order, stopping at
+the first failure.
+
+Chained seeding is what makes this converge: measured 2026-08-29, a cold-seeded scan at fixed
+`vy0` does not, and neither does stepping `z0` (see `corrector_free_z0`). Steps must also stay
+small — periapsis altitude moves ~2 km per `1e-05` of `x0` near the nominal orbit, so a `1e-04`
+step jumps 31 km to 170 km and skips the entire science range.
+
+Defaults trace periapsis ~31 km to ~248 km (latitude -87.03 deg to -66.40 deg) from
+`PERIOD1_SOUTH_IC_ND` in 181 members. `dx < 0` RAISES periapsis.
+"""
+function halo_family_table(;
+    ic_nd::AbstractVector{<:Real} = PERIOD1_SOUTH_IC_ND,
+    dx::Real = -5.0e-6,
+    n_steps::Integer = 180,
+    kwargs...,
+)
+    ic_nd = collect(float.(ic_nd))
+    table = NamedTuple[]
+    z0, vy0 = ic_nd[3], ic_nd[5]
+    for k in 0:n_steps
+        m = halo_family_member(ic_nd[1] + k * float(dx), z0, vy0; kwargs...)
+        m === nothing && break
+        push!(table, m)
+        z0, vy0 = m.z0, m.vy0
+    end
+    return table
+end
+
+# Memo for `halo_family_table_cached`. Continuing the default 181-member family costs ~2 min
+# (181 corrector solves, each propagating a half period with the 42-state STM), and a rollout
+# needs the SAME table on every controller construction — so a sweep of commanded altitudes
+# would otherwise pay that cost once per arm. Keyed on the arguments, so a different span or
+# step size gets its own entry rather than silently reusing the wrong family.
+const _HALO_FAMILY_CACHE = Dict{Tuple{Vector{Float64},Float64,Int},Vector{NamedTuple}}()
+
+"""
+    halo_family_table_cached(; ic_nd, dx, n_steps) -> Vector{NamedTuple}
+
+[`halo_family_table`](@ref) memoized on `(ic_nd, dx, n_steps)`. The continuation is
+deterministic, so caching is safe, and it turns a ~2-minute rebuild into a lookup for every
+caller after the first — which matters because a commanded-altitude sweep constructs one
+controller per arm and each would otherwise re-continue the whole family.
+
+Use this in a rollout; use [`halo_family_table`](@ref) when you want a guaranteed fresh solve.
+"""
+function halo_family_table_cached(;
+    ic_nd::AbstractVector{<:Real} = PERIOD1_SOUTH_IC_ND,
+    dx::Real = -5.0e-6,
+    n_steps::Integer = 180,
+)
+    key = (collect(float.(ic_nd)), float(dx), Int(n_steps))
+    return get!(_HALO_FAMILY_CACHE, key) do
+        halo_family_table(; ic_nd = ic_nd, dx = dx, n_steps = n_steps)
+    end
+end
+
+"""
+    retarget_to_altitude(table, target_alt_km; tol_km, max_iter) -> Union{NamedTuple,Nothing}
+
+The halo-family member whose PERIAPSIS ALTITUDE is `target_alt_km`, refined off a
+[`halo_family_table`](@ref) by secant in the family parameter `x0`. `nothing` if
+`target_alt_km` lies outside the table's altitude span — which is a real answer, not an error:
+it means the continued family contains no member at that altitude.
+
+⚠️ **This is the ONLY correct way to build a reference orbit at a commanded altitude.** Do NOT
+radially scale an apse position vector (`_scale_to_altitude`): a scaled vector is not a
+solution of the dynamics, and measured 2026-08-26 every scaled-apoapsis reference escaped, two
+with negative periapsis. A member returned here is a genuine periodic orbit, closing to
+~3e-05 km, so a controller can actually settle onto it.
+
+Measured accuracy (2026-08-29, from `PERIOD1_SOUTH_IC_ND`): commanded 31 / 50 / 70 / 120 /
+200 km are met to **better than 0.0002 km**, all south-polar.
+
+⚠️ Periapsis latitude degrades as altitude rises — -87.03 deg at 31 km, -85.73 deg at 50 km,
+-84.25 deg at 70 km, -77.29 deg at 150 km. Altitude and south-polar latitude TRADE OFF, so a
+band choice is also a latitude choice.
+
+Secant rather than bisection on purpose: a bisection midpoint far from the previous member
+breaks the continuation chain and the corrector converges to a DIFFERENT member, which reads
+as "no member exists at this altitude" when one does (measured — it is how this was first
+mis-diagnosed). Each secant iterate is seeded from the nearest converged member.
+"""
+function retarget_to_altitude(
+    table::AbstractVector,
+    target_alt_km::Real;
+    tol_km::Real = 0.01,
+    max_iter::Integer = 40,
+)
+    isempty(table) && return nothing
+    target = float(target_alt_km)
+    alts = [m.info.periapsis_alt_km for m in table]
+    (target < minimum(alts) || target > maximum(alts)) && return nothing
+
+    i = argmin(abs.(alts .- target))
+    j = clamp(i + (alts[i] < target ? 1 : -1), 1, length(table))
+    x_a, f_a = table[i].x0, alts[i] - target
+    x_b, f_b = table[j].x0, alts[j] - target
+    best = table[i]
+    seed = table[i]
+
+    for _ in 1:max_iter
+        abs(f_a) < tol_km && return best
+        abs(f_b - f_a) < 1e-18 && break
+        x_new = x_a - f_a * (x_b - x_a) / (f_b - f_a)
+        m = halo_family_member(x_new, seed.z0, seed.vy0)
+        m === nothing && break
+        f_new = m.info.periapsis_alt_km - target
+        if abs(f_new) < abs(f_a)
+            best = m
+            seed = m
+        end
+        x_b, f_b = x_a, f_a
+        x_a, f_a = x_new, f_new
+    end
+    return best
+end
+
 function _corrector_failure(x0, z0, vy0, iters, residual, n_crossings, error_msg)
     ic_nd = [float(x0), 0.0, float(z0), 0.0, float(vy0), 0.0]
     return (
