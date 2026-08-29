@@ -32,7 +32,7 @@ not inherit the scipy-vs-`ContinuousCallback` "event at `t0`" difference documen
 logic.
 
 ⚠️ KNOWN DEFECT — THE ORBIT IS NOT PERIOD-3 (measured 2026-08-29, session log §5a).
-`PERIOD3_IC_ND` is a **period-1** L1 halo of true period **11.996 hr**, not a period-3
+`PERIOD1_NORTH_IC_ND` is a **period-1** L1 halo of true period **11.996 hr**, not a period-3
 orbit of 35.988 hr. Three independent measurements:
 
   * it closes at `T/3 = 11.996 hr` to 0.009 km — better than at the nominal 35.988 hr,
@@ -80,18 +80,20 @@ References
   MacKenzie et al. (2020). Enceladus Orbilander Mission Concept Study, §B.2.3.
 """
 
-# ── L1 halo orbit IC (southern-amplitude family) ──────────────────────────────
+# ── L1 halo orbit ICs ─────────────────────────────────────────────────────────
 # Source: JPL Three-Body Periodic Orbits Catalog (Saturn-Enceladus, halo, L1), matched to
 # ~10 significant figures. Periapsis ~31 km altitude, apoapsis ~1065 km.
 #
-# ⚠️ MISNOMER, RETAINED ONLY TO AVOID A RENAME CASCADE. This is a PERIOD-1 orbit of true
-# period 11.996 hr with ONE periapsis per revolution, at +87.03° latitude (NORTH).
-# `PERIOD3_PERIOD_S` below is 3 × its true period, and propagating for that long traverses
-# the same loop three times. It is NOT the MacKenzie period-3 science orbit, which has
-# three distinct periapses over the SOUTH pole. Full evidence in the module docstring.
+# PERIOD-1: true period 11.996 hr (`HALO_PERIOD_S`), ONE periapsis per revolution. This is
+# NOT the MacKenzie period-3 science orbit, which has three GEOMETRICALLY DISTINCT periapses
+# over the south pole; finding that is a branch-switching problem (module docstring).
 #
-# Physical: x0 = 237911.1 km, z0 = −1162.8 km, vy0 = 0.06895 km/s, true T = 11.996 hr.
-const PERIOD3_IC_ND = [
+# Prefer `PERIOD1_SOUTH_IC_ND` — it is the hemisphere the science case wants. The north
+# variant is kept because every pre-2026-08-29 measurement was taken on it, so it is the
+# reference for reproducing those numbers.
+#
+# Physical: x0 = 237911.1 km, |z0| = 1162.8 km, |vy0| = 0.06895 km/s, true T = 11.996 hr.
+const PERIOD1_NORTH_IC_ND = [
      9.974083488926582e-01,   # x0  (nondim)
      0.0,                     # y0
     -4.874948479304304e-03,   # z0  (nondim; NEGATIVE amplitude -> NORTH-pole periapsis)
@@ -100,9 +102,11 @@ const PERIOD3_IC_ND = [
      0.0,                     # vz0
 ]
 
-# 3 × the true 11.996 hr period — three traversals of one loop, not one period-3 orbit.
-const PERIOD3_PERIOD_S  = 35.988 * 3600.0                      # s
-const PERIOD3_PERIOD_ND = PERIOD3_PERIOD_S / 18913.2798604104   # nondim (TU)
+# ⚠️ 3 × the true 11.996 hr period — three traversals of ONE loop, not a period-3 orbit.
+# Retained because every controller measurement to date used it as the horizon; use
+# `HALO_PERIOD_S` for the actual period.
+const PERIOD1_TRIPLE_PERIOD_S = 35.988 * 3600.0                       # s
+const PERIOD1_PERIOD_ND = PERIOD1_TRIPLE_PERIOD_S / 18913.2798604104   # nondim (TU)
 
 """
     mirror_z(state) -> Vector{Float64}
@@ -122,10 +126,10 @@ mirror_z(state::AbstractVector{<:Real}) =
     [state[1], state[2], -state[3], state[4], state[5], -state[6]]
 
 # ── South-polar science orbit ─────────────────────────────────────────────────
-# The z-mirror of `PERIOD3_IC_ND`, and the IC the science case actually calls for.
+# The z-mirror of `PERIOD1_NORTH_IC_ND`, and the IC the science case actually calls for.
 #
 # ⚠️ COUNTERINTUITIVE, AND THIS IS WHAT WENT WRONG BEFORE. The sign of the out-of-plane
-# amplitude `z0` is OPPOSITE to the hemisphere of the periapsis. `PERIOD3_IC_ND` has
+# amplitude `z0` is OPPOSITE to the hemisphere of the periapsis. `PERIOD1_NORTH_IC_ND` has
 # `z0 < 0` and was documented as the "southern (south-polar)" member, but its closest
 # approach is at +87.033° — the NORTH pole. This IC has `z0 > 0` and puts periapsis at
 # −87.033°, over the south-polar terrain and the plumes.
@@ -136,10 +140,10 @@ mirror_z(state::AbstractVector{<:Real}) =
 #
 # Because the two orbits are exact reflections, every controller result measured on the
 # north-polar IC transfers to this one unchanged.
-const SOUTH_POLAR_IC_ND = mirror_z(PERIOD3_IC_ND)
+const PERIOD1_SOUTH_IC_ND = mirror_z(PERIOD1_NORTH_IC_ND)
 
-# The true period of the halo — ONE periapsis pass. `PERIOD3_PERIOD_S` is 3× this.
-const HALO_PERIOD_S = PERIOD3_PERIOD_S / 3
+# The true period of the halo — ONE periapsis pass. `PERIOD1_TRIPLE_PERIOD_S` is 3× this.
+const HALO_PERIOD_S = PERIOD1_TRIPLE_PERIOD_S / 3
 
 # Non-dimensional positions of the primaries
 const _X_SAT_ND = -MU
@@ -482,7 +486,7 @@ is a simple halo, `n_crossings = 3` the period-3 orbit of MacKenzie §B.2.3.
     by exactly 5/3. Rather than return that plausible-but-wrong number (as the Python
     reference does), both period fields are `NaN` for `n_crossings > 1`, so a caller gets
     a loud failure instead of silently propagating 1.67 revolutions as one orbit. Use
-    `PERIOD3_PERIOD_S` for the period-3 science orbit, or `n × 2 × t_cross(n_crossings = 1)`.
+    `PERIOD1_TRIPLE_PERIOD_S` for the period-3 science orbit, or `n × 2 × t_cross(n_crossings = 1)`.
     `t_half_nd` is always returned if you need to compute it yourself.
 
 The Newton step uses the 2×2 STM sub-block (rows `vx = 4`, `vz = 6`; columns `x = 1`,
@@ -539,7 +543,7 @@ function differential_corrector(
             # value; we return NaN instead so a caller cannot silently propagate 1.67
             # revolutions and call it one orbit. Deliberate divergence from the
             # reference — see the 2026-08-24 halo-IC session log §5.
-            # Use PERIOD3_PERIOD_S, or n × 2 × t_cross(n_crossings = 1), until the
+            # Use PERIOD1_TRIPLE_PERIOD_S, or n × 2 × t_cross(n_crossings = 1), until the
             # general relation is derived and regression-tested.
             multi = n_crossings > 1
             return (
@@ -767,45 +771,60 @@ Targets the period-3 L1 halo orbit for the Enceladus Orbilander (MacKenzie et al
 i.e. half of the ~36-hr period-3 orbit.
 
   - `x0_km` — IC x-coordinate (km from the barycentre). `nothing` → `x_L1 − 100 km`.
-  - `z0_km` — IC z-coordinate (km); negative = southern amplitude. The family parameter.
+  - `z0_km` — IC z-amplitude (km). The family parameter. Its SIGN IS IGNORED; the hemisphere
+    is set by `periapsis_hemisphere` (see below), because the sign of `z0` is the OPPOSITE
+    of the hemisphere the periapsis lands in.
+  - `periapsis_hemisphere` — `:south` (default, what the science case wants) or `:north`.
+    Named for the observable, not for the amplitude sign.
   - `vy0_km_s` — IC y-velocity (km/s). `nothing` → found by [`seed_scan`](@ref).
-  - `t_half_max_hr` — propagation ceiling in hours; 60 hr covers three loops.
+  - `t_half_max_hr` — propagation ceiling in hours.
+
+⚠️ SIGN CONVENTION. `z0 > 0` gives SOUTH-pole periapsis and `z0 < 0` gives NORTH-pole — the
+out-of-plane amplitude sign is opposite to the periapsis hemisphere. The old `northern`
+keyword had this inverted (`northern = false` forced `z0 < 0`, which yields a NORTH-pole
+periapsis while printing "southern"), so it is removed rather than fixed: a bare boolean is
+what made the error invisible. Ask for the hemisphere you want and this function picks the
+sign. Verified against `periapsis_lat_deg`, which is the observable that finally caught it.
 
 Returns the corrector NamedTuple, merged with the characterisation fields when it converged.
 """
 function find_halo_ic(;
     x0_km::Union{Real,Nothing} = nothing,
-    z0_km::Real = -280.0,
+    z0_km::Real = 280.0,
     vy0_km_s::Union{Real,Nothing} = nothing,
-    northern::Bool = false,
-    n_crossings::Integer = 3,
+    periapsis_hemisphere::Symbol = :south,
+    n_crossings::Integer = 1,
     tol::Real = 1e-10,
     max_iter::Integer = 50,
     damp::Real = 0.7,
     t_half_max_hr::Real = 60.0,
     verbose::Bool = true,
 )
+    periapsis_hemisphere in (:south, :north) || throw(ArgumentError(
+        "periapsis_hemisphere must be :south or :north, got :$periapsis_hemisphere"))
+    south = periapsis_hemisphere === :south
+
     xL1_km, _, _ = libration_points_x()
     x0_km = x0_km === nothing ? xL1_km - 100.0 : float(x0_km)
-    z0_km = northern ? abs(float(z0_km)) : float(z0_km)
+    # z0 > 0 -> SOUTH-pole periapsis. The caller's sign is discarded on purpose.
+    z0_km = south ? abs(float(z0_km)) : -abs(float(z0_km))
 
     x0_nd = x0_km / L_STAR
     z0_nd = z0_km / L_STAR
     t_half_max_nd = t_half_max_hr * 3600.0 / T_STAR
 
     if verbose
-        hemi = northern ? "northern" : "southern (south-polar)"
-        println("=== Period-$(n_crossings) $(hemi) halo IC finder ===")
+        println("=== Period-$(n_crossings) halo IC finder — $(periapsis_hemisphere)-pole periapsis ===")
         @printf("  x0 = %.1f km (L1 offset: %+.1f km)\n", x0_km, x0_km - xL1_km)
-        @printf("  z0 = %.1f km\n", z0_km)
+        @printf("  z0 = %+.1f km  (sign set by periapsis_hemisphere, not by the caller)\n", z0_km)
     end
 
     local vy0_nd
     if vy0_km_s === nothing
         verbose && println("\n--- Seed scan over vy0 ---")
-        # Southern: vy0 > 0 (orbit goes +y first); northern: vy0 < 0.
-        lo = northern ? -0.3 / V_STAR : 0.001 / V_STAR
-        hi = northern ? -0.001 / V_STAR : 0.3 / V_STAR
+        # vy0 sign pairs with the z0 sign for a symmetric halo: z0 > 0 -> vy0 < 0.
+        lo = south ? -0.3 / V_STAR : 0.001 / V_STAR
+        hi = south ? -0.001 / V_STAR : 0.3 / V_STAR
         scanned = seed_scan(
             x0_nd, z0_nd, (lo, hi);
             n_vy = 40, n_crossings = n_crossings,
@@ -835,7 +854,7 @@ function find_halo_ic(;
         # intermediate coasts — see the differential_corrector docstring), so recover the
         # true period from a single-crossing solve of the SAME converged IC and scale by
         # the crossing count. Verified at n_crossings = 3: this reproduces
-        # PERIOD3_PERIOD_S (35.98811 hr vs the 35.988 hr constant).
+        # PERIOD1_TRIPLE_PERIOD_S (35.98811 hr vs the 35.988 hr constant).
         period_s = result.period_s
         if !isfinite(period_s)
             single = differential_corrector(

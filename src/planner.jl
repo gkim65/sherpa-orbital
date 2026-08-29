@@ -148,7 +148,7 @@ function next_apses(
     eom! = cr3bp_eom!,
     rtol::Real = RTOL_ONBOARD,
     atol::Real = ATOL_ONBOARD,
-    t_guess::Real = PERIOD3_PERIOD_S,
+    t_guess::Real = PERIOD1_TRIPLE_PERIOD_S,
     max_expansions::Integer = 6,
 )
     (n_peri >= 0 && n_apo >= 0) ||
@@ -189,7 +189,7 @@ function next_apse_positions(
     eom! = cr3bp_eom!,
     rtol::Real = RTOL_ONBOARD,
     atol::Real = ATOL_ONBOARD,
-    t_guess::Real = PERIOD3_PERIOD_S,
+    t_guess::Real = PERIOD1_TRIPLE_PERIOD_S,
     max_expansions::Integer = 6,
 )
     peri, apo = next_apses(state0, 1, 1; eom! = eom!, rtol = rtol, atol = atol,

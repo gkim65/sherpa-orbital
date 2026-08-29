@@ -93,8 +93,8 @@ Measure all three kernels and return them alongside a per-row diagnostics dict.
 function calibrate_tables(;
     truth_eom! = cr3bp_j2_eom!,
     truth_name::AbstractString = "CR3BP + Enceladus J2",
-    ic::AbstractVector{<:Real} = nondim_to_cr3bp(collect(PERIOD3_IC_ND)),
-    period_s::Real = PERIOD3_PERIOD_S,
+    ic::AbstractVector{<:Real} = nondim_to_cr3bp(collect(PERIOD1_NORTH_IC_ND)),
+    period_s::Real = PERIOD1_TRIPLE_PERIOD_S,
     n_steps::Integer = 120,
     horizon_s::Real = 25 * 86400.0,
     dev_edges::NTuple{3,Float64} = (15.0, 60.0, 200.0),
