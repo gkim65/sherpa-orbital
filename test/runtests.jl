@@ -169,4 +169,46 @@ const CFG = StationkeepingPOMDP()
         @test build_pomdp(CFG) !== nothing
     end
 
+    # Orbit geometry. These pin the 2026-08-29 findings: the shipped IC is period-1 (not
+    # period-3) and NORTH-polar, and the z-mirror of it is the south-polar science orbit.
+    # Without the latitude assertions an IC in the wrong hemisphere is invisible — which is
+    # exactly how the north-polar orbit survived several sessions of measurement.
+    @testset "orbit geometry and hemisphere" begin
+        ic_n = nondim_to_cr3bp(collect(PERIOD3_IC_ND))
+        ic_s = nondim_to_cr3bp(collect(SOUTH_POLAR_IC_ND))
+
+        # The true period is HALO_PERIOD_S; PERIOD3_PERIOD_S is 3x it (three traversals).
+        @test HALO_PERIOD_S ≈ PERIOD3_PERIOD_S / 3
+        ch_n = characterise_orbit(ic_n, HALO_PERIOD_S; verbose = false)
+        # Closes at T/3 to well under the 0.028 km it reaches at the mislabelled 3T,
+        # which is what makes it period-1 rather than period-3.
+        @test ch_n.closure_km < 0.02
+
+        # The shipped IC is NORTH-polar despite z0 < 0 — the sign of the out-of-plane
+        # amplitude is opposite to the periapsis hemisphere.
+        @test PERIOD3_IC_ND[3] < 0
+        @test ch_n.periapsis_lat_deg > 85.0
+
+        # The mirror is south-polar and otherwise identical.
+        ch_s = characterise_orbit(ic_s, HALO_PERIOD_S; verbose = false)
+        @test ch_s.periapsis_lat_deg < -85.0
+        @test ch_s.periapsis_lat_deg ≈ -ch_n.periapsis_lat_deg
+        @test ch_s.periapsis_alt_km  ≈ ch_n.periapsis_alt_km
+        @test ch_s.apoapsis_alt_km   ≈ ch_n.apoapsis_alt_km
+        @test ch_s.jacobi            ≈ ch_n.jacobi
+
+        # mirror_z is an involution and flips only z, vz.
+        @test mirror_z(mirror_z(PERIOD3_IC_ND)) ≈ collect(PERIOD3_IC_ND)
+
+        # Linear stability: all Floquet multipliers on the unit circle in the CR3BP, so
+        # the orbit has NO hyperbolic instability and no finite e-folding time. The
+        # divergence seen in rollouts comes from the truth model, not from this.
+        Mn = monodromy_matrix(PERIOD3_IC_ND, HALO_PERIOD_S / SherpaOrbital.T_STAR)
+        @test stability_index(Mn) ≈ 1.0 atol = 1e-6
+        @test !isfinite(e_folding_time_s(Mn, HALO_PERIOD_S))
+        # Mirrored orbit has identical stability.
+        @test stability_index(monodromy_matrix(SOUTH_POLAR_IC_ND,
+                                               HALO_PERIOD_S / SherpaOrbital.T_STAR)) ≈ 1.0 atol = 1e-6
+    end
+
 end

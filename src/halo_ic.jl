@@ -31,12 +31,44 @@ not inherit the scipy-vs-`ContinuousCallback` "event at `t0`" difference documen
 `dynamics/integrator.jl`. Do not "simplify" the coasts away — they are the crossing-counting
 logic.
 
-⚠️ KNOWN DEFECT. The converged period-3 IC has
-`z0 < 0` (southern out-of-plane amplitude), but the closest approach of this symmetric
-period-3 bifurcation orbit falls at ~+87° latitude — the NORTH pole — not the south pole
-the science case targets. Placing periapsis over the south pole needs the asymmetric
-6-variable corrector ("Step A′", `docs/todo.md` blocking item 2); this IC is the symmetric
-degenerate case.
+⚠️ KNOWN DEFECT — THE ORBIT IS NOT PERIOD-3 (measured 2026-08-29, session log §5a).
+`PERIOD3_IC_ND` is a **period-1** L1 halo of true period **11.996 hr**, not a period-3
+orbit of 35.988 hr. Three independent measurements:
+
+  * it closes at `T/3 = 11.996 hr` to 0.009 km — better than at the nominal 35.988 hr,
+    and the residual grows LINEARLY with time (0.0094 / 0.0187 / 0.0281 km at T/3, 2T/3,
+    T), which is accumulated integrator drift, not three distinct loops;
+  * its three "periapsis passes" are the SAME point revisited — all three at
+    altitude 30.9753 km, latitude +87.033°, longitude −180.000°, to 3+ decimals;
+  * the row matches the JPL Three-Body Periodic Orbit Catalog (Saturn-Enceladus, halo,
+    L1) to ~10 significant figures at period 11.99604 hr. The catalog's L1 halo periods
+    span 7.80–16.14 hr, so **35.988 hr is not in the family at all**.
+
+The `n_crossings = 3` target cannot detect this: a period-1 halo satisfies `vx = vz = 0`
+IDENTICALLY at every `y = 0` crossing (measured residual ~1e-14 at n = 1, 2, 3 and 4), so
+the period-1 branch is an exact root of the n = 3 residual and Newton converges to it.
+Raising `n_crossings` relabels revolutions; it does not impose period-3.
+
+⚠️ AND THE ORBIT IS NOT UNSTABLE. All six Floquet multipliers lie on the unit circle
+(`stability_index` = 1.000000 over the true period), and uncontrolled propagation under
+the ONBOARD CR3BP holds 30.975 km for ten revolutions with no drift. The 31 → 52 → 113 →
+950 → 43,819 km runaway recorded across earlier sessions is reproduced only under the
+TRUTH model — it is the **J2 model gap**, not orbital instability. Any claim resting on
+"the halo is unstable" needs re-deriving from this distinction.
+
+What MacKenzie et al. (2020) actually specify (§3.12 p.20, §B.2.3 p.B-25): a period-3
+orbit whose "three passages of periapsis" are "each roughly 12 hours apart" and "grouped
+in three distinct regions" over the SOUTH pole — i.e. a ~36 hr orbit with three
+GEOMETRICALLY DISTINCT periapses. Our 11.996 hr single-periapsis orbit reproduces their
+12 hr spacing by coincidence, which is why the mislabelling survived. They also state the
+period-3 family is preferred over period-1 precisely because period-1 gives repeat
+ground-tracks, whereas reconnaissance needs ground-track diversity.
+
+Finding a genuine period-3 orbit is a BRANCH-SWITCHING problem, not a corrector-formulation
+problem: locate a period-tripling bifurcation along the family (where the trace-convention
+stability index reaches −1, i.e. multipliers at the primitive cube roots of unity), step
+off along the critical eigenvector, then continue. No such crossing has been shown to exist
+in this family at these altitudes. See `docs/todo.md` blocking item 2.
 
 References
   Richardson, D. L. (1980). "Analytic Construction of Periodic Orbits about the Collinear
@@ -48,24 +80,66 @@ References
   MacKenzie et al. (2020). Enceladus Orbilander Mission Concept Study, §B.2.3.
 """
 
-# ── Verified period-3 L1 halo orbit IC (southern-amplitude family) ────────────
-# Source: JPL Three-Body Periodic Orbits Catalog (DE440), corrected in our CR3BP.
-# MacKenzie et al. 2020 §B.2.3 science orbit — periapsis ~31 km altitude, apoapsis
-# ~1065 km, period 35.99 hr, 3 periapsis passes per revolution. Converged with
-# `differential_corrector(...; n_crossings = 3)`.
+# ── L1 halo orbit IC (southern-amplitude family) ──────────────────────────────
+# Source: JPL Three-Body Periodic Orbits Catalog (Saturn-Enceladus, halo, L1), matched to
+# ~10 significant figures. Periapsis ~31 km altitude, apoapsis ~1065 km.
 #
-# Physical: x0 = 237911.1 km, z0 = −1162.8 km, vy0 = 0.06895 km/s, T = 35.99 hr.
+# ⚠️ MISNOMER, RETAINED ONLY TO AVOID A RENAME CASCADE. This is a PERIOD-1 orbit of true
+# period 11.996 hr with ONE periapsis per revolution, at +87.03° latitude (NORTH).
+# `PERIOD3_PERIOD_S` below is 3 × its true period, and propagating for that long traverses
+# the same loop three times. It is NOT the MacKenzie period-3 science orbit, which has
+# three distinct periapses over the SOUTH pole. Full evidence in the module docstring.
+#
+# Physical: x0 = 237911.1 km, z0 = −1162.8 km, vy0 = 0.06895 km/s, true T = 11.996 hr.
 const PERIOD3_IC_ND = [
      9.974083488926582e-01,   # x0  (nondim)
      0.0,                     # y0
-    -4.874948479304304e-03,   # z0  (nondim; negative = southern amplitude)
+    -4.874948479304304e-03,   # z0  (nondim; NEGATIVE amplitude -> NORTH-pole periapsis)
      0.0,                     # vx0
      5.466912598254453e-03,   # vy0 (nondim)
      0.0,                     # vz0
 ]
 
+# 3 × the true 11.996 hr period — three traversals of one loop, not one period-3 orbit.
 const PERIOD3_PERIOD_S  = 35.988 * 3600.0                      # s
 const PERIOD3_PERIOD_ND = PERIOD3_PERIOD_S / 18913.2798604104   # nondim (TU)
+
+"""
+    mirror_z(state) -> Vector{Float64}
+
+Reflect a CR3BP state through the `z = 0` plane: `(z, vz) -> (-z, -vz)`.
+
+The CR3BP is invariant under this map (both primaries lie in `z = 0`, and the potential
+depends on `z` only through `z²`), so the image of a periodic orbit is another periodic
+orbit with the SAME period, Jacobi constant, altitude profile and stability — reflected in
+latitude. Works on non-dimensional or physical states alike; the map is unit-free.
+
+Enceladus J2 is likewise z-symmetric, so the reflection is exact under the truth model as
+well (verified: altitudes agree to the digit over six uncontrolled revolutions, only the
+sign of the latitude changes).
+"""
+mirror_z(state::AbstractVector{<:Real}) =
+    [state[1], state[2], -state[3], state[4], state[5], -state[6]]
+
+# ── South-polar science orbit ─────────────────────────────────────────────────
+# The z-mirror of `PERIOD3_IC_ND`, and the IC the science case actually calls for.
+#
+# ⚠️ COUNTERINTUITIVE, AND THIS IS WHAT WENT WRONG BEFORE. The sign of the out-of-plane
+# amplitude `z0` is OPPOSITE to the hemisphere of the periapsis. `PERIOD3_IC_ND` has
+# `z0 < 0` and was documented as the "southern (south-polar)" member, but its closest
+# approach is at +87.033° — the NORTH pole. This IC has `z0 > 0` and puts periapsis at
+# −87.033°, over the south-polar terrain and the plumes.
+#
+# Measured, identical to the north-polar member in every respect but latitude sign:
+# periapsis 30.9753 km at −87.033°, apoapsis 1064.806 km, true period 11.996 hr,
+# closure 0.00935 km, Jacobi 477.173298 km²/s², max |λ| = 1.00000000.
+#
+# Because the two orbits are exact reflections, every controller result measured on the
+# north-polar IC transfers to this one unchanged.
+const SOUTH_POLAR_IC_ND = mirror_z(PERIOD3_IC_ND)
+
+# The true period of the halo — ONE periapsis pass. `PERIOD3_PERIOD_S` is 3× this.
+const HALO_PERIOD_S = PERIOD3_PERIOD_S / 3
 
 # Non-dimensional positions of the primaries
 const _X_SAT_ND = -MU
@@ -522,6 +596,88 @@ function _corrector_failure(x0, z0, vy0, iters, residual, n_crossings, error_msg
     )
 end
 
+# ── Monodromy and linear stability ────────────────────────────────────────────
+
+"""
+    monodromy_matrix(ic_nd, period_nd; rtol, atol) -> Matrix{Float64}
+
+The 6×6 state transition matrix accumulated over one full period, `Φ(T, 0)`, for the
+non-dimensional initial condition `ic_nd`. Its eigenvalues are the Floquet multipliers.
+
+⚠️ `period_nd` must be the TRUE period of the orbit. Passing an integer multiple returns
+the corresponding power of the true monodromy, whose eigenvalues are the true multipliers
+raised to that power — the |λ| = 1 / |λ| ≠ 1 verdict is unchanged, but the stability
+index is not.
+"""
+function monodromy_matrix(
+    ic_nd::AbstractVector{<:Real},
+    period_nd::Real;
+    rtol::Real = 1e-13,
+    atol::Real = 1e-15,
+)
+    aug0 = vcat(collect(float.(ic_nd)), vec(Matrix{Float64}(I, 6, 6)))
+    sol = OrdinaryDiffEq.solve(
+        ODEProblem(cr3bp_stm_nd!, aug0, (0.0, float(period_nd))), Vern9();
+        reltol = rtol, abstol = atol,
+    )
+    return reshape(sol.u[end][7:42], 6, 6)
+end
+
+"""
+    stability_index(monodromy) -> Float64
+
+Maximum Floquet multiplier magnitude, `max |λ(M)|`, for the monodromy matrix `M`.
+
+Interpretation: `> 1` is linearly unstable, with an initial error growing by that factor
+each period; `≈ 1` (all multipliers on the unit circle) is marginally stable, meaning
+errors grow at most polynomially under the model `M` was computed in.
+
+A Hamiltonian monodromy always carries a trivial `λ = 1` pair from the time-translation
+and energy directions, so this quantity is exactly 1 for a marginally stable orbit rather
+than 0.
+
+⚠️ This measures stability of the DYNAMICAL MODEL used to propagate the STM. An orbit that
+is marginally stable in the onboard CR3BP can still diverge under the truth model; that
+divergence is a model gap, not orbital instability, and this number will not show it. See
+[`e_folding_time_s`](@ref) for the timescale when the orbit genuinely is unstable.
+
+References
+  Koon, Lo, Marsden & Ross (2011), "Dynamical Systems, the Three-Body Problem and Space
+    Mission Design", Ch. 4 (Floquet theory and the monodromy matrix).
+"""
+stability_index(monodromy::AbstractMatrix{<:Real}) = maximum(abs.(eigvals(monodromy)))
+
+"""
+    stability_index_trace(monodromy) -> Float64
+
+Alternative stability index `½·|trace(M)|`, the convention used when a family is
+summarised by a single scalar and compared against bifurcation thresholds.
+
+Reported alongside [`stability_index`](@ref) because the two answer different questions:
+this one locates bifurcations along a family, `max |λ|` decides whether a given orbit is
+unstable. They do not agree numerically and neither substitutes for the other.
+"""
+stability_index_trace(monodromy::AbstractMatrix{<:Real}) = 0.5 * abs(tr(monodromy))
+
+"""
+    e_folding_time_s(monodromy, period_s; tol = 1e-8) -> Float64
+
+Time for a linear perturbation to grow by a factor of `e`, in seconds:
+`T / log(max |λ|)`. Returns `Inf` when the orbit is not linearly unstable, which is the
+honest answer — a marginally stable orbit has no e-folding time.
+
+`tol` guards the marginal case, and is not cosmetic. A marginally stable orbit integrates
+to `max |λ| = 1 + O(1e-12)`, and a bare `> 1` test turns that rounding noise into a
+finite-looking e-folding time of ~1e16 s (over a billion years) — a number that reads as
+real but is pure numerical dust. Anything within `tol` of 1 is reported as stable.
+"""
+function e_folding_time_s(monodromy::AbstractMatrix{<:Real}, period_s::Real;
+                          tol::Real = 1e-8)
+    lam = stability_index(monodromy)
+    lam > 1.0 + tol || return Inf
+    return float(period_s) / log(lam)
+end
+
 # ── Orbit characterisation ────────────────────────────────────────────────────
 
 """
@@ -531,8 +687,14 @@ Propagate one full period from `ic` (PHYSICAL units, km / km/s) under the onboar
 model and extract the orbit's properties.
 
 Returns `(periapsis_alt_km, apoapsis_alt_km, period_s, period_hr, jacobi, closure_km,
-closure_kms)`. `closure_km` is `‖r(T) − r(0)‖` — how nearly the orbit closes — and is the
-primary quality metric for a corrected IC.
+closure_kms, periapsis_lat_deg, periapsis_lon_deg)`. `closure_km` is `‖r(T) − r(0)‖` — how
+nearly the orbit closes — and is the primary quality metric for a corrected IC.
+
+`periapsis_lat_deg` is Enceladus-centred latitude at closest approach, POSITIVE NORTH.
+Enceladus is tidally locked, so the CR3BP rotating frame is the body-fixed frame and this
+latitude is directly the sub-spacecraft latitude — the quantity the south-polar science
+case turns on. It is reported because altitude alone cannot distinguish the two
+hemispheres, which is how a north-polar IC went unnoticed for several sessions.
 """
 function characterise_orbit(ic::AbstractVector{<:Real}, period_s::Real; verbose::Bool = true)
     ic = collect(float.(ic))
@@ -544,8 +706,15 @@ function characterise_orbit(ic::AbstractVector{<:Real}, period_s::Real; verbose:
                     rtol = RTOL_ONBOARD, atol = ATOL_ONBOARD, saveat = ts)
 
     r_enc = [r_enceladus(u) for u in sol.u]
-    peri_alt = minimum(r_enc) - R_ENCELADUS
+    i_peri = argmin(r_enc)
+    peri_alt = r_enc[i_peri] - R_ENCELADUS
     apo_alt  = maximum(r_enc) - R_ENCELADUS
+
+    # Enceladus-centred latitude/longitude of closest approach. Tidal locking makes the
+    # rotating frame body-fixed, so these are sub-spacecraft coordinates directly.
+    d_peri   = sol.u[i_peri][1:3] .- [X_ENCELADUS, 0.0, 0.0]
+    peri_lat = asind(clamp(d_peri[3] / norm(d_peri), -1.0, 1.0))
+    peri_lon = atand(d_peri[2], d_peri[1])
 
     state_f = sol.u[end]
     closure_r = norm(state_f[1:3] - ic[1:3])
@@ -562,10 +731,14 @@ function characterise_orbit(ic::AbstractVector{<:Real}, period_s::Real; verbose:
         @printf("  Jacobi const   : %.6f km²/s²\n", jc)
         @printf("  Closure (pos)  : %.4f km\n", closure_r)
         @printf("  Closure (vel)  : %.2e km/s\n", closure_v)
+        @printf("  Periapsis lat  : %+.3f deg  (%s pole; science wants SOUTH)\n",
+                peri_lat, peri_lat >= 0 ? "NORTH" : "south")
+        @printf("  Periapsis lon  : %+.3f deg\n", peri_lon)
         peri_ok = PERIAPSIS_ALT_MIN <= peri_alt <= PERIAPSIS_ALT_MAX
         apo_ok  = APOAPSIS_ALT_MIN  <= apo_alt  <= APOAPSIS_ALT_MAX
         println("  Periapsis OK   : ", peri_ok ? "✓" : "✗")
         println("  Apoapsis OK    : ", apo_ok  ? "✓" : "✗")
+        println("  Hemisphere OK  : ", peri_lat < 0 ? "✓" : "✗")
     end
 
     return (
@@ -576,6 +749,8 @@ function characterise_orbit(ic::AbstractVector{<:Real}, period_s::Real; verbose:
         jacobi           = jc,
         closure_km       = closure_r,
         closure_kms      = closure_v,
+        periapsis_lat_deg = peri_lat,
+        periapsis_lon_deg = peri_lon,
     )
 end
 
