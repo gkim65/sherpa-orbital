@@ -142,6 +142,31 @@ Measure all three kernels and return them alongside a per-row diagnostics dict.
 function calibrate_tables(;
     truth_eom! = cr3bp_j2_eom!,
     truth_name::AbstractString = "CR3BP + Enceladus J2",
+    # ── θ: THE ENVIRONMENT PARAMETERS ────────────────────────────────────────
+    # These are the axes a POMDP FAMILY is swept along (see the module header). The kernels
+    # this function returns ARE `T_θ`, so every θ needs its own `calibrate_tables` call.
+    #
+    # `noisy_thruster` closes a real gap: until 2026-08-30 every burn here was applied
+    # PERFECTLY while the rollout harness routed ΔV through `apply_dv_noisy`, so the kernels
+    # described a perfect-thruster world and understated excursion risk badly. Measured over
+    # 12 seeds, holding a commanded band for 8 passes:
+    #
+    #   | band | kernel P(LOST), noise-free | actual, noisy thruster |
+    #   |------|---------------------------|------------------------|
+    #   | LOW  |                      0.19 |         1.00  (12/12)  |
+    #   | MID  |                     0.056 |         1.00  (12/12)  |
+    #   | HIGH |                      0.00 |         0.00  ( 0/12)  |
+    #
+    # A policy solved against the noise-free kernels therefore excurses freely and dies:
+    # 100% survival noise-free, 0/10 noisy. Set `noisy_thruster = true` to measure the
+    # environment the vehicle actually flies.
+    #
+    # ⚠️ NOISE-FREE IS STILL A LEGITIMATE θ, not a bug — it is the optimistic corner of the
+    # family and the reference the regret of every other θ is measured against. Keep it
+    # available; just do not mistake it for the deployment environment.
+    noisy_thruster::Bool = false,
+    rng::AbstractRNG = Xoshiro(0),
+    thruster_kwargs::NamedTuple = NamedTuple(),
     ic::AbstractVector{<:Real} = nondim_to_cr3bp(collect(PERIOD1_NORTH_IC_ND)),
     period_s::Real = PERIOD1_TRIPLE_PERIOD_S,
     n_steps::Integer = 120,
@@ -183,6 +208,13 @@ function calibrate_tables(;
                 h < alt_edges[3] ? :A27_34 :
                 h < alt_edges[4] ? :A34_44 : :ABOVE_44
     alt_of(u) = norm(_enc_relative(u[1:3])) - R_ENCELADUS
+
+    # Apply a commanded ΔV the way the ENVIRONMENT does. Routed through the same
+    # `apply_dv`/`apply_dv_noisy` pair the rollout harness uses, so a kernel measured here
+    # and a rollout flown there cannot disagree about what the thruster does — which they
+    # silently did until 2026-08-30 (calibration perfect, rollout noisy).
+    exec_dv(dv) = noisy_thruster ? apply_dv_noisy(dv, rng; thruster_kwargs...)[1] :
+                                   apply_dv(dv)
 
     nxt = collect(ALT_ALL)
     # counts[action][alt_from] -> Vector{Int} over ALT_ALL
@@ -236,7 +268,7 @@ function calibrate_tables(;
         end
 
         spost = copy(sc)
-        spost[4:6] .+= b.dv
+        spost[4:6] .+= exec_dv(b.dv)
         pc, uc = _to_peri(truth_eom!, spost, 4 * one_rev_s)
         bump!(:CORRECT, from, pc === :ok ? bin_of(alt_of(uc)) : _terminal_dev(pc))
 
@@ -327,7 +359,7 @@ function calibrate_tables(;
             end
 
             sp = copy(sc)
-            sp[4:6] .+= b.dv
+            sp[4:6] .+= exec_dv(b.dv)
             pe, ue = _to_peri(truth_eom!, sp, 4 * one_rev_s)
             if pe !== :ok
                 bump!(:EXCURSE, from, _terminal_dev(pe))
@@ -449,7 +481,7 @@ function calibrate_tables(;
                     push!(dvs[:CORRECT][from], 0.0)
                     continue
                 end
-                sps = copy(scs); sps[4:6] .+= bs.dv
+                sps = copy(scs); sps[4:6] .+= exec_dv(bs.dv)
                 pcs, ucs = _to_peri(truth_eom!, sps, 4 * one_rev_s)
                 bump!(:CORRECT, from, pcs === :ok ? bin_of(alt_of(ucs)) : _terminal_dev(pcs))
                 push!(dvs[:CORRECT][from], bs.dv_mag_ms)
@@ -476,6 +508,11 @@ function calibrate_tables(;
         "band_dv_ms"         => Dict(string(b) => band_dv[b] for b in band_names),
         "band_achieved_alt"  => Dict(string(b) => band_achieved_alt[b] for b in band_names),
         "truth_name"         => truth_name,
+        # θ, recorded so an artifact is self-describing: a kernel set is only meaningful
+        # together with the environment it was measured in.
+        "noisy_thruster"     => noisy_thruster,
+        "thruster_kwargs"    => Dict(string(k) => v for (k, v) in pairs(thruster_kwargs)),
+        "band_target_km"     => Dict(string(b) => band_target_km[b] for b in band_names),
         "mode"               => string(mode),
         "alt_edges"          => collect(alt_edges),
         "min_trials_trusted" => MIN_TRIALS_TRUSTED,
@@ -525,6 +562,18 @@ function tables_from_rows(rows::Dict{Symbol,Dict{Symbol,CalibrationRow}},
         "generated_by"       => "calibrate_tables + tables_from_rows",
         "truth_name"         => get(diagnostics, "truth_name", "unknown"),
         "mode"               => get(diagnostics, "mode", "unknown"),
+        # ── θ: WHICH ENVIRONMENT THESE KERNELS DESCRIBE ──────────────────────
+        # A kernel set is meaningless without the environment it was measured in, and this
+        # artifact is one member of a parameterized POMDP family (shared S/A/O/R, varying
+        # T_θ and O_θ), not "the" model. Recorded here so the committed JSON is
+        # self-describing rather than relying on whoever ran it to remember.
+        "theta" => Dict{String,Any}(
+            "truth_eom"       => get(diagnostics, "truth_name", "unknown"),
+            "noisy_thruster"  => get(diagnostics, "noisy_thruster", false),
+            "thruster_kwargs" => get(diagnostics, "thruster_kwargs", Dict{String,Any}()),
+            "band_target_km"  => get(diagnostics, "band_target_km", Dict{String,Any}()),
+            "alt_edges"       => get(diagnostics, "alt_edges", Float64[]),
+        ),
         "alt_edges"          => get(diagnostics, "alt_edges", Float64[]),
         "n_loop_steps"       => get(diagnostics, "n_loop_steps", 0),
         "trials"             => trials,

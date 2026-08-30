@@ -80,5 +80,18 @@ const APOAPSIS_ALT_MAX  = 1110.0   # km
 
 const PERIAPSIS_CRASH_ALT = 5.0    # km  below this → terminal state
 
-# Optical navigation noise (1-sigma), from MacKenzie 2020 §C.1
+# Optical navigation noise (1σ, km).
+#
+# ⚠️ THIS IS ~20× MacKenzie'S PREDICTED PERFORMANCE, deliberately. Exhibit C-8 (p. 152)
+# reports a steady-state OD error of "on the order of 300 m in position and several
+# centimeters per second in velocity" at 3σ — so 1σ ≈ 0.1 km, not 2.0 km. Ours is a
+# conservative stand-in chosen before that figure was located in the source (2026-08-30);
+# earlier docstrings in this repo cited "~0.3–1 km", which was an estimate, not the paper.
+#
+# Kept at 2.0 so existing measurements reproduce, but it is the pessimistic end of a range,
+# NOT a mission spec. For anything quoted, sweep it — and note 0.1 km is the sourced value,
+# which makes the altitude bins (10 km wide at the time of writing) essentially exactly
+# observed rather than noisy.
+#
+# Reference: MacKenzie, S. M. et al. (2020), Enceladus Orbilander, Exhibit C-8 §C.1.
 const SIGMA_NAV_POS = 2.0          # km
