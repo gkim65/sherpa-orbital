@@ -213,9 +213,10 @@ const CFG = StationkeepingPOMDP()
     end
 
     @testset "family continuation and retargeting" begin
-        # A short table keeps the suite fast; the full 181-member default takes ~2 min.
-        # dx < 0 raises periapsis, so this spans roughly 31–45 km.
-        tbl = halo_family_table(; n_steps = 14)
+        # A short table keeps the suite fast. `dx` is passed EXPLICITLY: it is the sign that
+        # sets the direction (dx < 0 raises periapsis, dx > 0 lowers it), so a test that
+        # relies on the default is really asserting the default, not the behaviour.
+        tbl = halo_family_table(; dx = -5.0e-6, n_steps = 14)
         @test length(tbl) == 15
 
         # Every member must be a genuine periodic orbit, in the SOUTH hemisphere. Closure is
@@ -225,10 +226,26 @@ const CFG = StationkeepingPOMDP()
         @test all(m -> m.info.periapsis_lat_deg < 0, tbl)
 
         # Periapsis altitude must be strictly monotone in the family parameter, otherwise
-        # retarget_to_altitude's secant has no bracket to work with.
+        # retarget_to_altitude's secant has no bracket to work with. dx < 0 -> ascending.
         alts = [m.info.periapsis_alt_km for m in tbl]
         @test issorted(alts)
         @test alts[1] ≈ 30.9753 atol = 1e-2
+
+        # The other direction lowers periapsis below the nominal, which is what makes a
+        # sub-31 km band reachable at all. Fine steps are required: dx = -5e-6 mirrored
+        # (+5e-6) stalls near 26.8 km, which previously read as "the family ends here".
+        dn = halo_family_table(; dx = 1.0e-6, n_steps = 40)
+        dn_alts = [m.info.periapsis_alt_km for m in dn]
+        @test issorted(dn_alts; rev = true)
+        @test minimum(dn_alts) < 30.0
+        @test all(m -> m.info.closure_km < 1e-3, dn)
+
+        # halo_family_span brackets the seed on BOTH sides and returns ascending altitude,
+        # so a commanded altitude below the nominal resolves instead of reading as absent.
+        sp = halo_family_span(; dx = 1.0e-6, n_up = 12, n_down = 12)
+        sp_alts = [m.info.periapsis_alt_km for m in sp]
+        @test issorted(sp_alts)
+        @test minimum(sp_alts) < 30.9753 < maximum(sp_alts)
 
         # The first member reproduces the shipped IC (x0 step k = 0).
         @test tbl[1].ic_nd ≈ collect(PERIOD1_SOUTH_IC_ND) atol = 1e-9
@@ -288,6 +305,53 @@ const CFG = StationkeepingPOMDP()
                               target_alt_km = 5000.0, family_table = tbl)
         @test_throws ErrorException SherpaOrbital.controller_setup!(
             c_bad, ic, PERIOD1_TRIPLE_PERIOD_S)
+    end
+
+    @testset "SARSOPController retarget_bands toggle" begin
+        # Skip cleanly if no policy has been exported — the toggle is structural and should
+        # not make the suite depend on a solved artifact being present.
+        if !isfile(SherpaOrbital.DEFAULT_POLICY_PATH)
+            @test_skip "no exported policy at $(SherpaOrbital.DEFAULT_POLICY_PATH)"
+        else
+            ic  = nondim_to_cr3bp(collect(PERIOD1_SOUTH_IC_ND))
+            pol = load_policy()
+
+            # DEFAULT IS THE WAYPOINT BEHAVIOUR. Every pre-2026-08-29 SARSOP number depends
+            # on this staying the default.
+            c_wp = SARSOPController(pol; ref_ic = collect(ic), n_revs = 3)
+            @test c_wp.retarget_bands == false
+            SherpaOrbital.controller_setup!(c_wp, ic, PERIOD1_TRIPLE_PERIOD_S)
+
+            # Waypoint targets are the SCALED vector, so the periapsis target altitude equals
+            # the band altitude exactly — that is what makes it a waypoint and not an orbit.
+            rp_wp, _ = SherpaOrbital._sarsop_band_targets(c_wp, "MID")
+            alt_wp = norm(SherpaOrbital._enc_relative(rp_wp)) - SherpaOrbital.R_ENCELADUS
+            @test alt_wp ≈ c_wp.band_target_km["MID"] atol = 1e-6
+
+            # With the toggle on, a band's targets come from a REAL family member instead.
+            # The band is overridden into the default family span (~19-63 km): the shipped
+            # MID = 70 km is OUTSIDE it, and the toggle throws for an unreachable band rather
+            # than silently substituting a waypoint. That throw is asserted below.
+            c_rt = SARSOPController(pol; ref_ic = collect(ic), n_revs = 3,
+                                    retarget_bands = true)
+            c_rt.band_target_km["MID"] = 40.0
+            SherpaOrbital.controller_setup!(c_rt, ic, PERIOD1_TRIPLE_PERIOD_S)
+            rp_rt, _ = SherpaOrbital._sarsop_band_targets(c_rt, "MID")
+            @test haskey(c_rt.band_targets, "MID")          # cached, not re-continued
+            @test norm(rp_rt - rp_wp) > 1.0                 # genuinely different target
+
+            # CORRECT is UNAFFECTED by the toggle: it always returns to the original
+            # reference orbit. Only EXCURSE_* retargets.
+            @test c_rt.r_peri_nom == c_wp.r_peri_nom
+
+            # A band outside the family span is a configuration error and must THROW, not
+            # fall back to a scaled waypoint — a band that is not an orbit cannot be held.
+            c_far = SARSOPController(pol; ref_ic = collect(ic), n_revs = 3,
+                                     retarget_bands = true)
+            c_far.band_target_km["MID"] = 5000.0
+            SherpaOrbital.controller_setup!(c_far, ic, PERIOD1_TRIPLE_PERIOD_S)
+            @test_throws ErrorException SherpaOrbital._sarsop_band_targets(c_far, "MID")
+        end
     end
 
 end

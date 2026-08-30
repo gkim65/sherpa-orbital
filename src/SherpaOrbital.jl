@@ -117,6 +117,7 @@ export
     corrector_free_z0,
     halo_family_member,
     halo_family_table,
+    halo_family_span,
     halo_family_table_cached,
     retarget_to_altitude,
     monodromy_matrix,

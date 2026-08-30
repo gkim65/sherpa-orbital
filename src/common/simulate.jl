@@ -86,9 +86,11 @@ caches in `controller_setup!`.
   - `n_revs` — multiple-shooting horizon `N_m` for `solve_burn`.
   - `target_alt_km` — commanded periapsis altitude (km), or `nothing` (DEFAULT) to hold
     whatever orbit `ref_ic` is. **This is the retargeting toggle** — see below.
-  - `family_table` — a prebuilt [`halo_family_table`](@ref) to retarget against. `nothing`
-    uses [`halo_family_table_cached`](@ref). Pass one to control the altitude span or
-    resolution; the default family spans ~31–248 km and costs ~2 min to continue cold.
+  - `family_table` — a prebuilt [`halo_family_table`](@ref) / [`halo_family_span`](@ref) to
+    retarget against. `nothing` uses [`halo_family_table_cached`](@ref), which spans roughly
+    **19–63 km** and costs ~80 s to continue cold (cached after the first call). Pass a table
+    explicitly for a different altitude range — e.g. a band above 63 km, which the default
+    span does NOT contain and which therefore throws rather than silently missing.
 
 ## Commanding an off-nominal periapsis altitude (`target_alt_km`)
 
@@ -108,10 +110,34 @@ over 30 days from the 31 km IC (`Xoshiro(0)`, `cr3bp_j2_eom!` truth):
 
 The pinned column is bit-identical whatever is commanded — it ignores the command entirely.
 
-⚠️ **The achieved altitude runs ~6 km HIGH**, and that is the pre-existing single-impulse
-`:position` residual floor, not a retargeting error: the bias is +6.19 km at the nominal 31 km
-and DECREASES to +5.75 km at 120 km (a retargeting fault would grow with distance). Command
-~6 km low if you need the achieved value, and see `docs/todo.md` candidate C for the floor.
+⚠️ **THE ACHIEVED ALTITUDE RUNS ~6 km HIGH.** Command 30 km and the loop settles at ~36 km.
+The bias is +6.19 km at the nominal 31 km and decreases slowly to +5.75 km at 120 km.
+
+What it is NOT (both measured 2026-08-29, both wrong guesses made first):
+
+  * NOT a knob-count limit. With a genuine family member as the reference the residual at the
+    reference IC is **0.000000 km** and `cond(J) = 31` with three healthy singular values — the
+    six `:position` constraints ARE mutually compatible and an exact solution exists. "6
+    constraints vs 3 controls, so ~6 km is structural" is FALSE once the reference is a real
+    orbit rather than a scaled vector.
+  * NOT a targeting error. `retarget_to_altitude` hits a commanded altitude to <0.0003 km, and
+    the bias is present at the nominal orbit where nothing is retargeted at all.
+
+What it IS: a **proportional-only steady-state offset**. This controller re-solves an
+open-loop targeting problem each pass against a FIXED reference and has no integral action, so
+a persistent disturbance leaves a persistent offset. The disturbance is the truth/onboard model
+gap — the same state's next periapsis altitude is 30.9753 km under the onboard CR3BP but
+**31.2323 km** under the truth CR3BP+J2, i.e. **+0.257 km per revolution** — and the miss is
+radial-dominated (6.205 km radial vs 2.815 km transverse), which is what a radial perturbation
+produces. Note ~0.26 km/rev of disturbance producing a ~6 km offset is roughly **24x
+amplification**, so the loop gain is low; how much of the 6 km is under-correction (`damp`, one
+burn per pass) versus irreducible has NOT been measured.
+
+⚠️ Do NOT "fix" this by pre-shifting the commanded altitude (command 24 to get 30). It works
+numerically — measured, a two-iteration fixed point converges to <=0.007 km — but it fights any
+controller that also reasons about altitude, and it pushes the COMMANDED value ~6 km below the
+wanted one, so a 20 km target demands a ~14 km reference that the family does not contain. That
+manufactures a fake altitude floor. Fix the loop, not the setpoint. See `docs/todo.md`.
 
 ⚠️ **A transfer ceiling exists near 148 km commanded from the 31 km IC**, and it is a limit on
 TRANSFER authority, not on the orbit: 150 km escapes at 2.84 d when transferred from 31 km but
@@ -198,6 +224,33 @@ deviation observation into the belief.
 
 ⚠️ The ONBOARD model here is twofold and both halves are onboard-only: the discrete belief
 filter over dev bins, and `solve_burn`'s CR3BP prediction. Neither sees `truth_eom!`.
+
+## `retarget_bands` — aim an excursion at a REAL ORBIT rather than a scaled waypoint
+
+Affects `EXCURSE_<BAND>` ONLY. `CORRECT` always returns to the original reference orbit, which
+is what the action means.
+
+`false` (DEFAULT, so existing runs reproduce): `EXCURSE_<BAND>` targets the nominal periapsis
+vector radially SCALED to the band altitude. A scaled vector is not a solution of the dynamics,
+so the aim is poor — measured noise-free over 30 days, the three bands miss by
+**LOW −6.8 / MID −22.2 / HIGH −56.3 km** while `n_bands = 3` is banked regardless.
+
+`true`: `EXCURSE_<BAND>` targets the apses of the genuine halo-family member at that band
+altitude ([`retarget_to_altitude`](@ref)). Measured, aim improves substantially — MID goes from
+−22.2 km to −7.1 km — and the residual error is then the pre-existing ~6 km single-impulse
+`:position` floor rather than a bad target.
+
+An excursion is still a ONE-PASS visit: the next `CORRECT` returns to the nominal orbit by
+design. Holding a band for multiple passes would need the policy to keep choosing that band,
+which is a reward/state question, not a targeting one (`docs/todo.md`).
+
+⚠️ **The solved policy was calibrated against the WAYPOINT dynamics.** Rolling it out with
+`retarget_bands = true` tests the targeting mechanism, not a matched policy — the transition
+kernels in `artifacts/tables.json` describe the old behaviour. Re-solving is a separate step.
+
+⚠️ `science_cov` still banks on COMMANDED, not achieved, altitude, and `cov_set` is a monotone
+bitmask so a band can be credited only ONCE. This toggle makes an achieved-altitude gate
+meaningful but does not implement one.
 """
 mutable struct SARSOPController <: AbstractController
     # Model description, straight from the exported policy.
@@ -217,12 +270,18 @@ mutable struct SARSOPController <: AbstractController
     ref_ic::Union{Nothing,Vector{Float64}}
     n_revs::Int
     sigma_nav_km::Float64
+    # Band-retargeting toggle. `false` (default) = the pre-2026-08-29 waypoint behaviour.
+    retarget_bands::Bool
+    family_table::Union{Nothing,Vector{NamedTuple}}
     # Live state.
     belief::Vector{Float64}
     cov::Int
     r_peri_nom::Union{Nothing,Vector{Float64}}
     r_apo_nom::Union{Nothing,Vector{Float64}}
     apo_nom_alt_km::Float64
+    # Cache of band name -> (r_peri, r_apo) from that band's real family member, so the
+    # family is continued once rather than per decision step.
+    band_targets::Dict{String,Tuple{Vector{Float64},Vector{Float64}}}
 end
 
 controller_type(::SARSOPController) = "SARSOP"
@@ -237,7 +296,9 @@ Build a controller from a parsed policy payload. Use
 function SARSOPController(policy_data::AbstractDict;
                           ref_ic::Union{Nothing,AbstractVector{<:Real}} = nothing,
                           n_revs::Integer = 3,
-                          sigma_nav_km::Real = SIGMA_NAV_POS)
+                          sigma_nav_km::Real = SIGMA_NAV_POS,
+                          retarget_bands::Bool = false,
+                          family_table::Union{Nothing,Vector{NamedTuple}} = nothing)
     d = policy_data
     S  = String.(d["states"])
     A  = String.(d["actions"])
@@ -268,7 +329,9 @@ function SARSOPController(policy_data::AbstractDict;
         alphas, Int.(d["alpha_actions"]), T, O,
         ref_ic === nothing ? nothing : collect(float.(ref_ic)),
         Int(n_revs), float(sigma_nav_km),
+        retarget_bands, family_table,
         belief, 0, nothing, nothing, NaN,
+        Dict{String,Tuple{Vector{Float64},Vector{Float64}}}(),
     )
 end
 
@@ -345,6 +408,41 @@ function controller_setup!(c::SARSOPController, state0::AbstractVector, period_s
     return nothing
 end
 
+"""
+    _sarsop_band_targets(c, band_name) -> (r_peri, r_apo)
+
+Apse POSITION targets for an `EXCURSE_<BAND>` action.
+
+`retarget_bands = false` (default): the historical behaviour — the nominal periapsis vector
+radially scaled to the band altitude, which is a WAYPOINT, not an orbit (see
+[`_scale_to_altitude`](@ref)).
+
+`retarget_bands = true`: the apses of the genuine halo-family member at that band altitude
+([`retarget_to_altitude`](@ref)), so the band is an orbit the vehicle can settle onto. Cached
+per band, because continuing the family is expensive relative to a decision step.
+
+Throws if the family has no member at a band's altitude — a band that cannot be realised as an
+orbit is a configuration error, and silently substituting a scaled waypoint would hide it.
+"""
+function _sarsop_band_targets(c::SARSOPController, band_name::AbstractString)
+    alt = c.band_target_km[band_name]
+    if !c.retarget_bands
+        return (_scale_to_altitude(c.r_peri_nom, alt),
+                _scale_to_altitude(c.r_apo_nom, c.apo_nom_alt_km))
+    end
+    key = String(band_name)
+    return get!(c.band_targets, key) do
+        table = c.family_table === nothing ? halo_family_table_cached() : c.family_table
+        member = retarget_to_altitude(table, alt)
+        member === nothing && error(
+            "SARSOPController: band $key targets $(alt) km, but the continued L1 halo " *
+            "family contains no member at that periapsis altitude, so it is not an orbit " *
+            "that can be held. Widen the family table or change band_target_km.")
+        rp, ra = next_apse_positions(member.ic; eom! = cr3bp_eom!)
+        (collect(rp), collect(ra))
+    end
+end
+
 function controller_command(c::SARSOPController, shell_state::AbstractVector, period_s::Real)
     action = policy_action(c)
 
@@ -353,6 +451,8 @@ function controller_command(c::SARSOPController, shell_state::AbstractVector, pe
     end
 
     if action == "CORRECT"
+        # CORRECT always returns to the ORIGINAL reference orbit — that is what the action
+        # means, and it is unaffected by `retarget_bands`. Only EXCURSE_* retargets.
         b = solve_burn(shell_state, period_s; n_revs = c.n_revs, eom! = cr3bp_eom!,
                        mode = :position,
                        r_peri_nom = c.r_peri_nom, r_apo_nom = c.r_apo_nom)
@@ -363,8 +463,7 @@ function controller_command(c::SARSOPController, shell_state::AbstractVector, pe
     # EXCURSE_<BAND>: target that band's altitude at periapsis, holding apoapsis nominal.
     band_name = replace(action, "EXCURSE_" => "")
     band_idx  = findfirst(==(band_name), c.band_names)
-    rp = _scale_to_altitude(c.r_peri_nom, c.band_target_km[band_name])
-    ra = _scale_to_altitude(c.r_apo_nom, c.apo_nom_alt_km)
+    rp, ra = _sarsop_band_targets(c, band_name)
     b = solve_burn(shell_state, period_s; n_revs = c.n_revs, eom! = cr3bp_eom!,
                    mode = :position, r_peri_nom = rp, r_apo_nom = ra)
     return b.dv, Symbol(action), (band = band_idx, converged = b.converged,
@@ -507,6 +606,20 @@ function simulate(
     # The deviation metric is the same one the POMDP's dev bins are defined on: the
     # apse-POSITION deviation from the nominal periapsis. Computed here (not in the
     # controller) so both baselines report the identical quantity.
+    #
+    # ⚠️ KNOWN GAP, measured 2026-08-29 — this is the ORIGINAL reference, always. A
+    # controller deliberately holding a DIFFERENT orbit (`MPCController.target_alt_km`)
+    # therefore reports a large deviation even when the hold is perfect: measured, a
+    # rock-steady 75.86 km hold reports `true_dev_km = 48.10 km` and bins as DRIFT on every
+    # pass, so a belief filter fed this signal is permanently convinced it is off-course
+    # while the vehicle does exactly what it was commanded.
+    #
+    # Deliberately NOT fixed here. `dev_of` is defined once, outside the controllers, so the
+    # POMDP and MPC report the identical quantity and the comparison stays apples-to-apples;
+    # and the dev bins in `artifacts/tables.json` are calibrated against THIS definition, so
+    # redefining it invalidates every transition kernel. The fix (measure against whichever
+    # reference is currently being held) has to land together with re-measured kernels.
+    # See `docs/todo.md`.
     r_peri_nom, _ = next_apse_positions(
         controller isa MPCController && controller.ref_ic !== nothing ? controller.ref_ic :
         controller isa SARSOPController && controller.ref_ic !== nothing ? controller.ref_ic :

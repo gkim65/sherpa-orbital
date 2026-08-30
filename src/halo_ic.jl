@@ -709,7 +709,14 @@ small — periapsis altitude moves ~2 km per `1e-05` of `x0` near the nominal or
 step jumps 31 km to 170 km and skips the entire science range.
 
 Defaults trace periapsis ~31 km to ~248 km (latitude -87.03 deg to -66.40 deg) from
-`PERIOD1_SOUTH_IC_ND` in 181 members. `dx < 0` RAISES periapsis.
+`PERIOD1_SOUTH_IC_ND` in 181 members.
+
+⚠️ **`dx < 0` RAISES periapsis and `dx > 0` LOWERS it, so a one-directional table is
+one-sided about the seed.** With the default `dx`, this table starts AT the seed's ~31 km and
+only goes up — so [`retarget_to_altitude`](@ref) returns `nothing` for anything below the
+nominal, which reads as "the family has no member there" when it does. Stepping `dx > 0`
+reaches ~26.8 km. Use [`halo_family_span`](@ref) for a table that brackets the seed on both
+sides, which is what a band set spanning the nominal altitude needs.
 """
 function halo_family_table(;
     ic_nd::AbstractVector{<:Real} = PERIOD1_SOUTH_IC_ND,
@@ -729,31 +736,70 @@ function halo_family_table(;
     return table
 end
 
+"""
+    halo_family_span(; ic_nd, dx, n_up, n_down, kwargs...) -> Vector{NamedTuple}
+
+A family table BRACKETING the seed on both sides, sorted by ascending periapsis altitude:
+`n_down` members below the seed's periapsis and `n_up` above.
+
+Use this rather than [`halo_family_table`](@ref) whenever the commanded altitudes span the
+nominal — a set of science bands, typically. A one-directional table starts at the seed and
+`retarget_to_altitude` then returns `nothing` for everything on the other side, which is
+indistinguishable from the family genuinely having no member there.
+
+Defaults cover roughly **19–60 km** from `PERIOD1_SOUTH_IC_ND` (nominal periapsis 30.975 km) —
+the science-relevant range, not the whole family. The family continues well past 240 km, but
+each member costs a corrector solve, so covering ground nobody targets is pure cost.
+
+⚠️ **STEP SIZE IS LOAD-BEARING AT THE LOW END.** `dx = 5e-6` stalls the downward branch around
+26.8 km: the Newton seed from the previous member drifts too far and the corrector lands just
+outside `tol` (measured residuals 1.4e-10 to 3.1e-10 against a 1e-10 tolerance). At
+`dx = 1e-6` it continues monotonically to 18.59 km with no fold — so a stall near 26.8 km is a
+STEP-SIZE artifact and must not be read as the family ending there.
+"""
+function halo_family_span(;
+    ic_nd::AbstractVector{<:Real} = PERIOD1_SOUTH_IC_ND,
+    dx::Real = 1.0e-6,
+    n_up::Integer = 150,
+    n_down::Integer = 65,
+    kwargs...,
+)
+    up   = halo_family_table(; ic_nd = ic_nd, dx = -abs(float(dx)), n_steps = n_up, kwargs...)
+    down = halo_family_table(; ic_nd = ic_nd, dx = +abs(float(dx)), n_steps = n_down, kwargs...)
+    # `down[1]` and `up[1]` are both the seed (k = 0); drop the duplicate.
+    all = vcat(down[2:end], up)
+    return sort(all; by = m -> m.info.periapsis_alt_km)
+end
+
 # Memo for `halo_family_table_cached`. Continuing the default 181-member family costs ~2 min
 # (181 corrector solves, each propagating a half period with the 42-state STM), and a rollout
 # needs the SAME table on every controller construction — so a sweep of commanded altitudes
 # would otherwise pay that cost once per arm. Keyed on the arguments, so a different span or
 # step size gets its own entry rather than silently reusing the wrong family.
-const _HALO_FAMILY_CACHE = Dict{Tuple{Vector{Float64},Float64,Int},Vector{NamedTuple}}()
+const _HALO_FAMILY_CACHE = Dict{Tuple{Vector{Float64},Float64,Int,Int},Vector{NamedTuple}}()
 
 """
-    halo_family_table_cached(; ic_nd, dx, n_steps) -> Vector{NamedTuple}
+    halo_family_table_cached(; ic_nd, dx, n_up, n_down) -> Vector{NamedTuple}
 
-[`halo_family_table`](@ref) memoized on `(ic_nd, dx, n_steps)`. The continuation is
-deterministic, so caching is safe, and it turns a ~2-minute rebuild into a lookup for every
-caller after the first — which matters because a commanded-altitude sweep constructs one
-controller per arm and each would otherwise re-continue the whole family.
+[`halo_family_span`](@ref) memoized on its arguments — a TWO-SIDED table, so a commanded
+altitude below the seed's periapsis resolves rather than reading as "no member exists".
 
-Use this in a rollout; use [`halo_family_table`](@ref) when you want a guaranteed fresh solve.
+The continuation is deterministic, so caching is safe, and it turns a ~2-minute rebuild into a
+lookup for every caller after the first — which matters because a commanded-altitude sweep
+constructs one controller per arm and each would otherwise re-continue the whole family.
+
+This is what the controllers use by default. Use [`halo_family_table`](@ref) /
+[`halo_family_span`](@ref) directly for a guaranteed fresh solve or a custom span.
 """
 function halo_family_table_cached(;
     ic_nd::AbstractVector{<:Real} = PERIOD1_SOUTH_IC_ND,
-    dx::Real = -5.0e-6,
-    n_steps::Integer = 180,
+    dx::Real = 1.0e-6,
+    n_up::Integer = 150,
+    n_down::Integer = 65,
 )
-    key = (collect(float.(ic_nd)), float(dx), Int(n_steps))
+    key = (collect(float.(ic_nd)), float(dx), Int(n_up), Int(n_down))
     return get!(_HALO_FAMILY_CACHE, key) do
-        halo_family_table(; ic_nd = ic_nd, dx = dx, n_steps = n_steps)
+        halo_family_span(; ic_nd = ic_nd, dx = dx, n_up = n_up, n_down = n_down)
     end
 end
 
