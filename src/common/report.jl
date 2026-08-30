@@ -16,11 +16,14 @@ function print_model_summary(config::StationkeepingPOMDP = StationkeepingPOMDP()
     println(io, "="^72)
     println(io, "Science/safety Enceladus stationkeeping POMDP")
     println(io, "="^72)
-    println(io, "State = (dev safety bin, science coverage mask)")
-    println(io, "  dev edges (km) : ", config.dev_edges, "  -> ", NONTERM_DEV,
-                " (+ LOST, CRASHED)")
-    println(io, "  bands          : ", config.band_names, "  targets(km)=",
+    println(io, "State = (achieved periapsis-altitude bin, per-band visit counts)")
+    println(io, "  alt edges (km) : ", config.alt_edges, "  -> ", ALT_BINS,
+                " (+ CRASHED, LOST)")
+    println(io, "  bands          : ", config.band_names, "  bins=", config.band_bins,
+                "  targets(km)=",
                 [config.band_target_km[b] for b in config.band_names])
+    println(io, "  visit cap      : ", config.visit_cap,
+                "   (CORRECT holds ", config.correct_bin, ", so it has no EXCURSE)")
     println(io, "  actions        : ", actions(config))
     println(io, "  nav sigma (km) : ", config.sigma_nav_km)
     @printf(io, "  |S|=%d  |A|=%d  |O|=%d  discount=%.3f\n",
@@ -34,8 +37,8 @@ end
 """
     print_policy_table(policy, config = StationkeepingPOMDP(); io = stdout)
 
-Print the greedy action a*(dev, coverage) for a belief concentrated on each state,
-grouped by coverage mask so the science-vs-safety tradeoff reads across the row.
+Print the greedy action a*(altitude, visits) for a belief concentrated on each state,
+grouped by visit tuple so the science-vs-safety tradeoff reads across the row.
 
 A concentrated belief is a diagnostic, not how the policy runs — but it is the clearest
 way to see what the policy would do if it knew exactly where it was.
@@ -43,19 +46,19 @@ way to see what the policy would do if it knew exactly where it was.
 function print_policy_table(policy, config::StationkeepingPOMDP = StationkeepingPOMDP();
                             io::IO = stdout)
     S    = states(config)
-    covs = 0:(n_cov(config) - 1)
+    vs   = visit_tuples(config)
 
-    println(io, "\nGreedy policy  a*(dev, coverage)   [belief concentrated on the state]")
-    @printf(io, "  %-8s", "dev\\cov")
-    for c in covs
-        @printf(io, " %-14s", cov_label(config, c))
+    println(io, "\nGreedy policy  a*(alt, visits)   [belief concentrated on the state]")
+    @printf(io, "  %-10s", "alt\\visits")
+    for v in vs
+        @printf(io, " %-14s", visit_label(config, v))
     end
     println(io)
 
-    for dev in NONTERM_DEV
-        @printf(io, "  %-8s", dev)
-        for c in covs
-            s = SKState(dev, c)
+    for alt in ALT_BINS
+        @printf(io, "  %-10s", alt)
+        for v in vs
+            s = SKState(alt, v)
             b = SparseCat(S, [x == s ? 1.0 : 0.0 for x in S])
             @printf(io, " %-14s", action(policy, b))
         end

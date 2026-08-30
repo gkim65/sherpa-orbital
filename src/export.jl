@@ -38,7 +38,7 @@ path written.
 """
 function export_policy(policy, config::StationkeepingPOMDP = StationkeepingPOMDP();
                        path::AbstractString = DEFAULT_POLICY_PATH,
-                       tables::Union{Nothing,DevTables} = nothing,
+                       tables::Union{Nothing,AltTables} = nothing,
                        meta::AbstractDict = Dict{String,Any}())
     tbl = tables === nothing ?
         load_tables(something(config.tables_path, DEFAULT_TABLES_PATH)) : tables
@@ -58,16 +58,20 @@ function export_policy(policy, config::StationkeepingPOMDP = StationkeepingPOMDP
 
     payload = Dict(
         "states"          => state_label.(S),
-        "state_dev"       => [string(s.dev) for s in S],
-        "state_cov"       => [s.cov for s in S],
+        "state_alt"       => [string(s.alt) for s in S],
+        "state_visits"    => [collect(s.visits) for s in S],
         "actions"         => string.(A),
         "observations"    => string.(Ω),
-        "terminal_states" => [state_label(SKState(:LOST, 0)),
-                              state_label(SKState(:CRASHED, 0))],
-        "initial_state"   => state_label(SKState(:OK, 0)),
+        "terminal_states" => [state_label(SKState(:LOST, _zero_visits(config))),
+                              state_label(SKState(:CRASHED, _zero_visits(config)))],
+        "initial_state"   => state_label(SKState(config.correct_bin,
+                                                 _zero_visits(config))),
         "discount"        => config.discount,
-        "dev_edges"       => collect(config.dev_edges),
+        "alt_edges"       => collect(config.alt_edges),
         "band_names"      => string.(collect(config.band_names)),
+        "band_bins"       => string.(collect(config.band_bins)),
+        "visit_cap"       => config.visit_cap,
+        "correct_bin"     => string(config.correct_bin),
         "band_target_km"  => Dict(string(k) => v for (k, v) in config.band_target_km),
         "action_dv_cost"  => Dict(string(k) => v for (k, v) in config.action_dv_cost),
         "sigma_nav_km"    => config.sigma_nav_km,

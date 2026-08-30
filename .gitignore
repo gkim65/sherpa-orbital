@@ -26,9 +26,16 @@ docs/
 # ── OS noise ──────────────────────────────────────────────────────────────────
 .DS_Store
 
-# NOTE: artifacts/ is deliberately NOT ignored. tables.json and policy.json are
-# committed on purpose: they are the provenance record for the measured model, and
-# reviewing a diff in them is how a re-measurement gets noticed.
+# ── Artifacts ─────────────────────────────────────────────────────────────────
+# artifacts/tables.json IS committed: it is the MEASURED input (2.9 KB), the provenance
+# record for the model, and reviewing a diff in it is how a re-measurement gets noticed.
+#
+# artifacts/policy.json is NOT committed. It is a build product, fully reproducible from
+# tables.json + the config via `julia --project=experiments experiments/example.jl`, and it
+# is large: the exported T is 627x4x627 floats, so the file is ~21 MB pretty-printed. Git
+# keeps every version forever and a re-solve changes almost every line, so committing it
+# would add ~21 MB of unreclaimable history per solve.
+artifacts/policy.json
 # Claude Code project instructions (local only)
 CLAUDE.md
 claude.md

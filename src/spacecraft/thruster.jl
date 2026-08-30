@@ -43,22 +43,50 @@ Returns a fresh applied ΔV vector (km/s), so the caller's input is never aliase
 """
 apply_dv(dv_commanded::AbstractVector{<:Real}) = collect(float.(dv_commanded))
 
-"""
-    sample_eta_eff(rng) -> Float64
-    sample_eta_eff(rng, n) -> Vector{Float64}
+# Cassini in-flight maneuver magnitude error, MacKenzie et al. 2020 Exhibit B-24: 1σ of
+# 0.7% (Model 1) and 2.0% (Model 2), SYMMETRIC about the commanded magnitude.
+const THRUSTER_SIGMA_PCT_B24_MODEL1 = 0.7
+const THRUSTER_SIGMA_PCT_B24_MODEL2 = 2.0
 
-Draw one (or `n`) burn-efficiency samples from `Uniform(ETA_EFF_MIN, ETA_EFF_MAX)`.
+"""
+    sample_eta_eff(rng; model, sigma_pct, eta_min, eta_max) -> Float64
+    sample_eta_eff(rng, n; kwargs...) -> Vector{Float64}
+
+Draw one (or `n`) burn-efficiency samples.
 
   - `rng` — the random stream to draw from. Explicit and required: a rollout's
     reproducibility must not depend on global RNG state.
+  - `model` — `:uniform` for `η ~ U(eta_min, eta_max)`, or `:gaussian_pct` for a symmetric
+    `η ~ N(1, sigma_pct/100)`.
+  - `sigma_pct` — 1σ magnitude error in PERCENT, for `:gaussian_pct`. Cassini presets are
+    [`THRUSTER_SIGMA_PCT_B24_MODEL1`](@ref) / `..._MODEL2`.
 
-Returns a dimensionless efficiency in `[ETA_EFF_MIN, ETA_EFF_MAX]`.
+⚠️ `:uniform` IS THE KNOWN-WRONG LEGACY MODEL and remains the default only so existing
+results stay reproducible. `U(0.8, 1.0)` is 0–20% underburn, mean 10% short, and NEVER
+over — roughly 10× MacKenzie Exhibit B-24's error plus a systematic one-directional bias.
+It is known to flip a 0/5 survival result to 5/5 (`docs/todo.md`), so it is not a neutral
+default. Prefer `:gaussian_pct` with a cited B-24 preset for any result that is quoted.
+
+Returns a dimensionless efficiency. `:gaussian_pct` is clamped at 0 so a >5σ draw can
+never reverse the burn direction.
 """
-sample_eta_eff(rng::AbstractRNG) =
-    ETA_EFF_MIN + (ETA_EFF_MAX - ETA_EFF_MIN) * rand(rng)
+function sample_eta_eff(
+    rng::AbstractRNG;
+    model::Symbol = :uniform,
+    sigma_pct::Real = THRUSTER_SIGMA_PCT_B24_MODEL2,
+    eta_min::Real = ETA_EFF_MIN,
+    eta_max::Real = ETA_EFF_MAX,
+)
+    if model === :uniform
+        return eta_min + (eta_max - eta_min) * rand(rng)
+    elseif model === :gaussian_pct
+        return max(0.0, 1.0 + (float(sigma_pct) / 100) * randn(rng))
+    end
+    throw(ArgumentError("unknown thruster model $model; expected :uniform or :gaussian_pct"))
+end
 
-sample_eta_eff(rng::AbstractRNG, n::Integer) =
-    [sample_eta_eff(rng) for _ in 1:n]
+sample_eta_eff(rng::AbstractRNG, n::Integer; kwargs...) =
+    [sample_eta_eff(rng; kwargs...) for _ in 1:n]
 
 """
     apply_dv_noisy(dv_commanded, rng; eta_eff = nothing) -> (dv_applied, eta_eff)
@@ -70,6 +98,8 @@ Noisy-execution ΔV application: `ΔV_applied = ΔV_commanded · η_eff`, with
   - `rng` — random stream for the η_eff draw. Ignored when `eta_eff` is given.
   - `eta_eff` — optional fixed efficiency (dimensionless) instead of a random draw,
     for deterministic tests.
+  - remaining keywords are forwarded to [`sample_eta_eff`](@ref) to select the noise
+    model (`model`, `sigma_pct`, `eta_min`, `eta_max`).
 
 Returns `(dv_applied::Vector{Float64} [km/s], eta_eff::Float64)`.
 """
@@ -77,8 +107,9 @@ function apply_dv_noisy(
     dv_commanded::AbstractVector{<:Real},
     rng::AbstractRNG;
     eta_eff::Union{Real,Nothing} = nothing,
+    kwargs...,
 )
     dv = collect(float.(dv_commanded))
-    η = eta_eff === nothing ? sample_eta_eff(rng) : float(eta_eff)
+    η = eta_eff === nothing ? sample_eta_eff(rng; kwargs...) : float(eta_eff)
     return dv .* η, η
 end

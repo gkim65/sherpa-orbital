@@ -1,35 +1,198 @@
 {
-  "dev_next": [
-    "OK",
-    "DRIFT",
-    "FAR",
-    "LOST",
-    "CRASHED"
+  "alt_next": [
+    "BELOW_20",
+    "A20_30",
+    "A30_40",
+    "A40_50",
+    "ABOVE_50",
+    "CRASHED",
+    "LOST"
   ],
   "correct": {
-    "OK": [0.98, 0.01, 0.0, 0.01, 0.0],
-    "DRIFT": [0.8, 0.15, 0.03, 0.02, 0.0],
-    "FAR": [0.3, 0.4, 0.2, 0.1, 0.0]
-  },
-  "observe": {
-    "OK": [0.6, 0.3, 0.07, 0.02, 0.01],
-    "DRIFT": [0.05, 0.35, 0.4, 0.18, 0.02],
-    "FAR": [0.0, 0.05, 0.25, 0.65, 0.05]
+    "A20_30": [
+      0.0,
+      0.6666666666666666,
+      0.3333333333333333,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "A30_40": [
+      0.0,
+      0.0,
+      0.9433962264150944,
+      0.03773584905660377,
+      0.0,
+      0.0,
+      0.018867924528301886
+    ],
+    "A40_50": [
+      0.0,
+      0.0,
+      0.25,
+      0.5,
+      0.25,
+      0.0,
+      0.0
+    ],
+    "ABOVE_50": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "BELOW_20": [
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
   },
   "excurse": {
-    "OK": [0.95, 0.03, 0.01, 0.01, 0.0],
-    "DRIFT": [0.45, 0.25, 0.15, 0.13, 0.02],
-    "FAR": [0.1, 0.2, 0.25, 0.4, 0.05]
+    "A20_30": [
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "A30_40": [
+      0.0,
+      0.0,
+      0.9090909090909091,
+      0.09090909090909091,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "A40_50": [
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "ABOVE_50": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "BELOW_20": [
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
   },
   "meta": {
-    "provenance": "Hand-transcribed from the Python CR3BP+EncJ2 experiment output; NOT yet machine-generated. Superseded once experiments/calibrate.jl runs against the ported Julia dynamics.",
-    "truth_model": "CR3BP + Enceladus J2",
-    "sources": {
-      "correct": "exp 11b — sustained MPC loop. Measured OK->OK 0.98; from off-nominal the planner pulls inward.",
-      "observe": "exp 11b counterfactual (OK survives ~1 skipped pass) + exp 01 uncontrolled decay (dev grows OK->DRIFT->FAR->LOST over ~2-3 skipped passes).",
-      "excurse": "exp 06/12 — excursion plus its recovery burn. From OK the excursion recovered to dev=OK in 3/3 trials for every band; a small residual risk is retained for robustness. From DRIFT/FAR an added perturbation is riskier, so mass leaks outward faster than CORRECT."
+    "alt_edges": [
+      20.0,
+      30.0,
+      40.0,
+      50.0
+    ],
+    "caveats": [
+      "Rows listed in unmeasured_rows have n = 0 and are FILLED with a self-transition, not measured. They are not evidence.",
+      "Rows with 0 < n < min_trials_trusted are indicative only.",
+      "Noise-free unless the run was configured otherwise, so any survival number derived from these kernels is an UPPER BOUND, not feasibility."
+    ],
+    "generated_by": "calibrate_tables + tables_from_rows",
+    "min_trials_trusted": 20,
+    "mode": "position",
+    "n_loop_steps": 50,
+    "trials": {
+      "CORRECT": {
+        "A20_30": 3,
+        "A30_40": 53,
+        "A40_50": 4,
+        "ABOVE_50": 5,
+        "BELOW_20": 1
+      },
+      "EXCURSE": {
+        "A20_30": 0,
+        "A30_40": 22,
+        "A40_50": 2,
+        "ABOVE_50": 0,
+        "BELOW_20": 0
+      },
+      "OBSERVE": {
+        "A20_30": 3,
+        "A30_40": 52,
+        "A40_50": 4,
+        "ABOVE_50": 5,
+        "BELOW_20": 1
+      }
     },
-    "caveats": "The DRIFT/FAR rows for observe/excurse are engineering judgement anchored on few trials, not tightly measured; they are the least trustworthy numbers here and are the first thing calibration should replace.",
-    "band_dv_note": "Excursion safety did not differ meaningfully by band (exp 12); only the delta-V cost did, so all EXCURSE_* actions share one kernel."
+    "truth_name": "CR3BP + Enceladus J2",
+    "unmeasured_rows": [
+      "EXCURSE/BELOW_20",
+      "EXCURSE/A20_30",
+      "EXCURSE/ABOVE_50"
+    ]
+  },
+  "observe": {
+    "A20_30": [
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "A30_40": [
+      0.0,
+      0.0,
+      0.057692307692307696,
+      0.9230769230769231,
+      0.019230769230769232,
+      0.0,
+      0.0
+    ],
+    "A40_50": [
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    "ABOVE_50": [
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0
+    ],
+    "BELOW_20": [
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0,
+      0.0
+    ]
   }
 }

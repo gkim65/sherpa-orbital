@@ -73,7 +73,7 @@ controller_type(::AbstractController) = "UNKNOWN"
 
 # ── MPC baseline ──────────────────────────────────────────────────────────────
 """
-    MPCController(; ref_ic, mode, n_revs, peri_target_km, apo_target_km)
+    MPCController(; ref_ic, mode, peri_target_km, apo_target_km)
 
 The deterministic Strategy-3 MPC baseline as a controller: at every shell crossing, solve
 for the ΔV that re-targets the next apses. Stateless apart from the nominal targets it
@@ -83,7 +83,6 @@ caches in `controller_setup!`.
     uses the rollout's own initial state.
   - `mode` — `:position` (Strategy 3 proper, apse POSITION-vector bounding; MacKenzie's
     working strategy) or `:altitude` (Strategy 1/2, which MacKenzie says fails).
-  - `n_revs` — multiple-shooting horizon `N_m` for `solve_burn`.
   - `target_alt_km` — commanded periapsis altitude (km), or `nothing` (DEFAULT) to hold
     whatever orbit `ref_ic` is. **This is the retargeting toggle** — see below.
   - `family_table` — a prebuilt [`halo_family_table`](@ref) / [`halo_family_span`](@ref) to
@@ -129,16 +128,28 @@ the six `:position` constraints are not simultaneously satisfiable by one impuls
 least-squares splits ~8 km of unavoidable error and ~6.2 km of it lands on periapsis radius.
 
 Invariant under gain and horizon, which is the signature of a converged optimum rather than
-under-correction: bias is **6.098 km for every `damp` in 0.4–1.0** and for every
-`n_revs` in 1/2/3/5 (identical to three decimals, same ΔV, same pass count).
+under-correction: bias is **6.098 km for every `damp` in 0.4–1.0** (identical to three
+decimals, same ΔV, same pass count).
 
 ⚠️ **A measurement trap to avoid.** At the reference IC the residual is 0.000000 km and
 `cond(J) = 31`, which looks like "an exact solution exists, so the constraint count is not the
 problem". That is measured where the spacecraft is already perfectly on the orbit and says
 nothing about the drifted case. Measure at a drifted shell state instead.
 
-The lever is therefore CONTROL AUTHORITY or CADENCE, not tuning: `docs/todo.md` candidate C
-(two impulses, 6 controls vs 6 constraints) reached 0.294 km where one impulse reached 49 km.
+⚠️ **AND IT SHOULD NOT BE "FIXED" BY ADDING CONTROL AUTHORITY — measured 2026-08-29.** Two
+impulses (6 controls vs 6 constraints) reduce the single-pass periapsis error from +6.255 km to
+**+0.014 km**, and then LOSE THE VEHICLE closed-loop: executing both impulses escapes at 17.8 d
+(263 m/s), and MacKenzie's Nm-joint variant (solve two, execute only the first) escapes at
+**2.3 d** having burned 5.31 m/s with the solver CONVERGED. With Session 6's six formulations
+("every one that aims accurately loses the vehicle; the only survivor aims badly"), that is four
+independent measurements that **the ~8 km residual is LOAD-BEARING** — crushing six constraints
+into three controls is what pins the orbit's ORIENTATION, and it buys a stable limit cycle at
+~1.32 m/s per pass indefinitely.
+
+So treat the +6 km as a characterised property, not a bug: it is stable, predictable, and the
+vehicle survives 30 days on it. The productive direction is a SUPERVISOR that knows the
+controller lands ~6 km high and commands accordingly (altitude in the POMDP state/observation),
+which works WITH the holding mechanism rather than against it. See `docs/todo.md`.
 
 ⚠️ Do NOT "fix" this by pre-shifting the commanded altitude (command 24 to get 30). It works
 numerically — a two-iteration fixed point converges to <=0.007 km — but it fights any
@@ -157,7 +168,6 @@ check `n_failed_solves` before reading any outcome there.
 Base.@kwdef mutable struct MPCController <: AbstractController
     ref_ic::Union{Nothing,Vector{Float64}} = nothing
     mode::Symbol                           = :position
-    n_revs::Int                            = 3
     peri_target_km::Float64                = PERIAPSIS_ALT_TARGET
     apo_target_km::Float64                 = APOAPSIS_ALT_TARGET
     # Retargeting toggle: nothing = pinned reference (pre-2026-08-29 behaviour, the default).
@@ -206,7 +216,7 @@ end
 
 function controller_command(c::MPCController, shell_state::AbstractVector, period_s::Real)
     b = solve_burn(shell_state, period_s;
-                   n_revs = c.n_revs, eom! = cr3bp_eom!,
+                   eom! = cr3bp_eom!,
                    peri_target_km = c.peri_target_km,
                    apo_target_km  = c.apo_target_km,
                    mode = c.mode,
@@ -216,7 +226,7 @@ end
 
 # ── SARSOP baseline ───────────────────────────────────────────────────────────
 """
-    SARSOPController(policy_data; config, ref_ic, n_revs, sigma_nav_km)
+    SARSOPController(policy_data; config, ref_ic, sigma_nav_km)
 
 The solved POMDP policy as a controller. `policy_data` is the parsed
 `artifacts/policy.json` payload written by [`export_policy`](@ref) — it carries the state /
@@ -255,19 +265,21 @@ which is a reward/state question, not a targeting one (`docs/todo.md`).
 `retarget_bands = true` tests the targeting mechanism, not a matched policy — the transition
 kernels in `artifacts/tables.json` describe the old behaviour. Re-solving is a separate step.
 
-⚠️ `science_cov` still banks on COMMANDED, not achieved, altitude, and `cov_set` is a monotone
-bitmask so a band can be credited only ONCE. This toggle makes an achieved-altitude gate
-meaningful but does not implement one.
+Coverage is banked from the OBSERVED periapsis altitude (2026-08-30), not from which action
+was commanded — so `CORRECT` banks its own band passively and a missed excursion banks
+nothing. Counts saturate at `visit_cap`, so a revisit keeps paying until the cap.
 """
 mutable struct SARSOPController <: AbstractController
     # Model description, straight from the exported policy.
     states::Vector{String}
-    state_dev::Vector{String}
-    state_cov::Vector{Int}
+    state_alt::Vector{String}
+    state_visits::Vector{Vector{Int}}
     actions::Vector{String}
     observations::Vector{String}
-    dev_edges::Vector{Float64}
+    alt_edges::Vector{Float64}
     band_names::Vector{String}
+    band_bins::Vector{String}
+    visit_cap::Int
     band_target_km::Dict{String,Float64}
     alphas::Matrix{Float64}         # (n_alpha, |S|)
     alpha_actions::Vector{Int}      # 1-based action index per alpha
@@ -275,14 +287,17 @@ mutable struct SARSOPController <: AbstractController
     O::Matrix{Float64}              # [s, o]
     # Configuration.
     ref_ic::Union{Nothing,Vector{Float64}}
-    n_revs::Int
     sigma_nav_km::Float64
     # Band-retargeting toggle. `false` (default) = the pre-2026-08-29 waypoint behaviour.
     retarget_bands::Bool
     family_table::Union{Nothing,Vector{NamedTuple}}
     # Live state.
     belief::Vector{Float64}
-    cov::Int
+    visits::Vector{Int}
+    # PERSISTENT excursion reference: the band currently being aimed at, or "" for the
+    # nominal orbit. This is what makes EXCURSE_* a multi-pass command rather than a
+    # one-pass dip — see `controller_command`.
+    active_band::String
     r_peri_nom::Union{Nothing,Vector{Float64}}
     r_apo_nom::Union{Nothing,Vector{Float64}}
     apo_nom_alt_km::Float64
@@ -294,7 +309,7 @@ end
 controller_type(::SARSOPController) = "SARSOP"
 
 """
-    SARSOPController(policy_data::AbstractDict; ref_ic = nothing, n_revs = 3,
+    SARSOPController(policy_data::AbstractDict; ref_ic = nothing,
                      sigma_nav_km = SIGMA_NAV_POS)
 
 Build a controller from a parsed policy payload. Use
@@ -302,7 +317,6 @@ Build a controller from a parsed policy payload. Use
 """
 function SARSOPController(policy_data::AbstractDict;
                           ref_ic::Union{Nothing,AbstractVector{<:Real}} = nothing,
-                          n_revs::Integer = 3,
                           sigma_nav_km::Real = SIGMA_NAV_POS,
                           retarget_bands::Bool = false,
                           family_table::Union{Nothing,Vector{NamedTuple}} = nothing)
@@ -329,15 +343,18 @@ function SARSOPController(policy_data::AbstractDict;
     belief = zeros(Float64, length(S))
     belief[findfirst(==(String(d["initial_state"])), S)] = 1.0
 
+    band_names = String.(d["band_names"])
     return SARSOPController(
-        S, String.(d["state_dev"]), Int.(d["state_cov"]), A, Ω,
-        Float64.(d["dev_edges"]), String.(d["band_names"]),
+        S, String.(d["state_alt"]),
+        [Int.(v) for v in d["state_visits"]], A, Ω,
+        Float64.(d["alt_edges"]), band_names,
+        String.(d["band_bins"]), Int(d["visit_cap"]),
         Dict{String,Float64}(string(k) => Float64(v) for (k, v) in d["band_target_km"]),
         alphas, Int.(d["alpha_actions"]), T, O,
         ref_ic === nothing ? nothing : collect(float.(ref_ic)),
-        Int(n_revs), float(sigma_nav_km),
+        float(sigma_nav_km),
         retarget_bands, family_table,
-        belief, 0, nothing, nothing, NaN,
+        belief, zeros(Int, length(band_names)), "", nothing, nothing, NaN,
         Dict{String,Tuple{Vector{Float64},Vector{Float64}}}(),
     )
 end
@@ -353,21 +370,22 @@ function load_policy(path::AbstractString = DEFAULT_POLICY_PATH)
 end
 
 """
-    policy_dev_bin(c, dev_km) -> String
+    policy_alt_bin(c, alt_km) -> String
 
-Bin a deviation (km) using the EXPORTED edges, half-open [lo, hi).
+Bin an achieved periapsis altitude (km) using the EXPORTED edges, half-open [lo, hi).
 
-⚠️ This must stay identical to [`dev_bin`](@ref) in `states.jl`. It deliberately reads the
+⚠️ This must stay identical to [`alt_bin`](@ref) in `states.jl`. It deliberately reads the
 edges out of the policy artifact rather than the live config, so a policy solved against
 one discretization cannot be silently rolled out against another.
 """
-function policy_dev_bin(c::SARSOPController, dev_km::Real)
-    e = c.dev_edges
-    isfinite(dev_km) || return "LOST"
-    dev_km < e[1] && return "OK"
-    dev_km < e[2] && return "DRIFT"
-    dev_km < e[3] && return "FAR"
-    return "LOST"
+function policy_alt_bin(c::SARSOPController, alt_km::Real)
+    e = c.alt_edges
+    isfinite(alt_km) || return "LOST"
+    alt_km < e[1] && return "BELOW_20"
+    alt_km < e[2] && return "A20_30"
+    alt_km < e[3] && return "A30_40"
+    alt_km < e[4] && return "A40_50"
+    return "ABOVE_50"
 end
 
 """Greedy action from the current belief: argmax over α·b."""
@@ -375,7 +393,7 @@ policy_action(c::SARSOPController) =
     c.actions[c.alpha_actions[argmax(c.alphas * c.belief)]]
 
 """
-Discrete Bayes filter, b'(s') ∝ O[s', o] Σ_s T[s, a, s'] b(s), with `o` over dev bins.
+Discrete Bayes filter, b'(s') ∝ O[s', o] Σ_s T[s, a, s'] b(s), with `o` over altitude bins.
 Falls back to the prediction alone if the observation has zero likelihood everywhere.
 """
 function policy_update_belief!(c::SARSOPController, action::String, obs::String)
@@ -393,13 +411,22 @@ function policy_update_belief!(c::SARSOPController, action::String, obs::String)
 end
 
 """
-Re-concentrate the belief onto the known-`cov` block. `cov` is observed EXACTLY (we know
-which excursions we commanded), so belief mass on any other coverage mask is spurious.
+Re-concentrate the belief onto the known-`visits` block.
+
+The visit counts are a DETERMINISTIC function of the observed altitude bin, so the
+controller always knows them exactly and belief mass on any other visit tuple is spurious.
 Terminal states are always kept. A no-op if masking would zero everything.
+
+⚠️ WHY THIS IS STILL LICENSED after coverage moved onto achieved altitude. Gating on the
+TRUE altitude would make coverage stochastic and partially observed, breaking the exact
+-observation assumption this projection rests on. Gating on the OBSERVED altitude keeps it
+exact — the controller and the filter condition on the same measured bin. The cost is not
+soundness but accuracy: a true 32 km pass read as 27 km banks LOW, and the belief then
+confidently carries that wrong count. See `alt_bin` for the misbin rate.
 """
 function policy_reconcentrate_cov!(c::SARSOPController)
-    keep = [(c.state_dev[i] in ("LOST", "CRASHED") || c.state_cov[i] == c.cov) ? 1.0 : 0.0
-            for i in eachindex(c.states)]
+    keep = [(c.state_alt[i] in ("LOST", "CRASHED") || c.state_visits[i] == c.visits) ?
+            1.0 : 0.0 for i in eachindex(c.states)]
     masked = c.belief .* keep
     tot = sum(masked)
     tot > 0 && (c.belief = masked ./ tot)
@@ -437,6 +464,18 @@ function _sarsop_band_targets(c::SARSOPController, band_name::AbstractString)
         return (_scale_to_altitude(c.r_peri_nom, alt),
                 _scale_to_altitude(c.r_apo_nom, c.apo_nom_alt_km))
     end
+    # PHASE-MATCHED retarget. The family member supplies the periapsis RADIUS; the
+    # DIRECTION comes from our own nominal periapsis, and apoapsis stays pinned to nominal.
+    #
+    # ⚠️ DO NOT import the member's apse POSITIONS. `next_apse_positions(member.ic)` gives
+    # where THAT member's periapsis sits at ITS OWN epoch, which is unrelated to our phase.
+    # Measured 2026-08-30 from the 31 km limit cycle vs the 30 km member: altitudes differ
+    # by ~22 km but POSITIONS are 585 km (peri) and 2319 km (apo) apart, so the `:position`
+    # residual at ΔV = 0 is 2392 km and the solver burns 78–180 m/s across the orbit and
+    # loses the vehicle. Phase-matching drops that to 0.6–2.4 m/s with no escape.
+    #
+    # (`MPCController.target_alt_km` avoids this by resolving the member at SETUP from the
+    # IC, where vehicle and reference are phase-aligned. The bug only appears mid-flight.)
     key = String(band_name)
     return get!(c.band_targets, key) do
         table = c.family_table === nothing ? halo_family_table_cached() : c.family_table
@@ -445,8 +484,8 @@ function _sarsop_band_targets(c::SARSOPController, band_name::AbstractString)
             "SARSOPController: band $key targets $(alt) km, but the continued L1 halo " *
             "family contains no member at that periapsis altitude, so it is not an orbit " *
             "that can be held. Widen the family table or change band_target_km.")
-        rp, ra = next_apse_positions(member.ic; eom! = cr3bp_eom!)
-        (collect(rp), collect(ra))
+        (_scale_to_altitude(c.r_peri_nom, member.info.periapsis_alt_km),
+         collect(c.r_apo_nom))
     end
 end
 
@@ -454,24 +493,41 @@ function controller_command(c::SARSOPController, shell_state::AbstractVector, pe
     action = policy_action(c)
 
     if action == "OBSERVE"
+        # A no-burn pass. The active excursion reference PERSISTS through it — OBSERVE
+        # gathers information without paying ΔV and without abandoning the approach.
         return zeros(3), :OBSERVE, (band = 0, converged = true, residual_km = 0.0)
     end
 
     if action == "CORRECT"
-        # CORRECT always returns to the ORIGINAL reference orbit — that is what the action
-        # means, and it is unaffected by `retarget_bands`. Only EXCURSE_* retargets.
-        b = solve_burn(shell_state, period_s; n_revs = c.n_revs, eom! = cr3bp_eom!,
+        # CORRECT CLEARS the active excursion and re-aims at the ORIGINAL reference orbit.
+        # It is the only way back to nominal, which is what makes the excursion reference
+        # persistent rather than one-pass.
+        c.active_band = ""
+        b = solve_burn(shell_state, period_s; eom! = cr3bp_eom!,
                        mode = :position,
                        r_peri_nom = c.r_peri_nom, r_apo_nom = c.r_apo_nom)
         return b.dv, :CORRECT, (band = 0, converged = b.converged,
                                 residual_km = b.residual_km)
     end
 
-    # EXCURSE_<BAND>: target that band's altitude at periapsis, holding apoapsis nominal.
+    # EXCURSE_<BAND>: SET the active reference to that band and aim at it.
+    #
+    # ⚠️ THIS IS A PERSISTENT COMMAND, NOT A ONE-PASS DIP (changed 2026-08-30). Previously
+    # each EXCURSE burned once at a scaled waypoint and the next CORRECT pulled the vehicle
+    # straight back, so repeating the action accumulated NOTHING — every pass restarted from
+    # the nominal orbit and "spend another cycle getting there" was structurally impossible.
+    # Now the band's family member stays the reference until CORRECT clears it, so choosing
+    # EXCURSE_LOW again on the next pass CONTINUES the approach.
+    #
+    # This matters because single-impulse authority is poor (~25%: commanding 20 km from the
+    # 31 km limit cycle achieves ~38 km on one pass). Settling over several passes is the
+    # mechanism that actually reaches a commanded altitude — the same one measured working
+    # in `MPCController.target_alt_km` (50 -> 56.01 km, 70 -> 75.86 km, held 30 days).
     band_name = replace(action, "EXCURSE_" => "")
     band_idx  = findfirst(==(band_name), c.band_names)
+    c.active_band = band_name
     rp, ra = _sarsop_band_targets(c, band_name)
-    b = solve_burn(shell_state, period_s; n_revs = c.n_revs, eom! = cr3bp_eom!,
+    b = solve_burn(shell_state, period_s; eom! = cr3bp_eom!,
                    mode = :position, r_peri_nom = rp, r_apo_nom = ra)
     return b.dv, Symbol(action), (band = band_idx, converged = b.converged,
                                   residual_km = b.residual_km)
@@ -480,15 +536,23 @@ end
 function controller_observe!(c::SARSOPController, peri_state::AbstractVector,
                              dev_km::Real, label::Symbol, extra::NamedTuple,
                              rng::AbstractRNG)
-    # Bank the science band if the excursion pass survived to a periapsis.
-    extra.band != 0 && (c.cov = cov_set(c.cov, extra.band))
+    true_alt = norm(_enc_relative(peri_state[1:3])) - R_ENCELADUS
+    obs_alt  = observe_altitude(true_alt, rng; sigma_r = c.sigma_nav_km)
 
-    true_bin = policy_dev_bin(c, dev_km)
-    obs_bin  = policy_dev_bin(c, observe_deviation(dev_km, rng; sigma_r = c.sigma_nav_km))
+    true_bin = policy_alt_bin(c, true_alt)
+    obs_bin  = policy_alt_bin(c, obs_alt)
+
+    # Bank on the OBSERVED bin, indifferent to which action ran — so CORRECT banks its own
+    # band passively and a missed excursion banks nothing. Saturates at `visit_cap`.
+    bi = findfirst(==(obs_bin), c.band_bins)
+    bi === nothing || (c.visits[bi] = min(c.visits[bi] + 1, c.visit_cap))
+
     policy_update_belief!(c, String(label), obs_bin)
     policy_reconcentrate_cov!(c)
 
-    return (true_bin = true_bin, obs_bin = obs_bin, cov = c.cov)
+    return (true_bin = true_bin, obs_bin = obs_bin,
+            true_alt_km = true_alt, obs_alt_km = obs_alt,
+            visits = copy(c.visits))
 end
 
 # ── Geometry helpers ──────────────────────────────────────────────────────────
@@ -557,15 +621,15 @@ no per-baseline special-casing:
     of quietly uncontrolled rollouts. `n_failed_solves == n_solves > 0` means the result
     describes an uncontrolled coast, whatever the outcome field says.
   - `min_peri_alt_km` — smallest periapsis altitude visited (km)
-  - `science_cov`, `n_bands` — coverage bitmask and its popcount (0 for MPC).
-    ⚠️ AN UPPER BOUND, NOT A MEASUREMENT. A band is banked because the excursion was
-    COMMANDED and the pass survived to a periapsis — the achieved altitude is never checked
-    against the band. With the `:position` targeting floor at ~10 km (see the planner notes)
-    a commanded excursion can easily land outside its band and still be counted. Use
-    `peri_alts_km` to check where the passes actually went. Gating the bitmask on achieved
-    altitude is deliberately NOT done here: it would make `cov` stochastic and only
-    partially observed, which breaks the exact-observation assumption behind
-    `policy_reconcentrate_cov!` and would require re-measuring every transition kernel.
+  - `science_visits`, `n_bands`, `n_samples` — per-band visit counts, how many distinct
+    bands were sampled at least once, and the total sample count. Empty / 0 for MPC.
+    ⚠️ BANKED ON THE OBSERVED ALTITUDE (2026-08-30), which is an improvement on the old
+    commanded-altitude bitmask but still not ground truth. A band is credited when the
+    OBSERVED periapsis altitude lands in its bin, so nav noise misbins passes near a bin
+    edge — roughly 15–20% per pass at `sigma_nav_km = 2` on 10 km bins, symmetric. Use
+    `peri_alts_km` for where the passes truly went. Gating on the TRUE altitude was
+    rejected deliberately: it makes coverage stochastic and partially observed, which
+    breaks the exact-observation assumption behind `policy_reconcentrate_cov!`.
   - `peri_alts_km`, `peri_lats_deg` — achieved periapsis altitude (km) and latitude (deg)
     per control step. Latitude is what the south-polar science case turns on and is
     invisible in an altitude or a deviation norm.
@@ -649,13 +713,14 @@ function simulate(
         min_peri_alt_km = isfinite(min_peri_alt) ? min_peri_alt : NaN,
         # Achieved-geometry summary. `peri_alts_km` is the per-pass altitude sequence, so a
         # commanded science excursion can be checked against where it actually went rather
-        # than trusted because it was commanded (see the science_cov caveat below).
+        # than trusted from the noisy read the policy banked on (see `science_visits`).
         peri_alts_km    = [s.peri_alt_km for s in steps],
         peri_lats_deg   = [s.peri_lat_deg for s in steps],
         max_dev_trans_km = isempty(steps) ? NaN :
             maximum(s -> isfinite(s.dev_transverse_km) ? s.dev_transverse_km : -Inf, steps),
-        science_cov     = _controller_cov(controller),
-        n_bands         = cov_count(_controller_cov(controller)),
+        science_visits  = _controller_visits(controller),
+        n_bands         = count(>(0), _controller_visits(controller)),
+        n_samples       = sum(_controller_visits(controller)),
         # Full final 6-state (km, km/s), so a rollout can be CHAINED — e.g. a staged transfer
         # that advances the reference one rung at a time and hands the achieved state forward.
         # `steps[].peri_pos` is position only, which is not enough to resume propagation.
@@ -718,7 +783,8 @@ function simulate(
                           dev_radial_km = NaN, dev_transverse_km = NaN,
                           extra = (true_bin = uppercase(String(peri.outcome)),
                                    obs_bin  = uppercase(String(peri.outcome)),
-                                   cov = _controller_cov(controller))))
+                                   true_alt_km = NaN, obs_alt_km = NaN,
+                                   visits = copy(_controller_visits(controller)))))
             peri.outcome === :none && break
             return finish(peri.outcome, t_now + peri.t, false)
         end
@@ -768,9 +834,9 @@ function simulate(
     return finish(t_now < horizon_s ? :idle : :held, horizon_s, true)
 end
 
-"""Coverage mask of a controller (0 for baselines with no science state)."""
-_controller_cov(::AbstractController) = 0
-_controller_cov(c::SARSOPController)  = c.cov
+"""Per-band visit counts of a controller (empty for baselines with no science state)."""
+_controller_visits(::AbstractController) = Int[]
+_controller_visits(c::SARSOPController)  = c.visits
 
 """
     _coast_to(eom!, state, horizon, make_primary, arg; rtol, atol) -> NamedTuple
