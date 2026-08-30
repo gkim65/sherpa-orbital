@@ -257,6 +257,15 @@ Three rejections, one per way a target has actually gone wrong in this project:
 near the current state (the period-3 apoapses are near-degenerate in radius) sits ~1e-06 km
 away, whereas a true phantom is at *exactly* 0.0. The default separates those by orders of
 magnitude while staying far below `TARGET_TOL_KM`.
+
+## `mode = :altitude_position`
+
+There the periapsis target is a SCALAR altitude, not a position vector, so only two of the
+three rejections above can apply to it (a scalar has no position to coincide with `state0`'s,
+so the phantom check is meaningless) and `r_peri_nom` is not required at all. Pass
+`peri_target_km` instead of `r_peri_nom` and the periapsis half is checked as an altitude:
+finite, and below `max_alt_km`. Also required to be above the crash shell — a commanded
+periapsis inside Enceladus is a setup error the solver would happily converge on.
 """
 function validate_apse_targets(
     state0::AbstractVector{<:Real},
@@ -264,33 +273,61 @@ function validate_apse_targets(
     r_apo_nom::Union{AbstractVector{<:Real},Nothing};
     max_alt_km::Real = ESCAPE_ALT_KM,
     phantom_tol_km::Real = 1.0e-9,
+    mode::Symbol = :position,
+    peri_target_km::Union{Nothing,Real} = nothing,
 )
+    if mode === :altitude_position
+        r_apo_nom === nothing &&
+            throw(ArgumentError("mode = :altitude_position requires r_apo_nom"))
+        peri_target_km === nothing &&
+            throw(ArgumentError("mode = :altitude_position requires peri_target_km"))
+        isfinite(peri_target_km) || error(
+            "validate_apse_targets: peri_target_km = $(peri_target_km) is not finite.")
+        PERIAPSIS_CRASH_ALT < peri_target_km <= max_alt_km || error(
+            "validate_apse_targets: peri_target_km = $(peri_target_km) km is outside " *
+            "($(PERIAPSIS_CRASH_ALT), $(max_alt_km)] km — a commanded periapsis below the " *
+            "crash shell or outside the science orbit is a setup error, not a target.")
+        _validate_apse_position(state0, "r_apo_nom", r_apo_nom, max_alt_km, phantom_tol_km)
+        return nothing
+    end
+
     (r_peri_nom === nothing || r_apo_nom === nothing) &&
         throw(ArgumentError("mode = :position requires r_peri_nom and r_apo_nom"))
 
-    r0 = collect(float.(state0[1:3]))
     for (name, r) in (("r_peri_nom", r_peri_nom), ("r_apo_nom", r_apo_nom))
-        length(r) >= 3 || throw(ArgumentError("$name must have at least 3 components"))
-        rr = collect(float.(r[1:3]))
-
-        all(isfinite, rr) || error(
-            "validate_apse_targets: $name = $rr is not finite. A window-based apse search " *
-            "found no apse inside its horizon — use next_apse_positions, which takes an " *
-            "apse COUNT and cannot come back empty.")
-
-        d0 = norm(rr .- r0)
-        d0 > phantom_tol_km || error(
-            "validate_apse_targets: $name is $(d0) km from state0's own position " *
-            "(tol $(phantom_tol_km) km) — this is the phantom t = 0 apse signature, not a " *
-            "target. Solving against it yields a circular zero residual and a false " *
-            "converged = true.")
-
-        alt = norm(_planner_enc_relative(rr)) - R_ENCELADUS
-        alt <= max_alt_km || error(
-            "validate_apse_targets: $name is at altitude $(alt) km, above the " *
-            "max_alt_km = $(max_alt_km) km bound. This apse belongs to a trajectory that " *
-            "has left the science orbit, not to the orbit being held.")
+        _validate_apse_position(state0, name, r, max_alt_km, phantom_tol_km)
     end
+    return nothing
+end
+
+"""
+Check one apse POSITION target against the three rejections documented in
+[`validate_apse_targets`](@ref). Throws on failure, returns `nothing` on success.
+"""
+function _validate_apse_position(state0::AbstractVector{<:Real}, name::AbstractString,
+                                 r::AbstractVector{<:Real}, max_alt_km::Real,
+                                 phantom_tol_km::Real)
+    r0 = collect(float.(state0[1:3]))
+    length(r) >= 3 || throw(ArgumentError("$name must have at least 3 components"))
+    rr = collect(float.(r[1:3]))
+
+    all(isfinite, rr) || error(
+        "validate_apse_targets: $name = $rr is not finite. A window-based apse search " *
+        "found no apse inside its horizon — use next_apse_positions, which takes an " *
+        "apse COUNT and cannot come back empty.")
+
+    d0 = norm(rr .- r0)
+    d0 > phantom_tol_km || error(
+        "validate_apse_targets: $name is $(d0) km from state0's own position " *
+        "(tol $(phantom_tol_km) km) — this is the phantom t = 0 apse signature, not a " *
+        "target. Solving against it yields a circular zero residual and a false " *
+        "converged = true.")
+
+    alt = norm(_planner_enc_relative(rr)) - R_ENCELADUS
+    alt <= max_alt_km || error(
+        "validate_apse_targets: $name is at altitude $(alt) km, above the " *
+        "max_alt_km = $(max_alt_km) km bound. This apse belongs to a trajectory that " *
+        "has left the science orbit, not to the orbit being held.")
     return nothing
 end
 
@@ -318,6 +355,17 @@ Two targeting modes:
   - `mode = :position` (Strategy 3 proper) — the 6-vector
     `[r_peri − r_peri_nom, r_apo − r_apo_nom]` (km), bounding the full apse position
     vectors against the nominal orbit. `r_peri_nom` and `r_apo_nom` are required
+  - `mode = :altitude_position` — the 4-vector
+    `[peri_alt − peri_target_km, r_apo − r_apo_nom]` (km): periapsis by ALTITUDE only (the
+    quantity actually commanded) and apoapsis by full POSITION (which is what pins the
+    orbit's orientation). `r_apo_nom` is required; `r_peri_nom` is unused.
+
+    The inverse of `:position_altitude` (tried and rejected 2026-08-26, which constrained
+    apoapsis *altitude* and let its position drift 2.5 → 106.4 km and escaped at 3.3 d).
+    Frees the periapsis DIRECTION, which is where most of the unsatisfiable `:position`
+    residual lands as a ~6 km radial bias, while keeping the 3 apoapsis-position
+    constraints. 4 residuals on 3 controls — still over-determined, so the orientation
+    pinning that `:position` buys is not given up wholesale.
 """
 function apse_residual(
     state0::AbstractVector{<:Real},
@@ -340,11 +388,54 @@ function apse_residual(
         return vcat(peri_state[1:3] .- r_peri_nom, apo_state[1:3] .- r_apo_nom)
     end
 
+    if mode === :altitude_position
+        r_apo_nom === nothing &&
+            throw(ArgumentError("mode = :altitude_position requires r_apo_nom"))
+        peri_state, apo_state = predict_apse_states(s, period_s; eom! = eom!)
+        # `altitude` on a NaN state would return NaN anyway, but going through the same
+        # isnan guard as `predict_apses` keeps the sentinel explicit for solve_burn.
+        peri_alt = isnan(peri_state[1]) ? NaN : altitude(peri_state)
+        return vcat(peri_alt - peri_target_km, apo_state[1:3] .- r_apo_nom)
+    end
+
     peri_alt, apo_alt = predict_apses(s, period_s; eom! = eom!)
     return [peri_alt - peri_target_km, apo_alt - apo_target_km]
 end
 
 # ── Burn solver ───────────────────────────────────────────────────────────────
+
+"""
+    _residual_weights(mode, J) -> Diagonal
+
+Row weights `W` for the Gauss-Newton step, so `solve_burn` minimizes `‖W r‖` rather than
+`‖r‖`. IDENTITY for every mode except `:altitude_position` — the existing baselines are
+unweighted and must stay bit-for-bit reproducible.
+
+⚠️ WHY `:altitude_position` NEEDS THIS, measured 2026-08-30. Its 4 residuals are one
+periapsis ALTITUDE (km) and three apoapsis POSITION components (km). Same units, but wildly
+different SENSITIVITY to ΔV: at the drifted operating point `‖J_peri‖ = 8441` km per km/s
+against `‖J_apo‖ = 164880`, a factor of 19.5. Least squares weights by the SQUARE of that,
+so an unweighted solve spends all 3 controls nulling apoapsis position and abandons the
+periapsis altitude with ~15.6 km of error. That is the whole reason the unweighted 4-on-3
+walk delivers only 14% of a commanded altitude change (35.5 km achieved for 20 km commanded,
+39.8 km for 50 km) — the constraint it was added to enforce is numerically invisible.
+
+Equilibrating by the block Jacobian norms makes the two PHYSICAL requirements — "be at the
+commanded altitude" and "keep the apoapsis where it belongs" — carry equal weight, instead of
+weighting them by an accident of how strongly each responds to a velocity kick. This is
+standard row equilibration; there is no tuned constant. A hand-tuned `w = 20` gives the same
+answer to ~0.15 km, which is what identifies 19.5 as the number that matters.
+
+Recomputed each iteration from the current `J`, so it tracks the operating point rather than
+freezing a scaling measured at the first step.
+"""
+function _residual_weights(mode::Symbol, J::AbstractMatrix)
+    mode === :altitude_position || return Diagonal(ones(size(J, 1)))
+    n_peri = norm(@view J[1, :])
+    n_apo  = norm(@view J[2:end, :])
+    w = (n_peri > 0 && n_apo > 0) ? n_apo / n_peri : 1.0
+    return Diagonal([w; ones(size(J, 1) - 1)])
+end
 
 """
     solve_burn(state0, period_s; eom!, max_iter, fd_step, damp, tol_km,
@@ -353,7 +444,8 @@ end
 Solve for the impulsive ΔV that re-targets the next periapsis/apoapsis.
 
 Minimum-norm Gauss-Newton on a 3-control problem (ΔV ∈ ℝ³). The residual is 2-D in
-`mode = :altitude` or 6-D in `mode = :position` (see [`apse_residual`](@ref)). The Jacobian
+`mode = :altitude`, 6-D in `mode = :position`, or 4-D in `mode = :altitude_position`
+(see [`apse_residual`](@ref)). The Jacobian
 `J = ∂r/∂ΔV` (m×3) is built by forward finite differences with step `fd_step`, and the
 pseudo-inverse step `ΔV ← ΔV − damp · J⁺ r` selects the minimum-norm correction — so the
 solver prefers cheap burns and stays well posed whichever way the system is determined.
@@ -369,8 +461,14 @@ passing a truth EOM in normal operation.
   - `period_s` — single-revolution period estimate (s), the first chunk of the count-based
     apse search. The planner targets the NEXT apse pair; it has no multi-revolution horizon.
 
-Returns `(dv, dv_mag_ms, converged, residual_km, iterations)`, where `dv` is the ΔV in km/s
-and `dv_mag_ms` its magnitude in m/s.
+Returns `(dv, dv_mag_ms, converged, residual_km, peri_err_km, iterations)`, where `dv` is
+the ΔV in km/s and `dv_mag_ms` its magnitude in m/s.
+
+⚠️ IN `:altitude_position`, READ `peri_err_km`, NOT `converged`. The total residual there is
+dominated by the apoapsis POSITION block, which is held against a nominal orbit and is not
+driven to zero from a drifted state — so `converged` reads `false` on passes that hit the
+commanded altitude to well under a km. `peri_err_km` is the periapsis-altitude error alone
+and is the number that says whether the command was delivered (`NaN` in the other modes).
 """
 function solve_burn(
     state0::AbstractVector{<:Real},
@@ -390,8 +488,9 @@ function solve_burn(
     # Bad :position targets are a SETUP error, not a burn to attempt — see
     # validate_apse_targets. Checked before any propagation so the failure surfaces where it
     # was introduced rather than as a silent ΔV = 0.
-    mode === :position && validate_targets &&
-        validate_apse_targets(state0, r_peri_nom, r_apo_nom)
+    mode in (:position, :altitude_position) && validate_targets &&
+        validate_apse_targets(state0, r_peri_nom, r_apo_nom;
+                              mode = mode, peri_target_km = peri_target_km)
 
     resid(dv) = apse_residual(state0, dv, period_s, eom!;
                               peri_target_km = peri_target_km,
@@ -423,17 +522,29 @@ function solve_burn(
         end
         ok || break
 
-        # Minimum-norm Gauss-Newton step: ΔV -= damp · J⁺ r.
-        dv = dv .- damp .* (pinv(J) * r)
+        # Minimum-norm Gauss-Newton step: ΔV -= damp · (WJ)⁺ (Wr).
+        W = _residual_weights(mode, J)
+        dv = dv .- damp .* (pinv(W * J) * (W * r))
         r = resid(dv)
     end
 
     residual = all(isfinite, r) ? norm(r) : Inf
+
+    # Periapsis-altitude error, broken out separately. In `:altitude_position` the total
+    # residual is dominated by the apoapsis POSITION block, which is a 3-vector held against
+    # a nominal orbit and is never driven to zero at a drifted state — so `converged` reads
+    # false even on a pass that hit the commanded altitude to 0.08 km. That distinction is
+    # load-bearing: `n_failed_solves` is how every rollout result is qualified, and without
+    # this field a working excursion is indistinguishable from a dead ΔV = 0 solve.
+    # `NaN` in the other modes, where there is no single altitude residual to report.
+    peri_err = mode === :altitude_position && all(isfinite, r) ? abs(r[1]) : NaN
+
     return (
         dv          = dv,
         dv_mag_ms   = norm(dv) * 1.0e3,   # km/s → m/s
         converged   = residual < tol_km,
         residual_km = residual,
+        peri_err_km = peri_err,
         iterations  = iters,
     )
 end

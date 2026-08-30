@@ -187,7 +187,7 @@ end
 controller_type(::MPCController) = "MPC"
 
 function controller_setup!(c::MPCController, state0::AbstractVector, period_s::Real)
-    if c.mode === :position
+    if c.mode in (:position, :altitude_position)
         ref = c.ref_ic === nothing ? state0 : c.ref_ic
 
         # Retargeting path (opt-in). The reference must be a REAL family member: a radially
@@ -195,6 +195,19 @@ function controller_setup!(c::MPCController, state0::AbstractVector, period_s::R
         # holdable orbit (measured 2026-08-26 — every scaled attempt escaped, two with
         # negative periapsis). Throw rather than silently fall back to the pinned reference,
         # which would report a plausible run that ignored the command.
+        # `:altitude_position` commands the periapsis ALTITUDE directly, so it needs no
+        # family member for the periapsis half — the scalar target IS the command, and
+        # `peri_target_km` carries it. Only the apoapsis position target is looked up, and
+        # that stays the nominal orbit's (see the mode's docstring in `apse_residual`).
+        if c.mode === :altitude_position
+            c.peri_target_km = c.target_alt_km === nothing ?
+                (norm(_enc_relative(next_apse_positions(ref; eom! = cr3bp_eom!)[1])) -
+                 R_ENCELADUS) : c.target_alt_km
+            _, c.r_apo_nom = next_apse_positions(ref; eom! = cr3bp_eom!)
+            c.r_peri_nom = nothing
+            return nothing
+        end
+
         if c.target_alt_km !== nothing
             table = c.family_table === nothing ? halo_family_table_cached() : c.family_table
             member = retarget_to_altitude(table, c.target_alt_km)
@@ -221,7 +234,8 @@ function controller_command(c::MPCController, shell_state::AbstractVector, perio
                    apo_target_km  = c.apo_target_km,
                    mode = c.mode,
                    r_peri_nom = c.r_peri_nom, r_apo_nom = c.r_apo_nom)
-    return b.dv, :CORRECT, (converged = b.converged, residual_km = b.residual_km)
+    return b.dv, :CORRECT, (converged = b.converged, residual_km = b.residual_km,
+                            peri_err_km = b.peri_err_km)
 end
 
 # ── SARSOP baseline ───────────────────────────────────────────────────────────
@@ -235,9 +249,10 @@ the greedy query and the discrete Bayes filter are reproduced here without re-de
 model or depending on a solver.
 
 Per step: query the greedy action from the current belief, realize it as a commanded ΔV
-(`OBSERVE` → none; `CORRECT` → `solve_burn` toward the nominal apses; `EXCURSE_<BAND>` →
-`solve_burn` toward that band's radially-scaled periapsis target), then fold a noisy
-deviation observation into the belief.
+(`CORRECT` → `solve_burn` toward the nominal apses; `EXCURSE_<BAND>` → `solve_burn` toward
+that band's COMMANDED ALTITUDE via `mode = :altitude_position`), then fold a noisy altitude
+observation into the belief. Every action burns — there is no `OBSERVE` (removed
+2026-08-30; see [`actions`](@ref)).
 
 ⚠️ The ONBOARD model here is twofold and both halves are onboard-only: the discrete belief
 filter over dev bins, and `solve_burn`'s CR3BP prediction. Neither sees `truth_eom!`.
@@ -362,11 +377,26 @@ end
 """
     load_policy(path = DEFAULT_POLICY_PATH) -> Dict
 
-Read an exported policy JSON from disk. Thin wrapper so a caller does not need `JSON`.
+Read an exported policy JSON from disk and check its action list against this model's.
+
+The artifact carries its OWN action labels (as it must — a policy is only valid for the
+action set it was solved against), so a stale one stays loadable and its actions flow
+straight into `controller_command`. Rejecting the mismatch here mirrors
+[`load_tables`](@ref), which refuses a kernel artifact whose bin ordering has moved rather
+than remapping it. Re-solve with `experiments/calibrate.jl` then `experiments/example.jl`.
 """
 function load_policy(path::AbstractString = DEFAULT_POLICY_PATH)
     isfile(path) || error("no exported policy at $path — solve one and call export_policy")
-    return JSON.parsefile(path)
+    d = JSON.parsefile(path)
+
+    got = sort(String.(d["actions"]))
+    want = sort(String.(actions(StationkeepingPOMDP())))
+    got == want || error(
+        "$path was solved against actions $got, but this model has $want. A policy is only " *
+        "valid for the action set it was solved against — re-solve rather than rolling this " *
+        "one out (experiments/calibrate.jl, then experiments/example.jl).")
+
+    return d
 end
 
 """
@@ -382,10 +412,10 @@ function policy_alt_bin(c::SARSOPController, alt_km::Real)
     e = c.alt_edges
     isfinite(alt_km) || return "LOST"
     alt_km < e[1] && return "BELOW_20"
-    alt_km < e[2] && return "A20_30"
-    alt_km < e[3] && return "A30_40"
-    alt_km < e[4] && return "A40_50"
-    return "ABOVE_50"
+    alt_km < e[2] && return "A20_27"
+    alt_km < e[3] && return "A27_34"
+    alt_km < e[4] && return "A34_44"
+    return "ABOVE_44"
 end
 
 """Greedy action from the current belief: argmax over α·b."""
@@ -492,12 +522,6 @@ end
 function controller_command(c::SARSOPController, shell_state::AbstractVector, period_s::Real)
     action = policy_action(c)
 
-    if action == "OBSERVE"
-        # A no-burn pass. The active excursion reference PERSISTS through it — OBSERVE
-        # gathers information without paying ΔV and without abandoning the approach.
-        return zeros(3), :OBSERVE, (band = 0, converged = true, residual_km = 0.0)
-    end
-
     if action == "CORRECT"
         # CORRECT CLEARS the active excursion and re-aims at the ORIGINAL reference orbit.
         # It is the only way back to nominal, which is what makes the excursion reference
@@ -507,7 +531,8 @@ function controller_command(c::SARSOPController, shell_state::AbstractVector, pe
                        mode = :position,
                        r_peri_nom = c.r_peri_nom, r_apo_nom = c.r_apo_nom)
         return b.dv, :CORRECT, (band = 0, converged = b.converged,
-                                residual_km = b.residual_km)
+                                residual_km = b.residual_km,
+                                peri_err_km = b.peri_err_km)
     end
 
     # EXCURSE_<BAND>: SET the active reference to that band and aim at it.
@@ -523,14 +548,24 @@ function controller_command(c::SARSOPController, shell_state::AbstractVector, pe
     # 31 km limit cycle achieves ~38 km on one pass). Settling over several passes is the
     # mechanism that actually reaches a commanded altitude — the same one measured working
     # in `MPCController.target_alt_km` (50 -> 56.01 km, 70 -> 75.86 km, held 30 days).
+    #
+    # ⚠️ AND IT TARGETS THE COMMANDED ALTITUDE DIRECTLY (`:altitude_position`, added
+    # 2026-08-30). The previous `:position` aim could not deliver a band: with the periapsis
+    # constrained as a POSITION vector, commanding 20/30/40 km settled at 35.80/37.05/38.32 km
+    # — 2.5 km of achieved spread on 20 km of command, all three landing in the SAME `A30_40`
+    # bin, which is why three of five EXCURSE rows in `artifacts/tables.json` had zero trials.
+    # `:altitude_position` constrains the periapsis by altitude (the quantity actually
+    # commanded) and keeps the 3 apoapsis-position constraints that pin the orientation.
     band_name = replace(action, "EXCURSE_" => "")
     band_idx  = findfirst(==(band_name), c.band_names)
     c.active_band = band_name
-    rp, ra = _sarsop_band_targets(c, band_name)
+    _, ra = _sarsop_band_targets(c, band_name)
     b = solve_burn(shell_state, period_s; eom! = cr3bp_eom!,
-                   mode = :position, r_peri_nom = rp, r_apo_nom = ra)
+                   mode = :altitude_position,
+                   peri_target_km = c.band_target_km[band_name], r_apo_nom = ra)
     return b.dv, Symbol(action), (band = band_idx, converged = b.converged,
-                                  residual_km = b.residual_km)
+                                  residual_km = b.residual_km,
+                                  peri_err_km = b.peri_err_km)
 end
 
 function controller_observe!(c::SARSOPController, peri_state::AbstractVector,
@@ -747,13 +782,9 @@ function simulate(
         # 2. Ask the controller for a command (ONBOARD planning only).
         dv_cmd, label, extra = controller_command(controller, shell.u, period_s)
 
-        # Count only steps that actually ran a solve. OBSERVE is a genuine no-burn DECISION,
-        # not a solve, and folding it in would dilute the failure rate that these counters
-        # exist to expose.
-        if label !== :OBSERVE
-            n_solves += 1
-            extra.converged || (n_failed_solves += 1)
-        end
+        # Every action burns now that OBSERVE is gone, so every step ran a solve.
+        n_solves += 1
+        extra.converged || (n_failed_solves += 1)
 
         # 3. Execute it.
         dv_applied, eta_eff = noisy_thruster ? apply_dv_noisy(dv_cmd, rng) :
@@ -778,6 +809,7 @@ function simulate(
             push!(steps, (t_s = t_now, action = label, dv_ms = dv_ms, eta_eff = eta_eff,
                           true_dev_km = NaN, converged = extra.converged,
                           residual_km = extra.residual_km,
+                          peri_err_km = get(extra, :peri_err_km, NaN),
                           peri_alt_km = NaN, peri_lat_deg = NaN, peri_lon_deg = NaN,
                           peri_pos = fill(NaN, 3),
                           dev_radial_km = NaN, dev_transverse_km = NaN,
@@ -820,6 +852,7 @@ function simulate(
         push!(steps, (t_s = t_now, action = label, dv_ms = dv_ms, eta_eff = eta_eff,
                       true_dev_km = dev_km, converged = extra.converged,
                       residual_km = extra.residual_km,
+                      peri_err_km = get(extra, :peri_err_km, NaN),
                       peri_alt_km = peri_alt, peri_lat_deg = peri_lat,
                       peri_lon_deg = peri_lon, peri_pos = copy(state[1:3]),
                       dev_radial_km = dev_rad, dev_transverse_km = dev_trans,
