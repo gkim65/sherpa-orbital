@@ -3,7 +3,7 @@ Onboard burn planner — the apse-targeting solver shared by every stationkeepin
 
 This is the ONBOARD half of MacKenzie et al. 2020 §B.2.3 "Strategy 3". Given a state at a
 control point, it solves for the impulsive ΔV that re-targets the next periapsis and
-apoapsis, predicting with a multiple-shooting propagation over `n_revs` revolutions.
+apoapsis, predicting by propagating the onboard model to the next apse pair.
 
 ⚠️ TRUTH/ONBOARD SPLIT (CLAUDE.md rule — do NOT collapse). Everything in this file plans
 with the ONBOARD model, [`cr3bp_eom!`](@ref) (CR3BP only, no perturbations), at the loose
@@ -40,6 +40,24 @@ const APOAPSIS_ALT_TARGET  = 0.5 * (APOAPSIS_ALT_MIN  + APOAPSIS_ALT_MAX)   # 10
 
 const TARGET_TOL_KM = 1.0      # apse-targeting tolerance (MacKenzie ≤ 1 km)
 
+# Apse-search horizon, as a multiple of the single-revolution period estimate. Beyond this
+# the prediction returns NaN and solve_burn stops.
+#
+# ⚠️ NOT AN INERT PARAMETER, and not a physically-derived one. This is the surviving numeric
+# content of the deleted `n_revs = 3`: on-orbit the value provably does not matter (1/2/3/5
+# all predict periapsis 40.407873 km, identical to six decimals), which is why `n_revs` was
+# removed. But NEAR ESCAPE it matters a great deal, and that regime was never measured until
+# 2026-08-29. An escaping spacecraft stays bound to SATURN, so its apses still exist tens of
+# thousands of km out; an unbounded search finds them and solve_burn chases them. Measured on
+# the run_mpc :altitude parity row (CR3BP + Enceladus J2, 120 hr): unbounded turns the final
+# burn from 21.9 m/s into ~182 m/s and moves escape from 77.96 hr to 79.52 hr.
+#
+# Pinned at 3 to hold every existing baseline bit-for-bit (user decision, 2026-08-29). The
+# value itself is UNJUSTIFIED — it was inherited from a parameter chosen to match MacKenzie's
+# Nm = 3, which is a maneuver count, not a horizon. Treat it as an open controller parameter
+# needing a measured choice, not as a settled constant. See docs/todo.md.
+const APSE_SEARCH_REVS = 3
+
 # Escape threshold: above this altitude the spacecraft has left the ~1065-km-apoapsis
 # science orbit and the controller can no longer recover it (the 600-km descending control
 # shell never re-arms). ~5× the nominal apoapsis altitude.
@@ -63,54 +81,57 @@ end
 # ── Apse prediction (onboard model) ───────────────────────────────────────────
 
 """
-    predict_apse_states(state0, n_revs, period_s; eom!, rtol, atol)
-        -> (peri_state, apo_state)
+    predict_apse_states(state0, period_s; eom!, rtol, atol) -> (peri_state, apo_state)
 
-Predict the FIRST periapsis and FIRST apoapsis 6-states over the next `n_revs` revolutions
-of the ONBOARD model. Barycentre frame, km / km/s.
+Predict the NEXT periapsis and NEXT apoapsis 6-states reached under the ONBOARD model.
+Barycentre frame, km / km/s.
 
-This is the multiple-shooting prediction behind [`solve_burn`](@ref): it propagates
-`n_revs × period_s` seconds and records every apse passage (non-terminal), then returns the
-first of each type. An apse not reached within the horizon comes back as a vector of `NaN`.
+Using the FIRST apse of each type — rather than the min/max over the span — keeps the
+residual a smooth function of ΔV, which the Gauss-Newton Jacobian needs.
 
-Using the FIRST apse of each type — rather than the min/max over the whole span — keeps the
-residual a smooth function of ΔV, which the Gauss-Newton Jacobian needs. The multi-rev
-horizon exists so the solver still sees several apses and stays well-conditioned when the
-first one falls close to the burn.
+The search asks [`next_apses`](@ref) for the apse pair BY COUNT rather than taking whatever
+apses fall inside a window, so the two apse-prediction paths in this file now search the same
+way and a missing apse is a named failure rather than a silent empty result.
+
+⚠️ THE SEARCH IS DELIBERATELY BOUNDED at `max_horizon_s` — see [`APSE_SEARCH_REVS`](@ref) for
+why, and why the bound is an open parameter rather than a settled one. Beyond the bound this
+returns `NaN`, the sentinel `solve_burn` stops on, which is what keeps a near-escape burn
+finite.
 """
 function predict_apse_states(
     state0::AbstractVector{<:Real},
-    n_revs::Integer,
     period_s::Real;
     eom! = cr3bp_eom!,
     rtol::Real = RTOL_ONBOARD,
     atol::Real = ATOL_ONBOARD,
+    max_horizon_s::Real = APSE_SEARCH_REVS * float(period_s),
 )
-    peri, apo = collect_apses(eom!, state0, n_revs * float(period_s);
-                              rtol = rtol, atol = atol)
     nan6 = fill(NaN, 6)
-    peri_state = isempty(peri) ? nan6 : peri[1][2]
-    apo_state  = isempty(apo)  ? nan6 : apo[1][2]
-    return peri_state, apo_state
+    peri, apo = try
+        next_apses(state0, 1, 1; eom! = eom!, rtol = rtol, atol = atol,
+                   t_guess = float(max_horizon_s), max_expansions = 0)
+    catch
+        return nan6, nan6
+    end
+    return peri[1][2], apo[1][2]
 end
 
 """
-    predict_apses(state0, n_revs, period_s; eom!, rtol, atol) -> (peri_alt_km, apo_alt_km)
+    predict_apses(state0, period_s; eom!, rtol, atol) -> (peri_alt_km, apo_alt_km)
 
-Predict the ALTITUDE (km) of the first periapsis and first apoapsis over the next `n_revs`
-revolutions of the onboard model. `NaN` for an apse not reached within the horizon.
+Predict the ALTITUDE (km) of the next periapsis and next apoapsis under the onboard model.
+`NaN` for an apse the trajectory never reaches.
 
 The altitude-only counterpart of [`predict_apse_states`](@ref), used by `mode = :altitude`.
 """
 function predict_apses(
     state0::AbstractVector{<:Real},
-    n_revs::Integer,
     period_s::Real;
     eom! = cr3bp_eom!,
     rtol::Real = RTOL_ONBOARD,
     atol::Real = ATOL_ONBOARD,
 )
-    peri_state, apo_state = predict_apse_states(state0, n_revs, period_s;
+    peri_state, apo_state = predict_apse_states(state0, period_s;
                                                 eom! = eom!, rtol = rtol, atol = atol)
     peri_alt = isnan(peri_state[1]) ? NaN : altitude(peri_state)
     apo_alt  = isnan(apo_state[1])  ? NaN : altitude(apo_state)
@@ -283,7 +304,7 @@ end
 # ── Residual ──────────────────────────────────────────────────────────────────
 
 """
-    apse_residual(state0, dv, n_revs, period_s, eom!; ...) -> Vector{Float64}
+    apse_residual(state0, dv, period_s, eom!; ...) -> Vector{Float64}
 
 The residual `r(ΔV)` driven to zero by [`solve_burn`](@ref). `dv` (km/s) is added to the
 velocity of `state0` and the apses are predicted with the ONBOARD model.
@@ -301,7 +322,6 @@ Two targeting modes:
 function apse_residual(
     state0::AbstractVector{<:Real},
     dv::AbstractVector{<:Real},
-    n_revs::Integer,
     period_s::Real,
     eom!;
     peri_target_km::Real = PERIAPSIS_ALT_TARGET,
@@ -316,18 +336,18 @@ function apse_residual(
     if mode === :position
         (r_peri_nom === nothing || r_apo_nom === nothing) &&
             throw(ArgumentError("mode = :position requires r_peri_nom and r_apo_nom"))
-        peri_state, apo_state = predict_apse_states(s, n_revs, period_s; eom! = eom!)
+        peri_state, apo_state = predict_apse_states(s, period_s; eom! = eom!)
         return vcat(peri_state[1:3] .- r_peri_nom, apo_state[1:3] .- r_apo_nom)
     end
 
-    peri_alt, apo_alt = predict_apses(s, n_revs, period_s; eom! = eom!)
+    peri_alt, apo_alt = predict_apses(s, period_s; eom! = eom!)
     return [peri_alt - peri_target_km, apo_alt - apo_target_km]
 end
 
 # ── Burn solver ───────────────────────────────────────────────────────────────
 
 """
-    solve_burn(state0, period_s; n_revs, eom!, max_iter, fd_step, damp, tol_km,
+    solve_burn(state0, period_s; eom!, max_iter, fd_step, damp, tol_km,
                peri_target_km, apo_target_km, mode, r_peri_nom, r_apo_nom) -> NamedTuple
 
 Solve for the impulsive ΔV that re-targets the next periapsis/apoapsis.
@@ -346,8 +366,8 @@ keyword only for the deliberate perfect-model ablation; the caller is responsibl
 passing a truth EOM in normal operation.
 
   - `state0` — barycentre-frame state at the control point, PRE-burn (km, km/s)
-  - `period_s` — single-revolution period estimate (s)
-  - `n_revs` — multiple-shooting horizon in revolutions (MacKenzie `N_m` = 2–3)
+  - `period_s` — single-revolution period estimate (s), the first chunk of the count-based
+    apse search. The planner targets the NEXT apse pair; it has no multi-revolution horizon.
 
 Returns `(dv, dv_mag_ms, converged, residual_km, iterations)`, where `dv` is the ΔV in km/s
 and `dv_mag_ms` its magnitude in m/s.
@@ -355,7 +375,6 @@ and `dv_mag_ms` its magnitude in m/s.
 function solve_burn(
     state0::AbstractVector{<:Real},
     period_s::Real;
-    n_revs::Integer = 3,
     eom! = cr3bp_eom!,
     max_iter::Integer = 20,
     fd_step::Real = 1e-6,
@@ -374,7 +393,7 @@ function solve_burn(
     mode === :position && validate_targets &&
         validate_apse_targets(state0, r_peri_nom, r_apo_nom)
 
-    resid(dv) = apse_residual(state0, dv, n_revs, period_s, eom!;
+    resid(dv) = apse_residual(state0, dv, period_s, eom!;
                               peri_target_km = peri_target_km,
                               apo_target_km = apo_target_km,
                               mode = mode,

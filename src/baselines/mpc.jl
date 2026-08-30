@@ -11,8 +11,7 @@ Control concept
 The spacecraft coasts under the TRUTH dynamics. At each descending crossing of a fixed
 altitude shell ([`CONTROL_ALT_KM`](@ref) = 600 km above the surface) the controller solves
 for an impulsive ΔV re-targeting the next periapsis and apoapsis. The burn is planned by
-[`solve_burn`](@ref) with a multiple-shooting prediction over `n_revs` revolutions of the
-ONBOARD model; the world then propagates the post-burn state forward under the truth model
+[`solve_burn`](@ref), which targets the next apse pair under the ONBOARD model; the world then propagates the post-burn state forward under the truth model
 until the next trigger.
 
 ⚠️ TRUTH/ONBOARD SPLIT (CLAUDE.md rule). [`run_mpc`](@ref) is the ONLY place `truth_eom!` is
@@ -33,7 +32,7 @@ References
 """
 
 """
-    run_mpc(state0, truth_eom!, period_s, horizon_s; n_revs, rtol_truth, atol_truth,
+    run_mpc(state0, truth_eom!, period_s, horizon_s; rtol_truth, atol_truth,
             verbose, peri_target_km, apo_target_km, mode, ref_ic, max_burns) -> NamedTuple
 
 Run the event-driven MPC stationkeeping loop against a TRUTH model.
@@ -54,7 +53,6 @@ The loop ends when the horizon is reached, the spacecraft crashes
     SAME controller runs at every fidelity rung.
   - `period_s` — single-revolution period estimate (s)
   - `horizon_s` — total mission horizon to simulate (s)
-  - `n_revs` — multiple-shooting horizon for the burn solver (`N_m`)
   - `peri_target_km`, `apo_target_km` — apse-altitude targets used when
     `mode = :altitude`; default to the centre of the MacKenzie bands (42.05 / 1055 km).
     Set them to another orbit's own apse altitudes to stationkeep that orbit without
@@ -82,7 +80,6 @@ function run_mpc(
     truth_eom!,
     period_s::Real,
     horizon_s::Real;
-    n_revs::Integer = 3,
     rtol_truth::Real = RTOL_TRUTH,
     atol_truth::Real = ATOL_TRUTH,
     verbose::Bool = false,
@@ -180,7 +177,7 @@ function run_mpc(
         t_now += ctrl.t
 
         burn = solve_burn(state_ctrl, period_s;
-                          n_revs = n_revs, eom! = cr3bp_eom!,
+                          eom! = cr3bp_eom!,
                           peri_target_km = peri_target_km,
                           apo_target_km = apo_target_km,
                           mode = mode,
