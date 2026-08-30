@@ -33,7 +33,6 @@ plus the provenance metadata carried alongside them.
 """
 struct AltTables
     correct::Dict{Symbol,Vector{Float64}}
-    observe::Dict{Symbol,Vector{Float64}}
     excurse::Dict{Symbol,Vector{Float64}}
     meta::Dict{String,Any}
 end
@@ -48,7 +47,6 @@ band rebase to 20–50 km — re-check it when the kernels are re-measured.
 """
 function alt_kernel(tables::AltTables, action::Symbol, alt::Symbol)
     action === :CORRECT && return tables.correct[alt]
-    action === :OBSERVE && return tables.observe[alt]
     return tables.excurse[alt]
 end
 
@@ -70,7 +68,6 @@ function write_tables(tables::AltTables; path::AbstractString = DEFAULT_TABLES_P
     payload = Dict(
         "alt_next" => string.(collect(ALT_ALL)),
         "correct"  => _kernel_to_json(tables.correct),
-        "observe"  => _kernel_to_json(tables.observe),
         "excurse"  => _kernel_to_json(tables.excurse),
         "meta"     => tables.meta,
     )
@@ -103,7 +100,6 @@ function load_tables(path::AbstractString = DEFAULT_TABLES_PATH)
 
     tables = AltTables(
         _kernel_from_json(raw["correct"]),
-        _kernel_from_json(raw["observe"]),
         _kernel_from_json(raw["excurse"]),
         Dict{String,Any}(get(raw, "meta", Dict())),
     )
@@ -118,8 +114,7 @@ Check every kernel row covers the live altitude bins and sums to 1. Cheap, and i
 a hand-edited artifact before the error reaches the solver as a subtly wrong policy.
 """
 function validate_tables(tables::AltTables)
-    for (name, k) in (("correct", tables.correct), ("observe", tables.observe),
-                      ("excurse", tables.excurse))
+    for (name, k) in (("correct", tables.correct), ("excurse", tables.excurse))
         for alt in ALT_BINS
             haskey(k, alt) || error("tables.$name is missing a row for alt=$alt")
             row = k[alt]

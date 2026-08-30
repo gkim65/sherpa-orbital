@@ -1,6 +1,6 @@
 using Test
 using SherpaOrbital
-using LinearAlgebra: norm
+using LinearAlgebra: norm, Diagonal
 using JSON
 
 const CFG = StationkeepingPOMDP()
@@ -46,7 +46,6 @@ const CFG = StationkeepingPOMDP()
     # surfaces deep inside the solver rather than at configuration.
     @testset "every action is priced" begin
         @test all(haskey(CFG.action_dv_cost, a) for a in SherpaOrbital.actions(CFG))
-        @test CFG.action_dv_cost[:OBSERVE] == 0.0
     end
 
     # Half-open [lo, hi): an edge belongs to the OUTER bin. This must stay identical to
@@ -54,11 +53,19 @@ const CFG = StationkeepingPOMDP()
     # use.
     @testset "altitude binning" begin
         @test alt_bin(CFG, 19.9) == :BELOW_20
-        @test alt_bin(CFG, 20.0) == :A20_30
-        @test alt_bin(CFG, 29.9) == :A20_30
-        @test alt_bin(CFG, 30.0) == :A30_40
-        @test alt_bin(CFG, 49.9) == :A40_50
-        @test alt_bin(CFG, 50.0) == :ABOVE_50
+        @test alt_bin(CFG, 20.0) == :A20_27
+        @test alt_bin(CFG, 26.9) == :A20_27
+        @test alt_bin(CFG, 27.0) == :A27_34
+        @test alt_bin(CFG, 33.9) == :A27_34
+        @test alt_bin(CFG, 34.0) == :A34_44
+        @test alt_bin(CFG, 43.9) == :A34_44
+        @test alt_bin(CFG, 44.0) == :ABOVE_44
+
+        # The measured CORRECT limit cycle (37.17 km noise-free) must land in the
+        # NON-science bin, or a science band is banked by doing nothing — the defect these
+        # edges were rebased to fix. See `alt_edges`.
+        @test alt_bin(CFG, 37.17) == :A34_44
+        @test alt_bin(CFG, 37.17) ∉ CFG.band_bins
         @test alt_bin(CFG, NaN)  == :LOST
         @test alt_bin(CFG, Inf)  == :LOST
     end
@@ -85,20 +92,34 @@ const CFG = StationkeepingPOMDP()
 
         # Terminal states earn nothing; the loss was charged on entry, not on occupancy.
         for term in SherpaOrbital.TERMINAL_ALT
-            @test r(SKState(term, zv), :OBSERVE) == 0.0
+            @test r(SKState(term, zv), :CORRECT) == 0.0
         end
 
         # A band at the visit cap can bank no more, so it earns strictly less than a fresh
         # one from the same altitude under the same action.
         capped = ntuple(i -> i == 2 ? CFG.visit_cap : 0, SherpaOrbital.n_bands(CFG))
-        @test r(SKState(:A30_40, zv), :CORRECT) > r(SKState(:A30_40, capped), :CORRECT)
+        @test r(SKState(:A27_34, zv), :CORRECT) > r(SKState(:A27_34, capped), :CORRECT)
 
-        # Fuel is charged, and OBSERVE is free. Tested on the fuel term alone: OBSERVE does
-        # not score better overall, because it carries risk CORRECT removes.
+        # Fuel is charged: zeroing `fuel_weight` must strictly raise every action's reward,
+        # since every action now burns (there is no free OBSERVE to be indifferent).
         cfg0 = StationkeepingPOMDP(; fuel_weight = 0.0)
         r0   = SherpaOrbital.reward_function(cfg0, model_tables(cfg0)[1])
-        @test r0(SKState(:A30_40, zv), :CORRECT) > r(SKState(:A30_40, zv), :CORRECT)
-        @test r0(SKState(:A30_40, zv), :OBSERVE) == r(SKState(:A30_40, zv), :OBSERVE)
+        for a in SherpaOrbital.actions(CFG)
+            @test r0(SKState(:A27_34, zv), a) > r(SKState(:A27_34, zv), a)
+        end
+    end
+
+    # OBSERVE was REMOVED as an action on 2026-08-30 (a no-burn coast loses this orbit —
+    # see `actions`). Assert it is gone everywhere, because a stale reference would not
+    # error: `alt_kernel` would fall through to the EXCURSE kernel and quietly mis-price a
+    # coast as an excursion.
+    @testset "OBSERVE is not an action" begin
+        @test :OBSERVE ∉ SherpaOrbital.actions(CFG)
+        @test SherpaOrbital.n_actions(CFG) == length(SherpaOrbital.actions(CFG))
+        @test !haskey(CFG.action_dv_cost, :OBSERVE)
+        @test all(a -> a === :CORRECT || SherpaOrbital.is_excursion(CFG, a),
+                  SherpaOrbital.actions(CFG))
+        @test !hasfield(SherpaOrbital.AltTables, :observe)
     end
 
     # Hyperparameters must actually flow through the model rather than being shadowed.
@@ -108,13 +129,13 @@ const CFG = StationkeepingPOMDP()
         zv   = ntuple(_ -> 0, SherpaOrbital.n_bands(base))
         r_l  = SherpaOrbital.reward_function(loud, model_tables(loud)[1])
         r_b  = SherpaOrbital.reward_function(base, model_tables(base)[1])
-        @test r_l(SKState(:A30_40, zv), :CORRECT) > r_b(SKState(:A30_40, zv), :CORRECT)
+        @test r_l(SKState(:A27_34, zv), :CORRECT) > r_b(SKState(:A27_34, zv), :CORRECT)
 
         # Nav sigma must move the observation model, or the POMDP is secretly an MDP.
         sharp = StationkeepingPOMDP(; sigma_nav_km = 0.1)
         blurry = StationkeepingPOMDP(; sigma_nav_km = 8.0)
-        i = SherpaOrbital.state_index(sharp)[SKState(:A30_40, zv)]
-        oi = SherpaOrbital.observation_index(sharp)[:A30_40]
+        i = SherpaOrbital.state_index(sharp)[SKState(:A27_34, zv)]
+        oi = SherpaOrbital.observation_index(sharp)[:A27_34]
         @test model_tables(sharp)[2][i, oi] > model_tables(blurry)[2][i, oi]
     end
 
@@ -123,8 +144,8 @@ const CFG = StationkeepingPOMDP()
     @testset "measured tables validate" begin
         tables = load_tables()
         @test validate_tables(tables)
-        @test SherpaOrbital.alt_kernel(tables, :EXCURSE_LOW, :A30_40) ==
-              SherpaOrbital.alt_kernel(tables, :EXCURSE_HIGH, :A30_40)
+        @test SherpaOrbital.alt_kernel(tables, :EXCURSE_LOW, :A27_34) ==
+              SherpaOrbital.alt_kernel(tables, :EXCURSE_HIGH, :A27_34)
         @test_throws ErrorException load_tables(tempname() * ".json")
     end
 
@@ -267,6 +288,61 @@ const CFG = StationkeepingPOMDP()
                               target_alt_km = 5000.0, family_table = tbl)
         @test_throws ErrorException SherpaOrbital.controller_setup!(
             c_bad, ic, PERIOD1_TRIPLE_PERIOD_S)
+    end
+
+    @testset "altitude_position targeting mode" begin
+        ic = nondim_to_cr3bp(collect(PERIOD1_NORTH_IC_ND))
+        one_rev = PERIOD1_TRIPLE_PERIOD_S / 3
+        _, ra = SherpaOrbital.next_apse_positions(ic; eom! = SherpaOrbital.cr3bp_eom!)
+
+        # The residual is 4-D: 1 periapsis altitude + 3 apoapsis position components.
+        r = SherpaOrbital.apse_residual(ic, zeros(3), one_rev, SherpaOrbital.cr3bp_eom!;
+                                        mode = :altitude_position, peri_target_km = 30.0,
+                                        r_apo_nom = ra)
+        @test length(r) == 4
+
+        # The mode must DELIVER a commanded altitude from a DRIFTED state — measuring at the
+        # reference IC proves nothing (the residual is 0 there whatever the mode).
+        s = copy(ic)
+        for _ in 1:6
+            sh, sc = SherpaOrbital._to_shell(SherpaOrbital.cr3bp_j2_eom!, s, 4 * one_rev)
+            sh === :ok || break
+            b = SherpaOrbital.solve_burn(sc, one_rev; mode = :altitude_position,
+                                         peri_target_km = 35.0, r_apo_nom = ra)
+            sp = copy(sc); sp[4:6] .+= b.dv
+            pc, uc = SherpaOrbital._to_peri(SherpaOrbital.cr3bp_j2_eom!, sp, 4 * one_rev)
+            pc === :ok || break
+            s = copy(uc)
+        end
+        # Delivered to well under a km, where the unweighted 6-on-3 :position mode lands
+        # ~2 km away and cannot be commanded at all.
+        @test SherpaOrbital.altitude(s) ≈ 35.0 atol = 1.0
+
+        # ⚠️ `converged` is NOT the delivery test here: the apoapsis POSITION block dominates
+        # the total residual and does not clear TARGET_TOL_KM from a drifted state. That is
+        # what `peri_err_km` exists to report, and conflating the two would read a working
+        # excursion as a dead ΔV = 0 solve.
+        sh, sc = SherpaOrbital._to_shell(SherpaOrbital.cr3bp_j2_eom!, s, 4 * one_rev)
+        if sh === :ok
+            b = SherpaOrbital.solve_burn(sc, one_rev; mode = :altitude_position,
+                                         peri_target_km = 35.0, r_apo_nom = ra)
+            @test isfinite(b.peri_err_km)
+            @test b.peri_err_km < b.residual_km
+        end
+
+        # Weighting must be the IDENTITY for every other mode, or every pre-existing
+        # baseline number silently changes.
+        J = [1.0 0.0 0.0; 0.0 100.0 0.0; 0.0 0.0 1.0; 1.0 1.0 1.0]
+        @test SherpaOrbital._residual_weights(:position, J) == Diagonal(ones(4))
+        @test SherpaOrbital._residual_weights(:altitude, J) == Diagonal(ones(4))
+        @test SherpaOrbital._residual_weights(:altitude_position, J)[1, 1] > 1.0
+
+        # A commanded periapsis below the crash shell is a SETUP error, not a target.
+        @test_throws ErrorException SherpaOrbital.solve_burn(
+            ic, one_rev; mode = :altitude_position, peri_target_km = 1.0, r_apo_nom = ra)
+        # And the apoapsis target is required.
+        @test_throws ArgumentError SherpaOrbital.solve_burn(
+            ic, one_rev; mode = :altitude_position, peri_target_km = 35.0)
     end
 
     @testset "SARSOPController retarget_bands toggle" begin

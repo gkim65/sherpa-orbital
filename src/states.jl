@@ -28,7 +28,7 @@ science failure, not a mission failure. Only `CRASHED` and `LOST` absorb.
 # ── Altitude bins ─────────────────────────────────────────────────────────────
 
 """Live (non-absorbing) altitude bins, in ascending altitude order."""
-const ALT_BINS = (:BELOW_20, :A20_30, :A30_40, :A40_50, :ABOVE_50)
+const ALT_BINS = (:BELOW_20, :A20_27, :A27_34, :A34_44, :ABOVE_44)
 
 """Absorbing outcomes. `CRASHED` = below the crash altitude, `LOST` = escaped."""
 const TERMINAL_ALT = (:CRASHED, :LOST)
@@ -168,10 +168,10 @@ function alt_bin(pomdp::StationkeepingPOMDP, alt_km::Real)
     !isfinite(alt_km) && return :LOST
     e = pomdp.alt_edges
     alt_km < e[1] && return :BELOW_20
-    alt_km < e[2] && return :A20_30
-    alt_km < e[3] && return :A30_40
-    alt_km < e[4] && return :A40_50
-    return :ABOVE_50
+    alt_km < e[2] && return :A20_27
+    alt_km < e[3] && return :A27_34
+    alt_km < e[4] && return :A34_44
+    return :ABOVE_44
 end
 
 """

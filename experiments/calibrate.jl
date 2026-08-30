@@ -18,6 +18,7 @@ evidence and the policy's behaviour in those bins means nothing.
 using SherpaOrbital
 using SherpaOrbital: ALT_BINS, ALT_ALL
 using Printf
+using Statistics: median, mean
 
 # ── Scenario ─────────────────────────────────────────────────────────────────
 # Must match the StationkeepingPOMDP config the policy will be solved against: the kernels
@@ -40,7 +41,7 @@ rows, diag = calibrate_tables(;
 # ── Per-row provenance ───────────────────────────────────────────────────────
 println("\nMeasured rows (n = trials; a row with n = 0 is FILLED, not measured):")
 @printf("  %-9s %-10s %6s %7s  %s\n", "action", "from", "n", "nonconv", "P(next)")
-for a in (:CORRECT, :OBSERVE, :EXCURSE), b in ALT_BINS
+for a in (:CORRECT, :EXCURSE), b in ALT_BINS
     r = rows[a][b]
     @printf("  %-9s %-10s %6d %7d  %s\n", a, b, r.n, r.n_nonconverged,
             r.n == 0 ? "(UNMEASURED -> self-transition)" :
@@ -48,6 +49,22 @@ for a in (:CORRECT, :OBSERVE, :EXCURSE), b in ALT_BINS
 end
 
 # ── Where the excursions actually went ───────────────────────────────────────
+# ── Measured ΔV per action, for `action_dv_cost` ─────────────────────────────
+# The config's `action_dv_cost` is a REWARD-SHAPING proxy, and its entries were flagged as
+# placeholders needing re-measurement. Print the measured medians so they can be set from
+# data rather than carried forward by hand.
+println("\nMeasured ΔV per action (m/s) — set config.action_dv_cost from these:")
+let corr = vcat((rows[:CORRECT][b].dv_ms for b in ALT_BINS)...)
+    isempty(corr) || @printf("  CORRECT      n=%3d  median %6.3f  mean %6.3f\n",
+                             length(corr), median(corr), mean(corr))
+end
+for b in config.band_names
+    dv = diag["band_dv_ms"][string(b)]
+    isempty(dv) && continue
+    @printf("  EXCURSE_%-5s n=%3d  median %6.3f  mean %6.3f\n",
+            b, length(dv), median(dv), mean(dv))
+end
+
 println("\nBand COMMANDED vs ACHIEVED periapsis altitude (the excursion sanity check):")
 for b in config.band_names
     got = diag["band_achieved_alt"][string(b)]

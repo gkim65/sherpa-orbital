@@ -14,11 +14,12 @@ Formulation
             safety variable. `visits` = per-band sample COUNT saturating at `visit_cap`,
             so revisiting a band keeps paying. |S| = 5*(cap+1)^n_bands + 2 = 322 by
             default.
-  Action  : OBSERVE / CORRECT / EXCURSE_{LOW,HIGH}. Actions encode INTENT only; the burn
-            VECTOR is solved live by the planner (a fixed-direction menu was shown to
-            fail — see experiments/studies exp 04). There is no EXCURSE_MID: CORRECT
-            already holds ~31–37 km, which IS the middle band, so a MID excursion would
-            duplicate it.
+  Action  : CORRECT / EXCURSE_{LOW,MID,HIGH}. Every action burns — there is no OBSERVE
+            (removed 2026-08-30: a no-burn coast loses this orbit; see `actions`). Actions
+            encode INTENT only; the burn VECTOR is solved live by the planner (a
+            fixed-direction menu was shown to fail — see experiments/studies exp 04).
+            All THREE science bands get an EXCURSE (|A| = 4): the limit cycle now lives in
+            its own non-science bin, so no band duplicates what CORRECT already does.
   Obs     : noisy read of the achieved periapsis altitude (Gaussian nav noise, σ =
             `sigma_nav_km`), binned by `alt_bin`. Coverage is banked from this OBSERVED
             altitude, so it is deterministic given the observation but not correct — see
@@ -45,7 +46,8 @@ km/s, m/s (ΔV costs), matching the Python truth model's conventions.
 
 # Altitude discretization
 - `alt_edges`: periapsis-altitude bin edges (km), half-open [lo, hi), giving the five live
-  bins BELOW_20 / A20_30 / A30_40 / A40_50 / ABOVE_50.
+  bins BELOW_20 / A20_27 / A27_34 / A34_44 / ABOVE_44. ⚠️ Rebased 2026-08-30 so the
+  CORRECT limit cycle (37.17 km) sits in A34_44, which is NOT a science band.
 - `alt_rep_km`: representative altitude (km) per live bin — the mean of the nav
   observation model for that bin.
 
@@ -53,9 +55,11 @@ km/s, m/s (ΔV costs), matching the Python truth model's conventions.
 - `band_names`: the science bands, in visit-tuple order (index 1 = first band).
 - `band_bins`: which altitude bin each band corresponds to. This is the coverage gate:
   an observed altitude banks a band when it lands in that band's bin.
-- `band_target_km`: commanded periapsis-altitude target per band (km). ⚠️ Achieving X
-  requires COMMANDING ≈ X − 6 (the measured `:position` residual floor, characterised and
-  deliberately not fixed — `docs/session-log/2026-08-29-commanded-altitude-hold.md` §4d).
+- `band_target_km`: commanded periapsis-altitude target per band (km), set to the BIN
+  MIDPOINTS. ⚠️ The old "achieving X requires COMMANDING ≈ X − 6" no longer holds: that was
+  the `:position` residual floor, and `EXCURSE_*` now targets the commanded altitude
+  directly via `mode = :altitude_position`, which delivers it to ~0.2 km (commanded
+  25/35/45 → achieved 25.07/34.94/44.68 km, measured 2026-08-30). Command what you want.
 - `visit_cap`: max counted samples per band. Saturates the visit counts, so |S| grows as
   `(visit_cap + 1)^n_bands` — EXPONENTIAL in bands. `cap = 3` is 64 combos; a target of 20
   would be 9261 and needs a different encoding, not a bigger cap.
@@ -87,41 +91,114 @@ km/s, m/s (ΔV costs), matching the Python truth model's conventions.
 """
 Base.@kwdef struct StationkeepingPOMDP
     # -- altitude discretization ----------------------------------------------
-    # Edges at the science-range boundaries, so "in the 20–50 km science range" is exactly
-    # the three middle bins and needs no arithmetic.
-    alt_edges::NTuple{4,Float64}    = (20.0, 30.0, 40.0, 50.0)
+    # ⚠️ EDGES CHOSEN AGAINST THE MEASURED LIMIT CYCLE, not by round numbers (2026-08-30).
+    # The previous (20, 30, 40, 50) edges put the CORRECT limit cycle INSIDE a science band:
+    # noise-free the cycle holds 37.17 km with 96% of 295 passes inside 36–38 km, which sits
+    # squarely in the old `A30_40` = MID band. So MID was banked by doing nothing, and with
+    # the (known-unphysical, 10%-mean-underburn) `:uniform` thruster the cycle smears up to a
+    # 40.55 km median and gifted the old `A40_50` = HIGH band too. Two of three bands were
+    # free, so the policy collected 8 of 12 science points at zero risk and then — correctly —
+    # refused the only band that cost anything. The science/safety tradeoff the POMDP exists
+    # to study was largely vacuous.
+    #
+    # These edges instead BRACKET the limit cycle in its own band (`A34_44`, deliberately not
+    # a science band) so every science band requires a real, chosen maneuver:
+    #
+    #   | bin      | range (km) | what reaches it                                  |
+    #   |----------|------------|--------------------------------------------------|
+    #   | BELOW_20 | < 20       | off-nominal low; holdable (18 km holds steady)    |
+    #   | A20_27   | 20–27      | LOW band — a real excursion (P(LOST) ≈ 0.19)     |
+    #   | A27_34   | 27–34      | MID band — a real excursion, below the cycle      |
+    #   | A34_44   | 34–44      | THE LIMIT CYCLE. Not a science band.              |
+    #   | ABOVE_44 | > 44       | HIGH band — above the cycle, still holdable (45)  |
+    #
+    # Constrained by measurement, not taste: the continued family spans 17.57–63.13 km, and
+    # holding a member on its own altitude works at 18/20/22/25/28/32/45 km but ESCAPES by
+    # pass 3 at 55 and 60 km. So the top band has to stay near 45 km, and 50+ is not a science
+    # band that can be held.
+    alt_edges::NTuple{4,Float64}    = (20.0, 27.0, 34.0, 44.0)
     alt_rep_km::Dict{Symbol,Float64} = Dict(
-        :BELOW_20 => 15.0, :A20_30 => 25.0, :A30_40 => 35.0,
-        :A40_50   => 45.0, :ABOVE_50 => 60.0,
+        :BELOW_20 => 18.0, :A20_27 => 23.5, :A27_34 => 30.5,
+        :A34_44   => 37.2, :ABOVE_44 => 46.0,
     )
 
     # -- science bands --------------------------------------------------------
     band_names::NTuple{3,Symbol}    = (:LOW, :MID, :HIGH)
-    band_bins::NTuple{3,Symbol}     = (:A20_30, :A30_40, :A40_50)
+    # ⚠️ HIGH IS `ABOVE_44`, NOT the limit-cycle bin. `A34_44` holds the CORRECT cycle
+    # (37.17 km) and is deliberately absent here — a bin the controller already occupies
+    # cannot be a science objective, which is the whole point of the `alt_edges` rebase.
+    band_bins::NTuple{3,Symbol}     = (:A20_27, :A27_34, :ABOVE_44)
     # Commanded periapsis altitude per band (km). These are REAL halo-family members
     # (the continued family spans 17.565–63.126 km, so all three exist) and the excursion
     # reference PERSISTS until CORRECT clears it — so they are reached by settling over
     # several passes, not in one impulse.
-    # ⚠️ Do NOT re-tune these to match a single-pass achieved altitude. Single-impulse
-    # authority is only ~25% (commanding 20 km from the 31 km limit cycle reaches ~38 km on
-    # one pass), which is why the reference persists; "spend another cycle getting there"
-    # is the mechanism, and lowering the command to flatter a one-pass number would remove
-    # the very behaviour the policy is meant to learn.
+    #
+    # ⚠️ ONE COMMAND PER BAND, PLACED INSIDE ITS BIN AND AWAY FROM ITS EDGES (2026-08-30).
+    # Commanding a bin EDGE was a real defect: `EXCURSE_*` now delivers the commanded
+    # altitude to ~0.2 km, so a command at 20.0 for the [20,27) bin lands ~0.1 km from the
+    # boundary and nav noise misbins it constantly. (Under the old ~25%-authority targeting
+    # this was invisible — every command landed near 37 km regardless.) Interior points:
+    #
+    #   | band | bin       | commanded | measured achieved            |
+    #   |------|-----------|-----------|------------------------------|
+    #   | LOW  | [20, 27)  |   23.5 km | 25 km delivered to 0.2 km    |
+    #   | MID  | [27, 34)  |   30.5 km | 30 km delivered to 0.09 km   |
+    #   | HIGH | [44, ∞)   |   46.0 km | 45 km delivered to 0.3 km    |
+    #
+    # ⚠️ HIGH IS CONSTRAINED FROM ABOVE BY THE ORBIT, not by preference. Holding a family
+    # member on its own altitude works at 45 km but ESCAPES by pass 3 at 55 and 60 km, so
+    # 46 km is near the top of what can actually be held. Do not raise it without measuring.
+    #
+    # ⚠️ AND LOW IS THE EXPENSIVE ONE: `EXCURSE` from `A20_27` measures P(LOST) ≈ 0.19,
+    # because the transfer down from the 37 km cycle drives apoapsis past MacKenzie's 1110 km
+    # ceiling and the onboard model then loses the apse pair (ΔV = 0, uncontrolled pass).
+    # That risk is real and measured — it is not a targeting defect to be tuned away.
+    #
+    # ⚠️ `band_bins` — not this — is what the state space, action set and rewards key off
+    # (see `states.jl` `bank_visit`, `actions.jl` `excursion_bands`). Changing these commanded
+    # altitudes leaves |S|, |A| and the reward structure untouched.
     band_target_km::Dict{Symbol,Float64} =
-        Dict(:LOW => 20.0, :MID => 30.0, :HIGH => 40.0)
-    # ⚠️ 4, NOT 3. `visit_cap = 3` (322 states) makes NativeSARSOP die with
-    # `InexactError: Int64(NaN)` inside its belief-binning bound initialization. Measured
-    # 2026-08-30: it is NOT a size limit and NOT a malformed model — caps 1, 2, 4 and 5
-    # all solve (42 / 137 / 627 / 1082 states), and cap 3 itself solves at discount = 0.90
-    # or with r_science = 0, at every precision tried. T and O are finite, normalized, and
-    # have no zero-mass observation column. It is a solver-side numerical edge case where
-    # the upper and lower bounds coincide and a bin index goes 0/0.
-    # 4 is chosen over 2 because it is the nearest working value ABOVE 3, so the science
-    # resolution goes up rather than down. Revisit if NativeSARSOP is updated.
+        Dict(:LOW => 23.5, :MID => 30.5, :HIGH => 46.0)
+    # ⚠️ THE `InexactError: Int64(NaN)` THIS ONCE WORKED AROUND IS NOW DIAGNOSED, and the
+    # workaround is no longer what avoids it — pass `use_binning = false` to `SARSOPSolver`
+    # (see `experiments/example.jl`). Root cause, found 2026-08-30:
+    #
+    # `NativeSARSOP.entropy` has two methods and only the dense one guards the `p log p`
+    # term. `tree.b` is hard-typed `Vector{SparseVector}`, so the UNGUARDED one always runs:
+    #
+    #     entropy(b::AbstractVector) : b_i > 0 && (ent -= b_i * log(b_i))       # correct
+    #     entropy(b::SparseVector)   : for b_i in b.nzval; ent -= b_i*log(b_i)  # no guard
+    #
+    # `nzval` is the STRUCTURAL sparsity pattern, so an entry can sit in it at exactly 0.0.
+    # `tree.jl`'s belief update (`bp.nzval ./= po`, ~line 308) has no `dropzeros!` after the
+    # observation-weighting step, unlike the prediction step just above it — so an entry
+    # zeroed by an observation column stays in the pattern and `0.0 * log(0.0) = NaN`. That
+    # NaN reaches `get_interval_idx`, where `Int(floor(NaN/interval) + 1)` throws. Reproduced
+    # in three lines with no dynamics involved:
+    #
+    #     v = SparseVector(3,[1,2,3],[0.5,0.5,0.0]); entropy(v)   # NaN
+    #     entropy(Vector(v))                                      # 0.693
+    #
+    # `entropy` is reached ONLY from the two `use_binning` call sites, which is why disabling
+    # binning fixes it outright. Binning is a search heuristic for grouping similar beliefs;
+    # switching it off changes the exploration bookkeeping, not the POMDP or the solution.
+    #
+    # The old note here guessed "the upper and lower bounds coincide and a bin index goes
+    # 0/0", and also asserted the model has "no zero-mass observation column" — both wrong.
+    # `observation_matrix` gives every LIVE state exactly 0.0 in the CRASHED and LOST
+    # columns, deliberately and correctly (a live pass is not a crash; those are categorical
+    # events, not noisy altitude reads), and that is precisely the zero involved.
+    #
+    # Why caps 1/2/4/5 solved and 3 did not is then incidental, not structural: the cap
+    # changes which beliefs SARSOP explores, hence whether it happens to step on a zeroed
+    # entry. Same reason `r_science = 0` "fixed" it. Do NOT detune the science objective to
+    # dodge this — that changes the problem being solved.
     visit_cap::Int                  = 4
-    # The bin CORRECT already holds (nominal periapsis 30.98 km, limit cycle ~37 km), so
-    # no EXCURSE action is generated for it. See `excursion_bands`.
-    correct_bin::Symbol             = :A30_40
+    # The bin CORRECT already holds — measured 37.17 km noise-free, 96% of 295 passes inside
+    # 36–38 km. It is `A34_44`, which is NOT in `band_bins`, so `excursion_bands` generates an
+    # EXCURSE for all THREE science bands now (|A| = 4: CORRECT + LOW/MID/HIGH). Under the old
+    # edges this bin WAS the MID band, which is why MID had no action and was banked free.
+    correct_bin::Symbol             = :A34_44
 
     # -- noise hyperparameters (swept) ----------------------------------------
     sigma_nav_km::Float64           = 2.0
@@ -138,16 +215,30 @@ Base.@kwdef struct StationkeepingPOMDP
     fuel_weight::Float64            =    1.0
 
     # ΔV cost proxy (m/s) per action.
-    # ⚠️ PLACEHOLDERS, NOT MEASUREMENTS. The old 2.1 / 3.1 / 9.9 values were measured in
-    # exp 12 for bands at 40 / 70 / 120 km, which no longer exist — the bands are now
-    # 20–30 / 30–40 / 40–50 km and much closer together, so those numbers do not transfer.
-    # CORRECT's 1.3 is the one survivor with support (exp 11b, ~1.3 m/s per step, and the
-    # measured limit cycle sits at 1.32 m/s per pass). Re-measure with the kernels.
+    # ⚠️ MEASURED, not placeholders (2026-08-30). Per-pass ΔV medians from the calibration
+    # run that produced the committed kernels — `experiments/calibrate.jl` prints these, so
+    # they are re-derivable rather than transcribed. The old 1.3 / 2.1 / 2.1 values predated
+    # both the band rebase and `:altitude_position`; EXCURSE_MID did not exist at all,
+    # because the limit-cycle bin used to BE the MID band.
+    #
+    #   | action       |  n | median | mean  |
+    #   |--------------|----|--------|-------|
+    #   | CORRECT      | 90 |  1.278 | 1.314 |
+    #   | EXCURSE_LOW  | 24 |  3.292 | 3.443 |
+    #   | EXCURSE_MID  | 36 |  3.368 | 3.562 |
+    #   | EXCURSE_HIGH | 48 |  5.378 | 5.824 |
+    #
+    # Medians, not means: the means are pulled up by the first pass of each settling walk,
+    # which costs more than the steady-state hold this proxy is meant to price.
+    #
+    # ⚠️ HIGH IS THE EXPENSIVE BAND BUT ALSO THE SAFE ONE — measured P(LOST) = 0.0 over 45
+    # trials, against 0.19 for LOW at half the ΔV. That asymmetry is the tradeoff the policy
+    # exists to make; do not flatten these costs to equal values.
     action_dv_cost::Dict{Symbol,Float64} = Dict(
-        :OBSERVE      => 0.0,
-        :CORRECT      => 1.3,
-        :EXCURSE_LOW  => 2.1,
-        :EXCURSE_HIGH => 2.1,
+        :CORRECT      => 1.278,
+        :EXCURSE_LOW  => 3.292,
+        :EXCURSE_MID  => 3.368,
+        :EXCURSE_HIGH => 5.378,
     )
 
     # -- solver --------------------------------------------------------------
