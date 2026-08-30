@@ -110,34 +110,41 @@ over 30 days from the 31 km IC (`Xoshiro(0)`, `cr3bp_j2_eom!` truth):
 
 The pinned column is bit-identical whatever is commanded — it ignores the command entirely.
 
-⚠️ **THE ACHIEVED ALTITUDE RUNS ~6 km HIGH.** Command 30 km and the loop settles at ~36 km.
+⚠️ **THE ACHIEVED ALTITUDE RUNS ~6 km HIGH.** Command 40 km and the loop settles at ~46.1 km.
 The bias is +6.19 km at the nominal 31 km and decreases slowly to +5.75 km at 120 km.
 
-What it is NOT (both measured 2026-08-29, both wrong guesses made first):
+**It is the ~8 km single-impulse `:position` residual floor** — the same one `docs/todo.md`
+records, and NOT the truth/onboard model gap. Measured per pass, settled (target 40.000 km):
 
-  * NOT a knob-count limit. With a genuine family member as the reference the residual at the
-    reference IC is **0.000000 km** and `cond(J) = 31` with three healthy singular values — the
-    six `:position` constraints ARE mutually compatible and an exact solution exists. "6
-    constraints vs 3 controls, so ~6 km is structural" is FALSE once the reference is a real
-    orbit rather than a scaled vector.
-  * NOT a targeting error. `retarget_to_altitude` hits a commanded altitude to <0.0003 km, and
-    the bias is present at the nominal orbit where nothing is retargeted at all.
+| quantity | value |
+|---|---|
+| onboard PREDICTED next periapsis | 46.2552 km |
+| truth ACHIEVED next periapsis | **46.0977 km** |
+| prediction error | **0.16 km** |
+| `solve_burn` residual, converged | **7.99 km** |
 
-What it IS: a **proportional-only steady-state offset**. This controller re-solves an
-open-loop targeting problem each pass against a FIXED reference and has no integral action, so
-a persistent disturbance leaves a persistent offset. The disturbance is the truth/onboard model
-gap — the same state's next periapsis altitude is 30.9753 km under the onboard CR3BP but
-**31.2323 km** under the truth CR3BP+J2, i.e. **+0.257 km per revolution** — and the miss is
-radial-dominated (6.205 km radial vs 2.815 km transverse), which is what a radial perturbation
-produces. Note ~0.26 km/rev of disturbance producing a ~6 km offset is roughly **24x
-amplification**, so the loop gain is low; how much of the 6 km is under-correction (`damp`, one
-burn per pass) versus irreducible has NOT been measured.
+The truth model tracks the onboard prediction to 0.16 km, so J2 is not doing this. The
+controller is **deliberately and stably aiming 6.26 km high**: at the drifted operating point
+the six `:position` constraints are not simultaneously satisfiable by one impulse, so
+least-squares splits ~8 km of unavoidable error and ~6.2 km of it lands on periapsis radius.
+
+Invariant under gain and horizon, which is the signature of a converged optimum rather than
+under-correction: bias is **6.098 km for every `damp` in 0.4–1.0** and for every
+`n_revs` in 1/2/3/5 (identical to three decimals, same ΔV, same pass count).
+
+⚠️ **A measurement trap to avoid.** At the reference IC the residual is 0.000000 km and
+`cond(J) = 31`, which looks like "an exact solution exists, so the constraint count is not the
+problem". That is measured where the spacecraft is already perfectly on the orbit and says
+nothing about the drifted case. Measure at a drifted shell state instead.
+
+The lever is therefore CONTROL AUTHORITY or CADENCE, not tuning: `docs/todo.md` candidate C
+(two impulses, 6 controls vs 6 constraints) reached 0.294 km where one impulse reached 49 km.
 
 ⚠️ Do NOT "fix" this by pre-shifting the commanded altitude (command 24 to get 30). It works
-numerically — measured, a two-iteration fixed point converges to <=0.007 km — but it fights any
+numerically — a two-iteration fixed point converges to <=0.007 km — but it fights any
 controller that also reasons about altitude, and it pushes the COMMANDED value ~6 km below the
-wanted one, so a 20 km target demands a ~14 km reference that the family does not contain. That
-manufactures a fake altitude floor. Fix the loop, not the setpoint. See `docs/todo.md`.
+wanted one, so a 20 km target demands a ~14 km reference the family does not contain, which
+manufactures a fake altitude floor.
 
 ⚠️ **A transfer ceiling exists near 148 km commanded from the 31 km IC**, and it is a limit on
 TRANSFER authority, not on the orbit: 150 km escapes at 2.84 d when transferred from 31 km but
@@ -612,7 +619,9 @@ function simulate(
     # therefore reports a large deviation even when the hold is perfect: measured, a
     # rock-steady 75.86 km hold reports `true_dev_km = 48.10 km` and bins as DRIFT on every
     # pass, so a belief filter fed this signal is permanently convinced it is off-course
-    # while the vehicle does exactly what it was commanded.
+    # while the vehicle does exactly what it was commanded. (Distinct from the ~6 km
+    # periapsis bias, which is the single-impulse `:position` residual floor — see
+    # `MPCController`. These are two different problems and were conflated once already.)
     #
     # Deliberately NOT fixed here. `dev_of` is defined once, outside the controllers, so the
     # POMDP and MPC report the identical quantity and the comparison stays apples-to-apples;
