@@ -160,7 +160,7 @@ export
     SARSOPController,
     controller_type,
     load_policy,
-    simulate,
+    run_rollout,
     summarize_rollouts,
     # calibration — measure the kernels rather than transcribe them
     CalibrationRow,

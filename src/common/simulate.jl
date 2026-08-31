@@ -624,10 +624,17 @@ end
 
 # ── The rollout ───────────────────────────────────────────────────────────────
 """
-    simulate(controller, state0, truth_eom!, period_s, horizon_s; kwargs...) -> NamedTuple
+    run_rollout(controller, state0, truth_eom!, period_s, horizon_s; kwargs...) -> NamedTuple
 
 Roll `controller` out against a TRUTH model over `horizon_s` seconds. One decision per
 periapsis approach, triggered at the descending `CONTROL_ALT_KM` shell.
+
+⚠️ RENAMED FROM `simulate` (2026-08-31). `POMDPs.simulate` exists, and a consumer doing
+`using POMDPs` alongside `using SherpaOrbital` got an ambiguity error on every call — which
+is exactly how this package is consumed (ClusterPolicyGen). The two are different things and
+should not share a name: this flies the CR3BP TRUTH model with real burns (~10 s per 30-day
+rollout), while `POMDPs.simulate` rolls the abstract discrete POMDP. `simulate` is kept as a
+deprecated alias so the exploratory scripts in `scratch/` keep running.
 
   - `controller` — an [`AbstractController`](@ref): [`MPCController`](@ref) or
     [`SARSOPController`](@ref). This is the `type` switch: the world below is identical.
@@ -676,7 +683,7 @@ no per-baseline special-casing:
     radius cannot see, and it is where most of the `:position` residual lives.
   - `steps` — per-step trace records
 """
-function simulate(
+function run_rollout(
     controller::AbstractController,
     state0::AbstractVector{<:Real},
     truth_eom!,
@@ -945,3 +952,14 @@ function summarize_rollouts(results::AbstractVector)
         failed_solve_rate  = tot_solves == 0 ? NaN : tot_failed / tot_solves,
     )
 end
+
+"""
+    simulate(args...; kwargs...)
+
+Deprecated alias for [`run_rollout`](@ref). Renamed 2026-08-31 because `POMDPs.simulate`
+exists and the collision breaks any consumer doing `using POMDPs` alongside
+`using SherpaOrbital`. NOT exported — kept so the exploratory scripts in `scratch/` still
+run. Use `run_rollout` in new code.
+"""
+simulate(args...; kwargs...) = run_rollout(args...; kwargs...)
+
