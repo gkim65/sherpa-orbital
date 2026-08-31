@@ -27,15 +27,18 @@ docs/
 .DS_Store
 
 # ── Artifacts ─────────────────────────────────────────────────────────────────
-# artifacts/tables.json IS committed: it is the MEASURED input (2.9 KB), the provenance
+# artifacts/tables.json IS committed: it is the MEASURED input (~3 KB), the provenance
 # record for the model, and reviewing a diff in it is how a re-measurement gets noticed.
 #
-# artifacts/policy.json is NOT committed. It is a build product, fully reproducible from
-# tables.json + the config via `julia --project=experiments experiments/example.jl`, and it
-# is large: the exported T is 627x4x627 floats, so the file is ~21 MB pretty-printed. Git
-# keeps every version forever and a re-solve changes almost every line, so committing it
-# would add ~21 MB of unreclaimable history per solve.
+# Solved policies are NOT committed. They are build products, fully reproducible from
+# tables.json + the config via `julia --project=experiments experiments/example.jl`, and
+# they are large: the exported T is |S|x|A|x|S| floats, so a file is ~21 MB pretty-printed.
+# Git keeps every version forever and a re-solve changes almost every line, so committing
+# them would add ~21 MB of unreclaimable history per solve. The second pattern covers the
+# theta-keyed names `theta_path` writes during a sweep (policy_plume_gradient=4.0.json).
 artifacts/policy.json
+artifacts/policy_*
+
 # Claude Code project instructions (local only)
 CLAUDE.md
 claude.md

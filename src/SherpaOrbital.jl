@@ -161,6 +161,7 @@ export
     controller_type,
     load_policy,
     run_rollout,
+    discounted_return,
     summarize_rollouts,
     # calibration — measure the kernels rather than transcribe them
     CalibrationRow,

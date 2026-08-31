@@ -954,6 +954,87 @@ function summarize_rollouts(results::AbstractVector)
 end
 
 """
+    discounted_return(result, pomdp; gamma = pomdp.discount) -> Float64
+
+The discounted return `Σ γᵗ r(sₜ, aₜ)` of a [`run_rollout`](@ref) result, scored under
+`pomdp`'s reward function.
+
+**This is the quantity offline-policy-reuse regret is defined on**
+(`R_ij = V^{π_i}_{θ_i}(b₀) − V^{π_j}_{θ_i}(b₀)`, where `V^π_θ(b₀) = E[Σ γᵗ R(sₜ,aₜ)]`).
+`run_rollout` otherwise reports survival, ΔV, band visits and achieved altitudes — none of
+which is a return — so an evaluator comparing policies across environments needs this.
+
+Post-hoc over `result.steps` rather than accumulated inside the rollout, deliberately: the
+reward belongs to a POMDP (a `θ`), the trajectory belongs to the physics, and the same
+trajectory is legitimately scored under several `θ` when filling a regret matrix. Folding the
+reward into the rollout would tie one trajectory to one reward and make the off-diagonal
+entries impossible without re-flying.
+
+⚠️ THIS IS THE TRUTH-MODEL RETURN, NOT THE DISCRETE-MODEL ONE. `POMDPs.simulate` with a
+`RolloutSimulator` samples states from `T` and is milliseconds; this scores states the CR3BP
+dynamics actually produced (~10 s per 30-day rollout). Both are valid, they are NOT
+interchangeable, and a regret matrix must be built from one or the other throughout.
+
+⚠️ INTENSITY IS DRAWN FROM `T`, NOT MEASURED. The state is
+`(altitude bin, visit counts, plume intensity)`, and the physics produces the first two but
+has no notion of plume intensity — that is the environment parameter `plume_gradient` acts
+on. So the intensity term enters exactly as it does in the model: through the reward's
+expectation over `T`, which `reward_function` already computes. The reward is therefore
+evaluated at `(alt_bin, visits)` with intensity marginalised, and NOT sampled separately.
+Sampling it here AND using the `T`-expectation reward would count science twice.
+
+`r(s,a)` is charged at the state the decision was made FROM, matching the `r(sₜ, aₜ)`
+convention and the kernel's own accounting (`calibrate.jl` charges a lost apse pair to the
+bin the decision was made in, not the bin the vehicle fled to). A terminal step contributes
+the mission-loss cost through the same reward, since the reward already carries it as an
+expectation over `T`; `t` still advances so the discount is right.
+"""
+function discounted_return(result, pomdp::StationkeepingPOMDP;
+                           gamma::Real = pomdp.discount)
+    T, _ = model_tables(pomdp)
+    r    = reward_function(pomdp, T)
+    idx  = state_index(pomdp)
+
+    total = 0.0
+    visits = _zero_visits(pomdp)          # the run starts with nothing banked
+    alt = :A34_44                         # the limit cycle the rollout is initialised on
+
+    for (t, step) in enumerate(result.steps)
+        s = SKState(alt, visits)
+        # A state the model does not enumerate cannot be scored; skip rather than guess.
+        haskey(idx, s) || break
+        total += gamma^(t - 1) * r(s, Symbol(step.action))
+
+        # Advance to where the pass actually landed. Prefer the controller's own OBSERVED
+        # bin when it recorded one, so the scoring bins exactly as the policy did; fall
+        # back to binning the achieved altitude, because `MPCController` records an EMPTY
+        # `extra` (only `SARSOPController` observes) and the baseline must still be
+        # scoreable — comparing a POMDP policy against MPC is the point.
+        nxt = if hasproperty(step.extra, :obs_bin)
+            Symbol(step.extra.obs_bin)
+        elseif isfinite(step.peri_alt_km)
+            alt_bin(pomdp, step.peri_alt_km)
+        else
+            :LOST
+        end
+        isterminal_alt(nxt) && break      # cost already charged above
+
+        # Visit counts likewise: use the controller's if present, else bank from the bin
+        # the pass landed in, saturating at the cap exactly as `transition.jl` does.
+        visits = if hasproperty(step.extra, :visits)
+            # `SARSOPController` stores visits as a Vector; `SKState` needs an NTuple.
+            v = step.extra.visits
+            v isa Tuple ? v : ntuple(i -> Int(v[i]), n_bands(pomdp))
+        else
+            b = band_of_alt(pomdp, step.peri_alt_km)
+            b === nothing ? visits : visit_inc(visits, b, pomdp.visit_cap)
+        end
+        alt = nxt
+    end
+    return total
+end
+
+"""
     simulate(args...; kwargs...)
 
 Deprecated alias for [`run_rollout`](@ref). Renamed 2026-08-31 because `POMDPs.simulate`
