@@ -1,5 +1,5 @@
 """
-transition.jl — T[s, a, s'] over the factored (alt, visits) state.
+transition.jl — T[s, a, s'] over the factored (alt, visits, intensity, residual) state.
 
 `alt` evolves by the measured kernel for the chosen action. `visits` increments the band
 containing the SUCCESSOR altitude bin, but only if the pass did not go terminal: you bank
@@ -36,35 +36,52 @@ function transition_matrix(pomdp::StationkeepingPOMDP, tables::AltTables)
             continue
         end
         for (ai, a) in enumerate(A)
-            k = alt_kernel(tables, a, s.alt)
-            for (di, an) in enumerate(ALT_ALL)
+            # ⚠️ CONDITIONED ON THE RESIDUAL TOO (2026-08-31). The row is selected by
+            # BOTH where the vehicle is and how degraded its orbit is, which is the whole
+            # point of the dimension: keyed on altitude alone, the row is an average of a
+            # fresh departure and a degraded one and reports P(loss) = 0.0 for the
+            # transition that actually kills the vehicle.
+            k = alt_kernel(tables, a, s.alt, s.residual)
+            # The kernel's columns are the JOINT successor (alt, residual).
+            for (di, (an, rn)) in enumerate(kernel_columns())
                 p = k[di]
                 p == 0.0 && continue
                 if isterminal_alt(an)
-                    T[si, ai, sidx[SKState(an, zero_v, 1)]] += p
+                    T[si, ai, sidx[SKState(an, zero_v, 1, :R_OK)]] += p
                     continue
                 end
-                # Survived → bank the band this pass actually landed in, if any.
+                # Survived → bank the band this pass landed in, if it landed in one.
+                #
+                # ⚠️ VISIT COUNTING IS STILL PER SCIENCE BAND (3 slots), but SAMPLING IS NOT
+                # (2026-08-31). These were conflated: a pass outside every band used to bank
+                # nothing AND record no sample. Coverage is a per-band objective, so the
+                # counter stays 3-wide — widening it to all 5 bins would take the visit
+                # tuple from 5^3 = 125 combinations to 5^5 = 3125 and |S| from 5627 to
+                # 140627, for a coverage question nobody asked.
                 b = findfirst(==(an), pomdp.band_bins)
                 v = b === nothing ? s.visits :
                     visit_inc(s.visits, b, pomdp.visit_cap)
-                if b === nothing
-                    # Outside every science band: nothing was sampled, so the intensity
-                    # slot takes its canonical "no sample" value rather than a draw. Keeping
-                    # it deterministic here is what stops |S| inflating with states that
-                    # record an intensity for a pass that measured nothing.
-                    T[si, ai, sidx[SKState(an, v, 1)]] += p
-                else
-                    # ⚠️ THE GRADIENT ENTERS HERE, AND ONLY HERE. The pass landed in band b,
-                    # so the intensity it yielded is drawn from P_θ(i | b) — this is the
-                    # single point at which `plume_gradient` touches the model. The reward
-                    # then pays for the REALIZED level (see `rewards.jl`), so a θ that
-                    # tilts deep bands high genuinely makes them worth more.
-                    pi_dist = plume_intensity_dist(pomdp, b)
-                    for (lvl, pl) in enumerate(pi_dist)
-                        pl == 0.0 && continue
-                        T[si, ai, sidx[SKState(an, v, lvl)]] += p * pl
-                    end
+
+                # ⚠️ THE GRADIENT ENTERS HERE, AND ONLY HERE, FOR EVERY ALTITUDE. The pass
+                # landed in bin `an`, so the intensity it yielded is drawn from
+                # P_θ(i | an) — the single point at which `plume_gradient` touches the
+                # model. The reward then pays for the REALIZED level (see `rewards.jl`), so
+                # a θ that tilts deep bins high genuinely makes them worth more.
+                #
+                # ⚠️ EVERY BIN DRAWS, INCLUDING THE NON-SCIENCE ONES. Non-band successors
+                # used to be pinned to the canonical "no sample" level 1, which — together
+                # with `plume_intensity_value(1) = 0.0` — meant a `CORRECT` pass at the
+                # ~37 km limit cycle earned exactly zero science no matter how the reward
+                # was tuned. Sampling in the mission concept is PASSIVE (you collect by
+                # flying THROUGH the plume region), so every pass yields something and every
+                # bin needs its own distribution. `plume_band_depth` is defined over all of
+                # `ALT_BINS` for exactly this reason.
+                #
+                # |S| is UNCHANGED: the intensity dimension already existed and was already
+                # enumerated for every altitude bin — those states were simply unreachable.
+                for (lvl, pl) in enumerate(plume_intensity_dist(pomdp, an))
+                    pl == 0.0 && continue
+                    T[si, ai, sidx[SKState(an, v, lvl, rn)]] += p * pl
                 end
             end
         end

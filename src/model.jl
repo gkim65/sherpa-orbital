@@ -41,10 +41,15 @@ function build_pomdp(config::StationkeepingPOMDP = StationkeepingPOMDP();
         isterminal    = s -> isterminal_state(s),
 
         # Start on the nominal orbit, no science banked yet. Nominal periapsis is
-        # 30.98 km, so the initial altitude bin is `correct_bin` (A30_40) — NOT a
+        # 30.98 km, so the initial altitude bin is `correct_bin` (A34_44) — NOT a
         # separate "on target" state, since altitude is now the state variable.
+        #
+        # Residual starts at `:R_OK`: the vehicle begins ON the reference orbit, where the
+        # onboard solve is clean (measured 0.53 km on pass 1 of the sustained CORRECT loop,
+        # settling to the healthy ~8 km floor). Starting anywhere else would presume damage
+        # the mission has not yet accumulated.
         initialstate  = Deterministic(
-            SKState(config.correct_bin, _zero_visits(config))),
+            SKState(config.correct_bin, _zero_visits(config), 1, :R_OK)),
 
         transition    = (s, a)  -> SparseCat(S, T[sidx[s], aidx[a], :]),
 

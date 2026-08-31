@@ -166,6 +166,7 @@ export
     # calibration — measure the kernels rather than transcribe them
     CalibrationRow,
     calibrate_tables,
+    TREE_DEPTH,
     tables_from_rows,
     MIN_TRIALS_TRUSTED,
     CALIBRATION_EFFORT,
@@ -183,6 +184,12 @@ export
     isterminal_state,
     alt_bin,
     band_of_alt,
+    # residual / orbit-damage dimension — the measured conditioning that makes the
+    # killing transition visible (added 2026-08-31)
+    RESIDUAL_BINS,
+    RESIDUAL_EDGES,
+    residual_bin,
+    residual_index,
     visit_inc,
     visit_total,
     visit_tuples,
@@ -196,6 +203,11 @@ export
     plume_levels_range,
     # measured tables
     AltTables,
+    KernelKey,
+    kernel_keys_all,
+    kernel_columns,
+    kernel_entry_index,
+    N_KERNEL_COLS,
     load_tables,
     write_tables,
     validate_tables,

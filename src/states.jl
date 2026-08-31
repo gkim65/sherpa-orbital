@@ -1,5 +1,5 @@
 """
-states.jl — the factored (alt, visits) state space.
+states.jl — the factored (alt, visits, intensity, residual) state space.
 
 `alt` is the achieved periapsis-ALTITUDE bin; `visits` counts how many times each science
 band has been sampled. Both the live altitude bins and the two terminal outcomes live in
@@ -38,6 +38,73 @@ const ALT_ALL = (ALT_BINS..., TERMINAL_ALT...)
 
 """isterminal_alt(a) -> Bool. Is this an absorbing outcome?"""
 isterminal_alt(a::Symbol) = a in TERMINAL_ALT
+
+# ── Residual (orbit-damage) bins ──────────────────────────────────────────────
+"""
+Residual/damage bins, in ascending order of degradation.
+
+`residual_km` is the onboard `solve_burn` residual on the pass just flown: how badly the
+six `:position` (or `:altitude_position`) constraints failed to be simultaneously
+satisfiable by one impulse. It is the model's ORBIT-DAMAGE variable.
+
+⚠️ WHY THIS DIMENSION EXISTS (added 2026-08-31). Without it the state is
+`(alt, visits, intensity)` and the measured kernel reports `P(loss) = 0.0` for the
+transition that actually kills the vehicle — correctly, for a FRESH excursion. The danger
+is conditional on accumulated damage, which the old state could not represent, so the
+policy could not learn that a LOW excursion needs TWO corrections before the next one.
+No amount of extra calibration fixes that (more trials just average "fresh" and "degraded"
+into one number), and raising `r_crashed`/`r_lost` does not either — they multiply
+P(loss), and anything × 0.0 is 0.0.
+"""
+const RESIDUAL_BINS = (:R_OK, :R_DEGRADED, :R_CRITICAL)
+
+"""
+Residual bin edges (km), half-open [lo, hi).
+
+⚠️ MEASURED, NOT GUESSED (2026-08-31). Derived from 3671 pooled pass-to-pass transitions
+across 17 action patterns × 3 seeds × {noise-free, noisy thruster}, scoring each transition
+by whether the NEXT pass lost the apse pair (non-finite residual / ΔV = 0, i.e. the
+uncontrolled pass that loses the vehicle):
+
+  | residual bin      |    n | n lost | P(lose apse pair next pass) |
+  |-------------------|------|--------|-----------------------------|
+  | `R_OK`       < 15 | 2363 |      0 |                       0.000 |
+  | `R_DEGRADED` 15-25 |  661 |      6 |                       0.009 |
+  | `R_CRITICAL` >= 25 |  647 |     40 |                       0.062 |
+
+The load-bearing property is the HARD ZERO on `R_OK`: 0 losses in 2363 transitions. That
+is what lets the policy distinguish a safe excursion from a dangerous one, which is
+precisely the distinction the un-binned state could not express.
+
+⚠️ THESE ARE NOT THE HANDOFF'S PROPOSED EDGES, and the difference is a real finding. The
+prior reading was "~15-25 km = degraded, > ~30 km = one pass from losing the apse pair".
+Measurement says 15-25 is only 0.9% hazard and, more pointedly, the `LOW`/`CORRECT`
+pattern settles into a STABLE 23/17 km two-cycle that survives the full 30 days. A
+residual of 23 km is a sustainable limit cycle, not a near-death state. The genuine
+cliff is at 25 km.
+"""
+const RESIDUAL_EDGES = (15.0, 25.0)
+
+"""
+    residual_bin(residual_km) -> Symbol
+
+Bin an onboard `solve_burn` residual (km) into a damage bin, half-open [lo, hi).
+
+A NON-FINITE residual is `:R_CRITICAL`: that is the lost-apse-pair case, where the onboard
+model found no apse pair to aim at, `solve_burn` returned ΔV = 0, and the pass flies
+UNCONTROLLED. It is the most degraded state the vehicle can be in and still be alive, so it
+belongs in the worst live bin rather than in a bin of its own — the LOSS it usually causes
+is already carried by the altitude variable's `:LOST` outcome on the following pass.
+"""
+function residual_bin(residual_km::Real)
+    isfinite(residual_km) || return :R_CRITICAL
+    residual_km < RESIDUAL_EDGES[1] && return :R_OK
+    residual_km < RESIDUAL_EDGES[2] && return :R_DEGRADED
+    return :R_CRITICAL
+end
+
+"""residual_index(r) -> Int. 1-based position of a residual bin in `RESIDUAL_BINS`."""
+residual_index(r::Symbol) = findfirst(==(r), RESIDUAL_BINS)
 
 # ── Visit counts ──────────────────────────────────────────────────────────────
 """
@@ -79,14 +146,38 @@ authorizes payment, not the intensity field alone.
 
 `intensity` defaults to 1 so every pre-intensity construction site (`plume_levels = 1`,
 tests, terminal states) keeps working unchanged.
+
+`residual ∈ RESIDUAL_BINS` is the ORBIT-DAMAGE bin of the pass just flown — how badly the
+onboard solver's constraints failed, binned by [`residual_bin`](@ref). Like `intensity` it
+is a property of the pass just flown, not of the vehicle.
+
+⚠️ RESIDUAL IS OBSERVED EXACTLY, AND THAT IS A DELIBERATE MODELLING CHOICE (2026-08-31).
+Altitude is observed through nav noise because a radius has to be MEASURED by a sensor.
+The residual does not: it is computed by the ONBOARD `solve_burn` from the onboard CR3BP
+model, on quantities the flight software already holds. The spacecraft genuinely knows it
+to machine precision, so modelling it as noisy would be inventing uncertainty that does
+not exist.
+
+The consequence is that the state now mixes a partially-observed dimension (altitude) with
+two exactly-observed ones (visits, residual). That is sound — it is the same structure the
+visit counts already have (see `observations.jl`) — but it does mean the residual
+dimension adds no INFERENCE problem, only a control-relevant distinction. It is carried
+through the observation channel by the same deterministic projection the visit counts use
+(`policy_reconcentrate_cov!`).
+
+`residual` defaults to `:R_OK` so every pre-residual construction site keeps working.
 """
 struct SKState{N}
     alt::Symbol
     visits::NTuple{N,Int}
     intensity::Int
+    residual::Symbol
 end
 
-SKState(alt::Symbol, visits::NTuple{N,Int}) where {N} = SKState(alt, visits, 1)
+SKState(alt::Symbol, visits::NTuple{N,Int}) where {N} =
+    SKState(alt, visits, 1, :R_OK)
+SKState(alt::Symbol, visits::NTuple{N,Int}, intensity::Int) where {N} =
+    SKState(alt, visits, intensity, :R_OK)
 
 """isterminal_state(s) -> Bool."""
 isterminal_state(s::SKState) = isterminal_alt(s.alt)
@@ -134,16 +225,17 @@ vectors.
 function states(pomdp::StationkeepingPOMDP)
     nb = n_bands(pomdp)
     S = SKState{nb}[]
-    # Intensity varies FASTEST, inside (alt, visits). Terminal states are appended last and
-    # carry intensity 1 only — a lost orbit measured nothing, so duplicating the two
-    # absorbing states across k levels would add unreachable states and k-1 spurious
-    # self-absorbing sinks.
-    for a in ALT_BINS, v in visit_tuples(pomdp), i in plume_levels_range(pomdp)
-        push!(S, SKState(a, v, i))
+    # Residual varies FASTEST, then intensity, inside (alt, visits). Terminal states are
+    # appended last and carry intensity 1 / residual :R_OK only — a lost orbit measured
+    # nothing and has no onboard solve, so duplicating the two absorbing states across the
+    # inner dimensions would add unreachable states and spurious self-absorbing sinks.
+    for a in ALT_BINS, v in visit_tuples(pomdp), i in plume_levels_range(pomdp),
+        r in RESIDUAL_BINS
+        push!(S, SKState(a, v, i, r))
     end
     zero_v = ntuple(_ -> 0, nb)
     for a in TERMINAL_ALT
-        push!(S, SKState(a, zero_v, 1))
+        push!(S, SKState(a, zero_v, 1, :R_OK))
     end
     return S
 end
@@ -153,14 +245,15 @@ state_index(pomdp::StationkeepingPOMDP) =
     Dict(s => i for (i, s) in enumerate(states(pomdp)))
 
 """
-n_states(pomdp) -> Int. |S| = 5 * (visit_cap + 1)^n_bands * plume_levels + 2.
+n_states(pomdp) -> Int.
+|S| = 5 * (visit_cap + 1)^n_bands * plume_levels * |RESIDUAL_BINS| + 2.
 
-⚠️ LINEAR in `plume_levels`, EXPONENTIAL in `n_bands`. At cap 4 / 3 bands: k=1 → 627,
-k=3 → 1877, k=5 → 3127.
+⚠️ LINEAR in `plume_levels` AND in `|RESIDUAL_BINS|`, EXPONENTIAL in `n_bands`. At cap 4 /
+3 bands / k=3: 1877 without the residual dimension, **5627** with it at 3 residual bins.
 """
 n_states(pomdp::StationkeepingPOMDP) =
-    length(ALT_BINS) * n_visit_combos(pomdp) * pomdp.plume_levels +
-    length(TERMINAL_ALT)
+    length(ALT_BINS) * n_visit_combos(pomdp) * pomdp.plume_levels *
+    length(RESIDUAL_BINS) + length(TERMINAL_ALT)
 
 # ── Binning ───────────────────────────────────────────────────────────────────
 """
@@ -232,10 +325,12 @@ end
 """
     state_label(s) -> String
 
-Serialization label `"ALT|v1-v2-v3|i"`, used in the exported policy JSON so a consumer can
-reconstruct `(alt, visits, intensity)` without knowing the enumeration order.
+Serialization label `"ALT|v1-v2-v3|i|RESIDUAL"`, used in the exported policy JSON so a
+consumer can reconstruct `(alt, visits, intensity, residual)` without knowing the
+enumeration order.
 """
-state_label(s::SKState) = "$(s.alt)|" * join(s.visits, "-") * "|" * string(s.intensity)
+state_label(s::SKState) = "$(s.alt)|" * join(s.visits, "-") * "|" *
+                          string(s.intensity) * "|" * string(s.residual)
 
 """visit_label(pomdp, visits) -> String. Human-readable coverage, e.g. "LOW×2+MID×1"."""
 function visit_label(pomdp::StationkeepingPOMDP, visits::NTuple{N,Int}) where {N}

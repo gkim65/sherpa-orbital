@@ -88,12 +88,19 @@ function export_policy(policy, config::StationkeepingPOMDP = StationkeepingPOMDP
         "states"          => state_label.(S),
         "state_alt"       => [string(s.alt) for s in S],
         "state_visits"    => [collect(s.visits) for s in S],
+        # The ORBIT-DAMAGE bin per state, and the edges that define it. A consumer needs
+        # both: the labels to project its belief onto the known-residual block (the
+        # residual is exactly observed — see `states.jl`), and the edges to bin its own
+        # live `solve_burn` residual the same way the model was calibrated.
+        "state_residual"  => [string(s.residual) for s in S],
+        "residual_bins"   => string.(collect(RESIDUAL_BINS)),
+        "residual_edges"  => collect(RESIDUAL_EDGES),
         "actions"         => string.(A),
         "observations"    => string.(Ω),
-        "terminal_states" => [state_label(SKState(:LOST, _zero_visits(config))),
-                              state_label(SKState(:CRASHED, _zero_visits(config)))],
+        "terminal_states" => [state_label(SKState(:LOST, _zero_visits(config), 1, :R_OK)),
+                              state_label(SKState(:CRASHED, _zero_visits(config), 1, :R_OK))],
         "initial_state"   => state_label(SKState(config.correct_bin,
-                                                 _zero_visits(config))),
+                                                 _zero_visits(config), 1, :R_OK)),
         "discount"        => config.discount,
         "alt_edges"       => collect(config.alt_edges),
         "band_names"      => string.(collect(config.band_names)),

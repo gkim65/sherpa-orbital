@@ -289,6 +289,11 @@ mutable struct SARSOPController <: AbstractController
     states::Vector{String}
     state_alt::Vector{String}
     state_visits::Vector{Vector{Int}}
+    # ORBIT-DAMAGE bin per state, plus the edges to bin a live residual the same way the
+    # model was calibrated. Exactly observed (the onboard solver computes it), so the belief
+    # is projected onto the matching block just as it is for the visit counts.
+    state_residual::Vector{String}
+    residual_edges::Vector{Float64}
     actions::Vector{String}
     observations::Vector{String}
     alt_edges::Vector{Float64}
@@ -309,6 +314,9 @@ mutable struct SARSOPController <: AbstractController
     # Live state.
     belief::Vector{Float64}
     visits::Vector{Int}
+    # The damage bin the LAST pass's onboard solve produced. Starts `:R_OK` — the vehicle
+    # begins on the reference orbit, where the solve is clean.
+    residual::String
     # PERSISTENT excursion reference: the band currently being aimed at, or "" for the
     # nominal orbit. This is what makes EXCURSE_* a multi-pass command rather than a
     # one-pass dip — see `controller_command`.
@@ -359,9 +367,20 @@ function SARSOPController(policy_data::AbstractDict;
     belief[findfirst(==(String(d["initial_state"])), S)] = 1.0
 
     band_names = String.(d["band_names"])
+
+    # The residual dimension is REQUIRED (2026-08-31). A policy artifact without it was
+    # solved against a state space that cannot represent orbit damage, so rolling it out
+    # here would silently index the wrong states. Reject rather than default, for the same
+    # reason `load_policy` rejects a stale action set.
+    haskey(d, "state_residual") || error(
+        "this policy artifact has no \"state_residual\" — it was solved against the " *
+        "PRE-2026-08-31 state space, which carries no orbit-damage dimension. Re-solve " *
+        "(experiments/calibrate.jl, then experiments/example.jl) rather than rolling it out.")
+
     return SARSOPController(
         S, String.(d["state_alt"]),
-        [Int.(v) for v in d["state_visits"]], A, Ω,
+        [Int.(v) for v in d["state_visits"]],
+        String.(d["state_residual"]), Float64.(d["residual_edges"]), A, Ω,
         Float64.(d["alt_edges"]), band_names,
         String.(d["band_bins"]), Int(d["visit_cap"]),
         Dict{String,Float64}(string(k) => Float64(v) for (k, v) in d["band_target_km"]),
@@ -369,9 +388,27 @@ function SARSOPController(policy_data::AbstractDict;
         ref_ic === nothing ? nothing : collect(float.(ref_ic)),
         float(sigma_nav_km),
         retarget_bands, family_table,
-        belief, zeros(Int, length(band_names)), "", nothing, nothing, NaN,
+        belief, zeros(Int, length(band_names)), "R_OK", "", nothing, nothing, NaN,
         Dict{String,Tuple{Vector{Float64},Vector{Float64}}}(),
     )
+end
+
+"""
+    policy_residual_bin(c, residual_km) -> String
+
+Bin a live onboard `solve_burn` residual (km) using the EXPORTED edges.
+
+⚠️ Must stay identical to [`residual_bin`](@ref) in `states.jl`. It reads the edges out of
+the policy artifact rather than the live config, so a policy solved against one damage
+discretization cannot be silently rolled out against another. A non-finite residual is the
+lost-apse-pair case and bins as the most degraded live bin — see `residual_bin`.
+"""
+function policy_residual_bin(c::SARSOPController, residual_km::Real)
+    e = c.residual_edges
+    isfinite(residual_km) || return "R_CRITICAL"
+    residual_km < e[1] && return "R_OK"
+    residual_km < e[2] && return "R_DEGRADED"
+    return "R_CRITICAL"
 end
 
 """
@@ -441,11 +478,17 @@ function policy_update_belief!(c::SARSOPController, action::String, obs::String)
 end
 
 """
-Re-concentrate the belief onto the known-`visits` block.
+Re-concentrate the belief onto the known-`visits` AND known-`residual` block.
 
 The visit counts are a DETERMINISTIC function of the observed altitude bin, so the
 controller always knows them exactly and belief mass on any other visit tuple is spurious.
 Terminal states are always kept. A no-op if masking would zero everything.
+
+⚠️ THE RESIDUAL IS PROJECTED THE SAME WAY, AND FOR A STRONGER REASON (2026-08-31). The
+visit counts are exactly known because they are derived from the observation; the residual
+is exactly known because the ONBOARD SOLVER COMPUTED IT — it is not measured through a
+sensor at all, so there is no noise to carry a belief over. Leaving mass on the other
+damage bins would model uncertainty the spacecraft does not have.
 
 ⚠️ WHY THIS IS STILL LICENSED after coverage moved onto achieved altitude. Gating on the
 TRUE altitude would make coverage stochastic and partially observed, breaking the exact
@@ -455,7 +498,8 @@ soundness but accuracy: a true 32 km pass read as 27 km banks LOW, and the belie
 confidently carries that wrong count. See `alt_bin` for the misbin rate.
 """
 function policy_reconcentrate_cov!(c::SARSOPController)
-    keep = [(c.state_alt[i] in ("LOST", "CRASHED") || c.state_visits[i] == c.visits) ?
+    keep = [(c.state_alt[i] in ("LOST", "CRASHED") ||
+             (c.state_visits[i] == c.visits && c.state_residual[i] == c.residual)) ?
             1.0 : 0.0 for i in eachindex(c.states)]
     masked = c.belief .* keep
     tot = sum(masked)
@@ -582,12 +626,18 @@ function controller_observe!(c::SARSOPController, peri_state::AbstractVector,
     bi = findfirst(==(obs_bin), c.band_bins)
     bi === nothing || (c.visits[bi] = min(c.visits[bi] + 1, c.visit_cap))
 
+    # ⚠️ UPDATE THE DAMAGE BIN BEFORE RE-CONCENTRATING (2026-08-31). The residual is what
+    # the onboard solver reported for the burn THIS pass just flew, so it is known exactly
+    # and becomes the conditioning the next decision is made under. `extra.residual_km`
+    # comes straight from `controller_command`'s `solve_burn` result.
+    c.residual = policy_residual_bin(c, get(extra, :residual_km, NaN))
+
     policy_update_belief!(c, String(label), obs_bin)
     policy_reconcentrate_cov!(c)
 
     return (true_bin = true_bin, obs_bin = obs_bin,
             true_alt_km = true_alt, obs_alt_km = obs_alt,
-            visits = copy(c.visits))
+            visits = copy(c.visits), residual = c.residual)
 end
 
 # ── Geometry helpers ──────────────────────────────────────────────────────────
@@ -998,9 +1048,10 @@ function discounted_return(result, pomdp::StationkeepingPOMDP;
     total = 0.0
     visits = _zero_visits(pomdp)          # the run starts with nothing banked
     alt = :A34_44                         # the limit cycle the rollout is initialised on
+    res = :R_OK                           # starts on the reference orbit: a clean solve
 
     for (t, step) in enumerate(result.steps)
-        s = SKState(alt, visits)
+        s = SKState(alt, visits, 1, res)
         # A state the model does not enumerate cannot be scored; skip rather than guess.
         haskey(idx, s) || break
         total += gamma^(t - 1) * r(s, Symbol(step.action))
@@ -1029,6 +1080,10 @@ function discounted_return(result, pomdp::StationkeepingPOMDP;
             b = band_of_alt(pomdp, step.peri_alt_km)
             b === nothing ? visits : visit_inc(visits, b, pomdp.visit_cap)
         end
+        # Advance the damage bin from the residual the onboard solve actually reported.
+        # Recorded on every step by both controllers, so this needs no controller-specific
+        # fallback the way the visit counts do.
+        res = residual_bin(step.residual_km)
         alt = nxt
     end
     return total
