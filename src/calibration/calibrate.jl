@@ -26,14 +26,23 @@ committed artifact becomes a machine-generated record with a reproducible proven
      the commanded altitude to ~0.05 km. The EXCURSE rows count a trial as
      non-converged on `peri_err_km`, the periapsis-altitude error alone.
 
-METHOD
-  CORRECT : run the sustained shell-cadence CORRECT loop and log alt_before → alt_after,
-            then seed one short loop per altitude bin from a real halo-family member there,
-            so the bins a working controller never visits are measured rather than invented.
-  EXCURSE : short walks toward a band's commanded altitude, RESTARTED from the seed every
-            `EXCURSE_PASSES_PER_RESTART` passes so each restart contributes a fresh
-            departure from the origin bin. Seeded from every (bin × band) pair for the same
-            reason as CORRECT. ONE KERNEL PER EXCURSE ACTION.
+METHOD — ONE WALKER, EVERY ACTION (unified 2026-08-31)
+  `action_walk!` flies short walks of a SINGLE action, RESTARTED from the seed every
+  `EXCURSE_PASSES_PER_RESTART` passes so each restart contributes a fresh departure from
+  the origin bin, and carries the residual (orbit damage) along the walk so later passes
+  are booked as degraded departures. Every action is measured this way — first from the
+  nominal limit cycle, then seeded from a real halo-family member in each altitude bin so
+  the bins a working controller never visits are measured rather than invented.
+
+  The only per-action differences are ARGUMENTS: `:position` + nominal apse vectors for
+  CORRECT, `:altitude_position` + a commanded altitude for each EXCURSE, and the matching
+  success test (`converged` vs `peri_err_km` — see caveat 4). ONE KERNEL PER ACTION.
+
+  ⚠️ CORRECT USED TO HAVE ITS OWN BESPOKE PATH — a sustained loop, written out inline
+  twice — and it only ever flew from PRISTINE states. So every `CORRECT` row at
+  `R_DEGRADED` / `R_CRITICAL` was n = 0, and the recovery behaviour the residual dimension
+  exists to model ("the first CORRECT does not clear the damage, the second does") was not
+  measured at all. Routing CORRECT through the shared walker is what fixed that.
             ⚠️ CHANGED 2026-08-31: the walk used to be carried forward across ALL trials,
             which made the trial count a WALK LENGTH. Because an accurate excursion settles
             after 1–2 passes, every later pass was recorded departing the DESTINATION bin
@@ -55,6 +64,21 @@ passes of each restart condition on drifted states. Prefer a row with sustained-
 it over one that is purely seeded. (Before 2026-08-31 the walker was never re-seeded at all,
 which avoided the bias but produced n = 1 origin rows — a worse failure.)
 
+⚠️ ROWS ARE CONDITIONED ON ORBIT DAMAGE AS OF 2026-08-31. A row's key is a
+[`KernelKey`](@ref) — the altitude bin AND the residual bin — and its columns are the JOINT
+successor `(alt, residual)`. Keyed on altitude alone, a row averages a FRESH departure with
+a departure from an already-degraded orbit, and the average reports P(loss) = 0.0 for the
+transition that actually loses the vehicle. That is not a calibration-effort problem (more
+trials just average harder) and it cannot be fixed by raising the loss penalties (they
+multiply P(loss), and anything × 0.0 is 0.0).
+
+⚠️ AND THE ROW COUNT TRIPLED, ON THE SAME TRIAL BUDGET. Five altitude rows became fifteen
+(alt × residual) rows per action. The trials are REDISTRIBUTED, not multiplied, so rows
+that previously cleared `MIN_TRIALS_TRUSTED` may not any more — and many (alt, residual)
+combinations are simply not reachable (the vehicle cannot be at 18 km with a pristine
+residual after a violent transfer). Check `meta.trials` and `meta.unmeasured_rows`; an
+unreachable row filled with a self-transition is not evidence about anything.
+
 ⚠️ TRUTH/ONBOARD SPLIT. `truth_eom!` is an argument and is integrated only in the coast
 helpers; all planning goes through `solve_burn` on the onboard CR3BP.
 """
@@ -66,7 +90,7 @@ One measured kernel row: the counts over `ALT_ALL`, the normalized probabilities
 diagnostics needed to judge whether the row is trustworthy.
 """
 struct CalibrationRow
-    counts::Vector{Int}          # over ALT_ALL
+    counts::Vector{Int}          # over kernel_columns() — the JOINT (alt, residual)
     probs::Vector{Float64}       # counts ./ n, or a fallback if n == 0
     n::Int
     n_nonconverged::Int          # solve_burn failures folded into this row
@@ -89,7 +113,159 @@ function _bin_rep_alt(bin::Symbol, e::NTuple{4,<:Real})
     return 46.0
 end
 
-"""Minimum trials before a measured row is considered anything but indicative."""
+"""
+    _bin_sample_alts(bin, e, n) -> Vector{Float64}
+
+`n` seeding altitudes (km) SPREAD ACROSS a bin, rather than one representative point.
+
+⚠️ WHY THE SPREAD EXISTS (2026-08-31). Seeding a bin at a single altitude measures one
+canonical orbit and reports it as the behaviour of the whole bin. But a bin is a RANGE: a
+20.5 km departure and a 26.5 km departure are both `A20_27` and do not behave the same. The
+kernel row is supposed to mean "I am somewhere in this cell", so the measurement should
+sample the cell, not a point in it.
+
+Interior points only — the endpoints are deliberately inset by 15% of the bin width so a
+sample never sits on a boundary where `alt_bin` could round it into the neighbour. The two
+open-ended bins keep their measured, holdable anchors (see [`_bin_rep_alt`](@ref)) and are
+spread over a narrow window around them rather than out into the region that escapes.
+"""
+function _bin_sample_alts(bin::Symbol, e::NTuple{4,<:Real}, n::Integer)
+    n <= 1 && return [_bin_rep_alt(bin, e)]
+    lo, hi = if bin === :BELOW_20
+        # Floor is the continued family's 17.565 km; stay just inside it.
+        (17.8, min(19.5, e[1] - 0.5))
+    elseif bin === :A20_27
+        (e[1], e[2])
+    elseif bin === :A27_34
+        (e[2], e[3])
+    elseif bin === :A34_44
+        (e[3], e[4])
+    else
+        # ABOVE_44 is open-ended but NOT holdable far above ~46 km (55 and 60 km escape by
+        # pass 3, measured 2026-08-30), so spread over a narrow survivable window.
+        (e[4] + 0.5, 48.0)
+    end
+    inset = 0.15 * (hi - lo)
+    a, b = lo + inset, hi - inset
+    return [a + (b - a) * (i - 1) / (n - 1) for i in 1:n]
+end
+
+"""
+    _disperse_state(state, rng; sigma_pos_km, sigma_vel_kms) -> Vector{Float64}
+
+Perturb a state by a small Gaussian dispersion in position and velocity.
+
+⚠️ **DO NOT USE THIS TO DISPERSE A CALIBRATION SEED — MEASURED AND REJECTED 2026-08-31.**
+The intent was to attack a real, documented bias (a seeded state is a freshly-placed
+PERIODIC family member, the most stable state in the system, so seeded rows understate
+divergence). It does not work, and the failure is not graceful.
+
+Dispersing the state AT PERIAPSIS breaks the ONBOARD APSE PREDICTION: `solve_burn` can no
+longer find the next apse pair, returns a non-finite residual and ΔV = 0, and the pass is
+booked as a loss. Measured from the 30.5 km family member, identical targets:
+
+  | departure    | residual | ΔV        |
+  |--------------|----------|-----------|
+  | undispersed  |   12.231 | 1.884 m/s |
+  | dispersed    |    **Inf** | **0.000** |
+
+So the kernel records SOLVER FAILURES as orbit deaths. The whole-run symptom was
+`CORRECT / A27_34 / R_OK` reading P(LOST) = 0.471 over n = 85 — physically absurd, since
+correcting from a healthy mid orbit is the safe baseline that holds 30 days.
+
+⚠️ AND THE OBVIOUS DIAGNOSIS IS WRONG, which is why this note is long. It is NOT that the
+perturbation destabilises the orbit: a dispersed CORRECT walk SURVIVES at every scale
+tried, up to 0.5 km / 0.5 m/s, holding the ~7.6 km residual floor. Nor is it the seed
+altitudes: every one of them holds its own orbit for 8 passes. The orbit is fine; the
+PLANNER is what the perturbation breaks. Shrinking the scale is not a fix, because the
+failure mode is a discontinuous loss of the apse pair rather than a gradual degradation.
+
+Reachability is measured instead by the ACTION TREE (see `tree_walk!`), which only ever
+visits states the vehicle can actually fly to, so no perturbation is needed.
+
+Retained because the dispersion itself is correct and may be useful elsewhere (e.g.
+injecting nav-scale uncertainty into a ROLLOUT, where no apse solve is pending).
+"""
+function _disperse_state(state::AbstractVector{<:Real}, rng::AbstractRNG;
+                         sigma_pos_km::Real = SEED_DISPERSION_POS_KM,
+                         sigma_vel_kms::Real = SEED_DISPERSION_VEL_KMS)
+    s = collect(float.(state))
+    s[1:3] .+= sigma_pos_km  .* randn(rng, 3)
+    s[4:6] .+= sigma_vel_kms .* randn(rng, 3)
+    return s
+end
+
+"""
+    _cell_rng(rng_seed, parts...) -> Xoshiro
+
+A per-cell RNG derived DETERMINISTICALLY from the measurement seed and the cell's identity
+(altitude bin, action, sample index, …).
+
+⚠️ WHY NOT ONE SHARED STREAM. With a single sequential RNG, the dispersion a given cell
+receives depends on how many draws every earlier cell happened to make — so adding a walk,
+reordering a loop, or short-circuiting on an escape silently changes the perturbation
+applied to unrelated cells, and the artifact stops being reproducible across code changes.
+Hashing the cell identity makes each cell's randomness independent of the others and of the
+iteration order: re-running gives bit-identical results, while different cells still get
+genuinely different perturbations.
+"""
+_cell_rng(rng_seed::Integer, parts...) =
+    Xoshiro(hash((rng_seed, parts...)))
+
+"""
+Samples per (altitude bin × action) seeding cell — how many DISPERSED departures to fly.
+
+⚠️ THIS IS WHAT MAKES A ROW A DISTRIBUTION RATHER THAN A REPLICATE. Noise-free, the truth
+integrator and the burn solver are both deterministic, so repeating a walk from the SAME
+seed reproduces it exactly: a row reading n = 48 was 16 identical restarts of a 3-pass walk,
+not 48 independent samples. Dispersing the departure state (position/velocity jitter) and
+spreading the seed altitude across the bin are what make the replicates genuinely differ, so
+`n` starts to mean sample size rather than repeat count.
+
+⚠️ IT DOES NOT MAKE THE DANGEROUS ROWS SAFER, and should not be expected to. A cell
+measured at P(LOST) = 1.00 over many DISPERSED samples is strong evidence; the point of
+sampling is that the number means something, not that it softens.
+"""
+const SEED_SAMPLES_PER_CELL = 3
+
+"""
+Depth of the exhaustive action-sequence tree (see `tree_walk!` inside `calibrate_tables`).
+
+Every action sequence of this length is flown from the nominal orbit, so the measurement
+covers the CROSS PRODUCT of actions rather than one action at a time. That is what reaches
+`(CORRECT, R_DEGRADED)` — a state CORRECT cannot produce for itself.
+
+Cost before pruning is `(|A|^(d+1) - |A|) / (|A| - 1)` passes; at |A| = 4:
+
+  | depth | passes | note                                   |
+  |-------|--------|----------------------------------------|
+  |     4 |    340 | thin                                   |
+  |     5 |   1364 | comparable to the pre-tree calibration  |
+  |     6 |   5460 | ~4x                                    |
+  |     7 |  21844 | ~16x                                   |
+
+Escaping branches prune their whole subtree, so the flown count runs well under these.
+Raising this is a ONE-NUMBER change. There is deliberately no resume/extend path: the tree
+is bottom-heavy (each level is ~|A| times the one before), so reusing a shallower tree can
+never save more than ~1/|A| of the work — the frontier, which is the bulk, always has to be
+flown. Threading is the speedup that actually pays; see `tree_walk!`.
+"""
+const TREE_DEPTH = 5
+
+"""1σ dispersion applied to a seed state's position (km) — nav-scale, see `_disperse_state`."""
+const SEED_DISPERSION_POS_KM = 0.5
+
+"""1σ dispersion applied to a seed state's velocity (km/s). ~0.5 m/s, a small fraction of a
+typical 1.3 m/s stationkeeping burn."""
+const SEED_DISPERSION_VEL_KMS = 5.0e-4
+
+"""Minimum trials before a measured row is considered anything but indicative.
+
+⚠️ READ THIS AS SAMPLE SIZE ONLY IF THE SAMPLES DIFFER. Noise-free with an undispersed seed
+the environment is deterministic, so `n` counts REPLICATES of one trajectory, not draws from
+a distribution — see [`SEED_SAMPLES_PER_CELL`](@ref). Check `meta.effort.seed_samples` before
+reading a trial count as statistical confidence.
+"""
 const MIN_TRIALS_TRUSTED = 20
 
 """
@@ -159,13 +335,21 @@ are recorded into `meta.effort` so an artifact says how hard it was measured, wh
 only way to tell a thin row that is thin BY CONFIGURATION from one thin because the walk
 settled.
 
-  - `n_steps`             — sustained CORRECT-loop steps to log.
+  - `n_steps`             — CORRECT passes to fly from the nominal limit cycle.
+                            ⚠️ Was the length of ONE sustained loop; since the 2026-08-31
+                            walker unification it is a total pass budget spread over
+                            restarts, exactly like `excurse_trials`.
   - `horizon_s`           — wall-clock cap on the sustained loop (s).
   - `excurse_trials`      — steps per primary excursion walk.
   - `seed_trials`         — CORRECT trials per seeded altitude bin.
   - `excurse_seed_trials` — EXCURSE trials per (bin × band) seed.
   - `seed_bins`           — seed the bins a working controller never visits at all.
-  - `rng_seed`            — reproducibility seed.
+  - `seed_samples`        — DISPERSED departures per (bin × action) cell. The cell's trial
+                            budget is split across them, so this trades replicates for
+                            genuine spread rather than costing more.
+  - `rng_seed`            — reproducibility seed. Mixed with each cell's identity by
+                            [`_cell_rng`](@ref), so a cell's dispersion does not depend on
+                            iteration order and a re-run is bit-identical.
 
 ⚠️ `excurse_trials`/`excurse_seed_trials` were RAISED 8 → 24 on 2026-08-30 when the EXCURSE
 kernel became per-action (splitting one pooled row three ways divides the trials). That did
@@ -181,6 +365,11 @@ const CALIBRATION_EFFORT = (
     seed_trials         = 8,
     excurse_seed_trials = 48,
     seed_bins           = true,
+    # Seed altitudes sampled across each bin. The per-cell trial budget is DIVIDED across
+    # these, not multiplied — see `SEED_SAMPLES_PER_CELL`.
+    seed_samples        = SEED_SAMPLES_PER_CELL,
+    # Exhaustive action-tree depth — the main coverage mechanism. See `TREE_DEPTH`.
+    tree_depth          = TREE_DEPTH,
     rng_seed            = 0,
 )
 
@@ -239,6 +428,8 @@ function calibrate_tables(config::StationkeepingPOMDP;
                           seed_trials::Integer = CALIBRATION_EFFORT.seed_trials,
                           excurse_seed_trials::Integer =
                               CALIBRATION_EFFORT.excurse_seed_trials,
+                          seed_samples::Integer = CALIBRATION_EFFORT.seed_samples,
+                          tree_depth::Integer = CALIBRATION_EFFORT.tree_depth,
                           seed_bins::Bool = CALIBRATION_EFFORT.seed_bins,
                           rng::AbstractRNG = Xoshiro(CALIBRATION_EFFORT.rng_seed),
                           kwargs...)
@@ -257,8 +448,11 @@ function calibrate_tables(config::StationkeepingPOMDP;
         excurse_trials      = excurse_trials,
         seed_trials         = seed_trials,
         excurse_seed_trials = excurse_seed_trials,
+        seed_samples        = seed_samples,
+        tree_depth          = tree_depth,
         seed_bins           = seed_bins,
         rng                 = rng,
+        rng_seed            = CALIBRATION_EFFORT.rng_seed,
         kwargs...)
 end
 
@@ -346,6 +540,17 @@ function calibrate_tables(;
     # EXCURSE seeding runs per (bin × band), so it multiplies out faster than the
     # CORRECT seeding and gets its own knob rather than sharing one.
     excurse_seed_trials::Integer = 8,
+    # Seed altitudes sampled across each bin (see `_bin_sample_alts`). The cell's trial
+    # budget is DIVIDED across them, so this buys spread rather than costing more.
+    seed_samples::Integer = SEED_SAMPLES_PER_CELL,
+    # Base seed, retained for reproducibility of any stochastic path (`noisy_thruster`).
+    rng_seed::Integer = 0,
+    # ── The action tree ───────────────────────────────────────────────────────
+    # Depth of the exhaustive action-sequence enumeration (see `tree_walk!`). 0 disables it.
+    # Cost is (|A|^(d+1) - |A|)/(|A| - 1) passes before pruning; at |A| = 4 that is 1364 at
+    # depth 5, 5460 at depth 6, 21844 at depth 7. Escapes prune whole subtrees, so the real
+    # count is well below those.
+    tree_depth::Integer = TREE_DEPTH,
     verbose::Bool = false,
 )
     ic = collect(float.(ic))
@@ -373,7 +578,12 @@ function calibrate_tables(;
     exec_dv(dv) = noisy_thruster ? apply_dv_noisy(dv, rng; thruster_kwargs...)[1] :
                                    apply_dv(dv)
 
-    nxt = collect(ALT_ALL)
+    # ⚠️ COLUMNS ARE THE JOINT (alt, residual) SUCCESSOR as of 2026-08-31, not the marginal
+    # altitude. A row now answers "given I am in this bin with this much orbit damage and
+    # take this action, where do I land AND how damaged am I then?" — the second half is
+    # what lets the policy learn that the first CORRECT after an excursion does not clear
+    # the damage and only the second one does.
+    cols = kernel_columns()
     # ⚠️ KEYED PER BAND AS OF 2026-08-30. This replaces ONE pooled EXCURSE kernel.
     #
     # The old keys were just `(:CORRECT, :EXCURSE)`, on the exp-12 finding that excursion
@@ -398,104 +608,81 @@ function calibrate_tables(;
     # each new row ~1/3 of the trials, so rows that previously cleared `MIN_TRIALS_TRUSTED`
     # may no longer. Raise `excurse_trials` / `excurse_seed_trials` to compensate and CHECK
     # `meta.trials` — a thin row is exactly what this file exists to make auditable.
-    kernel_keys = (:CORRECT, (Symbol("EXCURSE_", b) for b in band_names)...)
-    # counts[action][alt_from] -> Vector{Int} over ALT_ALL
-    counts = Dict(a => Dict(d => zeros(Int, length(nxt)) for d in ALT_BINS)
-                  for a in kernel_keys)
-    nonconv = Dict(a => Dict(d => 0 for d in ALT_BINS)
-                   for a in kernel_keys)
-    dvs = Dict(a => Dict(d => Float64[] for d in ALT_BINS)
-               for a in kernel_keys)
+    action_keys = (:CORRECT, (Symbol("EXCURSE_", b) for b in band_names)...)
+    # counts[action][KernelKey(alt_from, residual_from)] -> Vector{Int} over kernel_columns()
+    all_keys = kernel_keys_all()
+    counts = Dict(a => Dict(k => zeros(Int, N_KERNEL_COLS) for k in all_keys)
+                  for a in action_keys)
+    nonconv = Dict(a => Dict(k => 0 for k in all_keys)
+                   for a in action_keys)
+    dvs = Dict(a => Dict(k => Float64[] for k in all_keys)
+               for a in action_keys)
     # ΔV per band, for the action_dv_cost proxy.
     band_dv = Dict(b => Float64[] for b in band_names)
     band_achieved_alt = Dict(b => Float64[] for b in band_names)
 
-    bump!(a, from, to) = counts[a][from][findfirst(==(to), nxt)] += 1
+    """
+    Record one measured transition.
 
-    # ── CORRECT: the sustained shell-cadence loop ──────────────────────────────
-    # Get onto the orbit at a periapsis first, so step 1 starts in the same phase every
-    # later step does.
-    st, u = _to_peri(truth_eom!, ic, 4 * one_rev_s)
-    state = st === :ok ? copy(u) : copy(ic)
-    t = 0.0
-    nlogged = 0
+    `from` is the FULL conditioning (altitude bin AND residual bin) the pass departed
+    under; `to_alt` / `to_res` are the joint successor. A terminal successor carries
+    `:R_OK` by convention — a lost orbit ran no onboard solve, so it has no residual (see
+    `kernel_columns`).
+    """
+    bump!(a, from::KernelKey, to_alt::Symbol, to_res::Symbol = :R_OK) =
+        counts[a][from][kernel_entry_index(to_alt, to_res)] += 1
 
-    while t < horizon_s && nlogged < n_steps
-        from = bin_of(alt_of(state))
-        from in ALT_BINS || break
-
-        sh, sc = _to_shell(truth_eom!, state, horizon_s - t)
-        if sh !== :ok
-            bump!(:CORRECT, from, _terminal_dev(sh))
-            break
-        end
-
-        # CORRECT: the branch the loop actually takes.
-        b = solve_burn(sc, one_rev_s; eom! = cr3bp_eom!, mode = mode,
-                       r_peri_nom = r_peri_nom, r_apo_nom = r_apo_nom)
-        b.converged || (nonconv[:CORRECT][from] += 1)
-        push!(dvs[:CORRECT][from], b.dv_mag_ms)
-
-        # A lost apse pair is a LOSS charged to this bin — same reasoning as the EXCURSE
-        # walk below, where the full argument and the measurements live. ⚠️ Note this is NOT
-        # the same as `converged == false`: the ~8 km `:position` residual floor means a
-        # healthy CORRECT burn reports `converged = false` on almost every pass (57 of 58 in
-        # the sustained loop) while burning a real ~1.3 m/s. Only a NON-FINITE residual, or a
-        # literally zero ΔV, means the planner had nothing to aim at.
-        if !isfinite(b.residual_km) || b.dv_mag_ms == 0.0
-            bump!(:CORRECT, from, :LOST)
-            verbose && @printf("  step %3d  %-6s -> CORRECT NO APSE PAIR (ΔV=0) -> LOST\n",
-                               nlogged + 1, from)
-            break
-        end
-
-        spost = copy(sc)
-        spost[4:6] .+= exec_dv(b.dv)
-        pc, uc = _to_peri(truth_eom!, spost, 4 * one_rev_s)
-        bump!(:CORRECT, from, pc === :ok ? bin_of(alt_of(uc)) : _terminal_dev(pc))
-
-        verbose && @printf("  step %3d  %-6s -> CORRECT ΔV=%6.3f m/s %s  -> %s\n",
-                           nlogged + 1, from, b.dv_mag_ms,
-                           b.converged ? "  " : "NC",
-                           pc === :ok ? string(bin_of(alt_of(uc))) : string(_terminal_dev(pc)))
-
-        pc === :ok || break
-        state = copy(uc)
-        t += one_rev_s
-        nlogged += 1
-    end
-
-    # ── EXCURSE: one step of a PERSISTENT walk toward a band ───────────────────
-    # ⚠️ CHANGED 2026-08-30, twice, and both changes matter.
+    # ── ONE WALKER FOR EVERY ACTION ────────────────────────────────────────────
+    # ⚠️ UNIFIED 2026-08-31. CORRECT used to be measured by a bespoke sustained loop
+    # (written out inline TWICE — once here, once in the bin-seeding block) while the
+    # EXCURSE actions went through a factored `excurse_walk!`. The two paths had drifted
+    # into different restart policies, different seeding loops and different trial knobs.
     #
-    # (1) The outcome is where the EXCURSION lands. This previously coasted through a
-    #     recovery CORRECT and binned the state AFTER it, so every excursion recorded as
-    #     landing back on the nominal orbit — a 100% self-transition telling the policy that
-    #     excursions do nothing.
-    # (2) The reference PERSISTS across passes, matching `SARSOPController.active_band`.
-    #     An excursion is not a one-pass dip: single-impulse authority is only ~25%, so
-    #     reaching a commanded altitude takes several passes holding the same reference.
-    #     Each trial here is therefore ONE STEP of that walk, started from where the
-    #     previous step left off — which is exactly the transition the policy reasons about
-    #     when it decides whether to keep aiming.
+    # THAT ASYMMETRY CAUSED A SUBSTANTIVE BUG, not just duplication. `excurse_walk!` WALKS,
+    # so damage accumulates across its passes and it naturally produced degraded-departure
+    # rows. The CORRECT paths only ever flew from pristine states — a healthy limit cycle,
+    # or a freshly-placed family member — so EVERY `CORRECT` row at `R_DEGRADED` /
+    # `R_CRITICAL` came back n = 0. That is precisely the recovery behaviour the residual
+    # dimension exists to model ("the first CORRECT does not clear the damage, the second
+    # does"), and it was the one thing the measurement could not see. The file already
+    # warned that "a hand-copied second loop is how the two would silently diverge"; they
+    # diverged.
     #
-    # The kernel is measured from a REAL family member at the band altitude, because a
-    # persistent reference has to be an orbit the vehicle can settle onto. (A scaled
-    # waypoint is fine for a single dip and wrong for this; aiming ONE impulse at a family
-    # member escapes — see the phase note above. The difference is that here the same target
-    # is held for consecutive passes rather than jumped at once.)
+    # Now every action — CORRECT included — goes through `action_walk!`. The legitimate
+    # per-action differences survive as ARGUMENTS (targeting mode, aim point, success
+    # test), not as separate implementations.
     st0, u0 = _to_peri(truth_eom!, ic, 4 * one_rev_s)
     base = st0 === :ok ? copy(u0) : copy(ic)
 
-    # One persistent-reference walk, logged into the EXCURSE kernel. Factored out so the
-    # bin-seeded walks below run the IDENTICAL measurement as the primary ones — a
-    # hand-copied second loop is how the two would silently diverge.
-    function excurse_walk!(band, peri_tgt, ra, start_state, n_trials;
-                           passes_per_restart::Integer = EXCURSE_PASSES_PER_RESTART)
-        # The kernel this walk measures is the one for the ACTION that aims at `band`.
-        # ⚠️ Previously every walk bumped a single shared `:EXCURSE` key, which pooled the
-        # three bands' outcomes and discarded the aiming. See `kernel_keys` above.
-        akey = Symbol("EXCURSE_", band)
+    """
+        action_walk!(akey, start_state, n_trials; kwargs...)
+        action_walk!(pattern, start_state, n_trials; kwargs...)
+
+    Fly `n_trials` passes, restarting from `start_state` every `passes_per_restart`
+    passes, and log each pass into the kernel of whichever action flew it.
+
+    `akey` may be a single action (every pass flies it) or a PATTERN — a vector of actions
+    cycled over the walk. The pattern form is what measures an action departing from a
+    damage level that only ANOTHER action can produce; see `RECOVERY_PATTERNS`.
+
+    The residual is carried ALONG the walk and reset on restart: it is the state of the
+    ORBIT, not of the pass, so a transition is booked under the damage the PREVIOUS pass
+    left behind. A fresh departure from a seed is undamaged by construction; pass 2 or 3
+    of a walk departs under whatever the earlier passes accumulated. That conditioning is
+    the whole reason the walk restarts rather than running once and long.
+
+      - `mode_` / `peri_tgt` / `ra` / `rp` — the targeting. `:position` aims at nominal
+        apse POSITION vectors (`rp`, `ra`) and is what CORRECT means; `:altitude_position`
+        commands the periapsis ALTITUDE (`peri_tgt`) and keeps the apoapsis position
+        constraints, which is what an EXCURSE means.
+      - `band` — the science band an EXCURSE aims at, or `nothing` for CORRECT. Only used
+        to accumulate the per-band ΔV / achieved-altitude diagnostics.
+    """
+    function action_walk!(akey::Symbol, start_state, n_trials;
+                          mode_::Symbol, peri_tgt = nothing,
+                          ra = nothing, rp = nothing,
+                          band = nothing,
+                          passes_per_restart::Integer = EXCURSE_PASSES_PER_RESTART)
 
         # ⚠️ RESTARTS, NOT ONE LONG WALK (fixed 2026-08-31). `walker` used to be initialised
         # ONCE outside this loop and carried forward, so `n_trials` was a WALK LENGTH, not a
@@ -517,32 +704,59 @@ function calibrate_tables(;
         # corrupted the OBSERVE kernel. A few passes per restart sees whether the excursion
         # actually survives while still producing many departures.
         walker = copy(start_state)
+        # ⚠️ THE RESIDUAL IS CARRIED ALONG THE WALK and RESET on each restart, exactly like
+        # `walker` itself. It is the state of the ORBIT, so a fresh departure from the seed
+        # is by construction undamaged (`:R_OK`) while pass 2 or 3 of a walk departs under
+        # whatever damage the earlier passes accumulated. That is the conditioning the whole
+        # dimension exists to record — without it, both get booked to the same row and
+        # averaged, which is the defect being fixed.
+        res_from = :R_OK
         for t in 1:n_trials
             # Fresh departure at the start of each restart block.
-            t > 1 && (t - 1) % passes_per_restart == 0 && (walker = copy(start_state))
-
-            from = bin_of(alt_of(walker))
-            # Out of the live bins -> this restart is done; begin the next one.
-            if !(from in ALT_BINS)
+            if t > 1 && (t - 1) % passes_per_restart == 0
                 walker = copy(start_state)
+                res_from = :R_OK
+            end
+
+            from_alt = bin_of(alt_of(walker))
+            # Out of the live bins -> this restart is done; begin the next one.
+            if !(from_alt in ALT_BINS)
+                walker = copy(start_state)
+                res_from = :R_OK
                 continue
             end
+            from = KernelKey(from_alt, res_from)
 
             sh, sc = _to_shell(truth_eom!, walker, 4 * one_rev_s)
             if sh !== :ok
                 bump!(akey, from, _terminal_dev(sh))
                 walker = copy(start_state)   # terminal: restart, do not cancel the rest
+                res_from = :R_OK
                 continue
             end
 
-            b = solve_burn(sc, one_rev_s; eom! = cr3bp_eom!, mode = :altitude_position,
-                           peri_target_km = peri_tgt, r_apo_nom = ra)
+            # The ONE targeting difference between the actions, as an argument rather than
+            # a separate implementation. `:position` (CORRECT) aims at the nominal apse
+            # POSITION vectors; `:altitude_position` (EXCURSE) commands the periapsis
+            # ALTITUDE and keeps the apoapsis position constraints.
+            b = mode_ === :altitude_position ?
+                solve_burn(sc, one_rev_s; eom! = cr3bp_eom!, mode = :altitude_position,
+                           peri_target_km = peri_tgt, r_apo_nom = ra) :
+                solve_burn(sc, one_rev_s; eom! = cr3bp_eom!, mode = mode_,
+                           r_peri_nom = rp, r_apo_nom = ra)
+
+            # ⚠️ THE SUCCESS TEST DIFFERS BY MODE, and both are documented caveats.
             # In `:altitude_position` the total residual is dominated by the apoapsis
             # POSITION block and never clears `TARGET_TOL_KM` from a drifted state, so
-            # `converged` would flag every excursion as failed. The delivery question is
-            # whether the COMMANDED ALTITUDE was met, which is `peri_err_km`.
-            isfinite(b.peri_err_km) && b.peri_err_km < TARGET_TOL_KM ||
-                (nonconv[akey][from] += 1)
+            # `converged` would flag every excursion as failed; the delivery question is
+            # whether the COMMANDED ALTITUDE was met, which is `peri_err_km`. In
+            # `:position` there is no commanded altitude to check, and the ~8 km residual
+            # floor means `converged` reads false on almost every healthy pass — it is
+            # still the only signal available, so it is what gets counted.
+            ok_ = mode_ === :altitude_position ?
+                  (isfinite(b.peri_err_km) && b.peri_err_km < TARGET_TOL_KM) :
+                  b.converged
+            ok_ || (nonconv[akey][from] += 1)
 
             # ⚠️ A LOST APSE PAIR IS A LOSS, AND IT MUST BE CHARGED TO *THIS* BIN.
             #
@@ -567,12 +781,17 @@ function calibrate_tables(;
             if !isfinite(b.residual_km) || b.dv_mag_ms == 0.0
                 bump!(akey, from, :LOST)
                 push!(dvs[akey][from], 0.0)
-                push!(band_dv[band], 0.0)
-                verbose && @printf("  excurse %-4s step from %-8s NO APSE PAIR (ΔV=0) -> LOST\n",
-                                   band, from)
+                band === nothing || push!(band_dv[band], 0.0)
+                verbose && @printf("  %-13s from %-16s NO APSE PAIR (ΔV=0) -> LOST\n",
+                                   akey, string(from))
                 walker = copy(start_state)   # terminal: restart, do not cancel the rest
+                res_from = :R_OK
                 continue
             end
+
+            # The damage this pass leaves behind — the successor's residual bin, and the
+            # conditioning the NEXT pass of this walk is booked under.
+            res_to = residual_bin(b.residual_km)
 
             sp = copy(sc)
             sp[4:6] .+= exec_dv(b.dv)
@@ -580,22 +799,200 @@ function calibrate_tables(;
             if pe !== :ok
                 bump!(akey, from, _terminal_dev(pe))
                 push!(dvs[akey][from], b.dv_mag_ms)
-                push!(band_dv[band], b.dv_mag_ms)
+                band === nothing || push!(band_dv[band], b.dv_mag_ms)
                 walker = copy(start_state)   # terminal: restart, do not cancel the rest
+                res_from = :R_OK
                 continue
             end
 
-            bump!(akey, from, bin_of(alt_of(ue)))
+            bump!(akey, from, bin_of(alt_of(ue)), res_to)
             push!(dvs[akey][from], b.dv_mag_ms)
-            push!(band_dv[band], b.dv_mag_ms)
-            push!(band_achieved_alt[band], altitude(ue))
+            if band !== nothing
+                push!(band_dv[band], b.dv_mag_ms)
+                push!(band_achieved_alt[band], altitude(ue))
+            end
 
-            verbose && @printf("  excurse %-4s step from %-8s ΔV=%6.3f m/s -> alt %7.2f km (%s)\n",
-                               band, from, b.dv_mag_ms, altitude(ue), bin_of(alt_of(ue)))
+            verbose && @printf("  %-13s from %-16s ΔV=%6.3f m/s -> alt %7.2f km (%s/%s)\n",
+                               akey, string(from), b.dv_mag_ms, altitude(ue),
+                               bin_of(alt_of(ue)), res_to)
             walker = copy(ue)          # continue the walk from here
+            res_from = res_to
         end
         return nothing
     end
+
+    # ── THE ACTION TREE ────────────────────────────────────────────────────────
+    """
+        tree_walk!(root_state, max_depth; cache) -> nothing
+
+    Enumerate EVERY action sequence up to `max_depth` from `root_state`, booking each pass
+    as one kernel sample.
+
+    ⚠️ THIS IS THE COVERAGE MECHANISM (2026-08-31), and it replaces two failed attempts.
+    A kernel row is `P(s' | s, a)`, so every reachable `(s, a)` needs visiting — but the
+    single-action walks only ever fly ONE action per walk, which structurally cannot reach
+    a state that another action produces. That is why every `CORRECT` row at `R_DEGRADED` /
+    `R_CRITICAL` came back n = 0: CORRECT alone is a stable limit cycle at ~8 km residual
+    and never damages its own orbit, so it can only DEPART degraded if something else
+    degraded it first. The fix is not a longer walk or a bigger trial count; it is to fly
+    the CROSS PRODUCT of actions.
+
+    The two alternatives were tried and are worse:
+      * placing the vehicle at a target damage level — there is nothing to place. Damage is
+        a property of how far the orbit has drifted from what one impulse can fix, not a
+        location.
+      * perturbing a seed into a damaged state — breaks the onboard apse prediction and
+        books solver failures as deaths (see `_disperse_state`).
+
+    A tree needs neither: every node is a state the vehicle genuinely flew to, reached the
+    way it would actually reach it.
+
+    ⚠️ PARALLELISED BREADTH-FIRST, IN TWO PHASES PER LEVEL (2026-08-31). Each level's
+    passes are independent — they share only their (already-computed) parent states — so
+    they are flown with `@threads` and their outcomes collected into a per-pass result
+    vector. NOTHING is booked during the parallel phase; the counts are folded in serially
+    afterwards. That keeps `bump!`/`push!` off the threaded path entirely, so no locking is
+    needed and, more importantly, the ARTIFACT IS BIT-IDENTICAL to a serial run: booking
+    order is fixed by the level's node ordering, not by which thread finishes first.
+    Julia must be started with `-t auto` (or `JULIA_NUM_THREADS`) for this to use more than
+    one core; with one thread it degenerates to the serial walk.
+
+    ⚠️ PREFIX SHARING IS EXACT ONLY BECAUSE THE DYNAMICS ARE DETERMINISTIC. A node's state
+    is fully determined by its action prefix, so the 4 children of a node all branch from
+    ONE parent state and a depth-d tree costs `(4^(d+1) - 4)/3` passes rather than
+    `d * 4^d`. With `noisy_thruster = true` that no longer holds — each node would need
+    several sampled children — so the cost model and this caching are both noise-free
+    assumptions.
+
+    ⚠️ COVERAGE IS REACHABILITY-WEIGHTED, NOT UNIFORM. States the vehicle passes through
+    often get many samples; states reachable only at depth > `max_depth` get none, and
+    `BELOW_20` / `ABOVE_44` may never appear at all from the nominal orbit. That is why the
+    family-member seeding below is RETAINED — placement at an altitude is legitimate and
+    was never the part that failed.
+
+    Pre-resolved EXCURSE targets are passed in as `excurse_targets` so the family table is
+    not queried inside the threaded region.
+    """
+    function tree_walk!(root_state, max_depth::Integer, excurse_targets)
+        n_passes = 0
+        n_nodes  = 0
+
+        # `_fly_one` is PURE with respect to the accumulators: it integrates and solves,
+        # and RETURNS what happened. Nothing here touches `counts`/`dvs`/`nonconv`, which
+        # is what makes the threaded phase safe without locks.
+        function _fly_one(state, res_from::Symbol, a::Symbol)
+            from_alt = bin_of(alt_of(state))
+            from_alt in ALT_BINS ||
+                return (kind = :dead, from = nothing, a = a)
+            from = KernelKey(from_alt, res_from)
+
+            sh, sc = _to_shell(truth_eom!, state, 4 * one_rev_s)
+            sh === :ok ||
+                return (kind = :terminal, from = from, a = a, out = _terminal_dev(sh))
+
+            # Same per-action targeting split as `action_walk!`.
+            b = if a === :CORRECT
+                solve_burn(sc, one_rev_s; eom! = cr3bp_eom!, mode = mode,
+                           r_peri_nom = r_peri_nom, r_apo_nom = r_apo_nom)
+            else
+                tgt = get(excurse_targets, a, nothing)
+                tgt === nothing ? nothing :
+                    solve_burn(sc, one_rev_s; eom! = cr3bp_eom!,
+                               mode = :altitude_position,
+                               peri_target_km = tgt, r_apo_nom = r_apo_nom)
+            end
+            b === nothing && return (kind = :dead, from = from, a = a)
+
+            ok_ = a === :CORRECT ? b.converged :
+                  (isfinite(b.peri_err_km) && b.peri_err_km < TARGET_TOL_KM)
+
+            # Lost apse pair: an uncontrolled pass, charged to THIS bin. Branch dies.
+            if !isfinite(b.residual_km) || b.dv_mag_ms == 0.0
+                return (kind = :noapse, from = from, a = a, ok = ok_)
+            end
+
+            res_to = residual_bin(b.residual_km)
+            sp = copy(sc)
+            sp[4:6] .+= exec_dv(b.dv)
+            pe, ue = _to_peri(truth_eom!, sp, 4 * one_rev_s)
+            pe === :ok ||
+                return (kind = :terminal_after, from = from, a = a, ok = ok_,
+                        dv = b.dv_mag_ms, out = _terminal_dev(pe))
+            return (kind = :ok, from = from, a = a, ok = ok_, dv = b.dv_mag_ms,
+                    to_alt = bin_of(alt_of(ue)), to_res = res_to,
+                    state = copy(ue))
+        end
+
+        # BFS. `frontier` holds the nodes whose children are flown next.
+        frontier = [(state = collect(float.(root_state)), res = :R_OK)]
+        for _ in 1:max_depth
+            isempty(frontier) && break
+
+            # One work item per (parent node × action) — all independent.
+            jobs = [(pi_, a) for pi_ in eachindex(frontier) for a in action_keys]
+            results = Vector{Any}(undef, length(jobs))
+
+            # ── PARALLEL PHASE: integrate + solve only. No accumulator touched. ──
+            Threads.@threads for j in eachindex(jobs)
+                pi_, a = jobs[j]
+                node = frontier[pi_]
+                results[j] = _fly_one(node.state, node.res, a)
+            end
+
+            # ── SERIAL PHASE: book in a FIXED order, so the artifact is reproducible
+            # regardless of thread scheduling. ──
+            next_frontier = NamedTuple[]
+            for j in eachindex(jobs)
+                r = results[j]
+                r.kind === :dead && continue
+                n_passes += 1
+                if r.kind !== :terminal
+                    get(r, :ok, true) || (nonconv[r.a][r.from] += 1)
+                end
+                if r.kind === :terminal
+                    bump!(r.a, r.from, r.out)
+                elseif r.kind === :noapse
+                    bump!(r.a, r.from, :LOST)
+                    push!(dvs[r.a][r.from], 0.0)
+                elseif r.kind === :terminal_after
+                    bump!(r.a, r.from, r.out)
+                    push!(dvs[r.a][r.from], r.dv)
+                else
+                    bump!(r.a, r.from, r.to_alt, r.to_res)
+                    push!(dvs[r.a][r.from], r.dv)
+                    push!(next_frontier, (state = r.state, res = r.to_res))
+                    n_nodes += 1
+                end
+            end
+            frontier = next_frontier
+        end
+
+        verbose && @printf("  tree: depth %d, %d passes flown, %d live nodes, %d threads\n",
+                           max_depth, n_passes, n_nodes, Threads.nthreads())
+        return (passes = n_passes, nodes = n_nodes)
+    end
+
+    # Resolve the EXCURSE aim points ONCE, outside the threaded region — the family table
+    # is a shared structure and `retarget_to_altitude` has no documented thread safety.
+    excurse_targets = Dict{Symbol,Float64}()
+    if family_table !== nothing
+        for band in band_names
+            m = retarget_to_altitude(family_table, band_target_km[band])
+            m === nothing && continue
+            excurse_targets[Symbol("EXCURSE_", band)] = m.info.periapsis_alt_km
+        end
+    end
+
+    tree_stats = tree_depth > 0 ?
+        tree_walk!(base, tree_depth, excurse_targets) : (passes = 0, nodes = 0)
+    tree_passes, tree_nodes = tree_stats.passes, tree_stats.nodes
+
+    # ── PRIMARY WALKS from the nominal limit cycle, one per action ─────────────
+    # CORRECT goes through the SAME walker as the excursions now. `n_steps` is its pass
+    # budget (it used to be the length of a single sustained loop); with restarts it is
+    # spread over many fresh departures instead, exactly as the EXCURSE budget is.
+    action_walk!(:CORRECT, copy(base), n_steps;
+                 mode_ = mode, rp = collect(r_peri_nom), ra = collect(r_apo_nom))
 
     for band in band_names
         target = band_target_km[band]
@@ -610,117 +1007,95 @@ function calibrate_tables(;
         # radius no longer has to be smuggled in through a scaled position vector, and the
         # phase-matching problem noted at the top of this file does not arise for the
         # periapsis half at all. The apoapsis anchor stays our own nominal.
-        peri_tgt = member.info.periapsis_alt_km
-        ra = collect(r_apo_nom)
-
-        excurse_walk!(band, peri_tgt, ra, copy(base), excurse_trials)
+        action_walk!(Symbol("EXCURSE_", band), copy(base), excurse_trials;
+                     mode_ = :altitude_position,
+                     peri_tgt = member.info.periapsis_alt_km,
+                     ra = collect(r_apo_nom), band = band)
     end
 
-    # ── SEED the EXCURSE walk from each altitude bin ───────────────────────────
-    # ⚠️ WITHOUT THIS, THE EXCURSE KERNEL DESCRIBES ONE BIN. Measured 2026-08-30: the walks
-    # above all start from the IC limit cycle (~37 km, `A30_40`) and, once
-    # `:altitude_position` made the aim accurate, they SETTLE — 8 passes commanded 35 km go
-    # 34.97, 34.95, 34.94, 34.94 … and never leave the bin they started in. So 11 of 20
-    # trials land in `A30_40` and three rows stay empty. Accurate targeting made this WORSE
-    # than the old sloppy aim, which at least overshot into `A40_50` twice by accident.
+    # ── SEED EVERY ACTION FROM EVERY ALTITUDE BIN ──────────────────────────────
+    # ⚠️ WITHOUT SEEDING, A KERNEL DESCRIBES ONE BIN. Measured 2026-08-30: the primary walks
+    # all start from the IC limit cycle (~37 km) and, once `:altitude_position` made the aim
+    # accurate, they SETTLE — 8 passes commanded 35 km go 34.97, 34.95, 34.94 … and never
+    # leave the bin they started in. Rows are keyed by the bin a pass STARTS in, so covering
+    # them means starting passes in them. A working controller has no reason to visit
+    # BELOW_20 or ABOVE_44, yet the solver queries those states, and filling them with a
+    # guess would teach the policy something never measured.
     #
-    # The rows are keyed by the bin the vehicle STARTS a pass in, so covering them means
-    # starting passes in them. This mirrors the CORRECT seeding below, which exists
-    # for exactly this reason; the EXCURSE loop simply never used it.
+    # ⚠️ ONE LOOP FOR ALL ACTIONS (2026-08-31). This used to be TWO blocks — one seeding the
+    # EXCURSE walks per (bin × band), one seeding CORRECT per bin with its own hand-written
+    # copy of the burn/coast/book logic. Merging them is what finally measures CORRECT from
+    # a DEGRADED orbit: the shared walker accumulates damage across a restart block, so
+    # `CORRECT` now produces `R_DEGRADED` / `R_CRITICAL` departures the same way the
+    # excursions always did. Those rows were ALL n = 0 before, which meant the recovery
+    # behaviour the residual dimension exists to model was pure inference.
     #
     # ⚠️ AND THE LOW BINS ARE REACHABLE — the earlier read that they were not was wrong.
     # Commanding 20 or 25 km from the 37 km limit cycle escapes, but that is the TRANSFER
     # failing, not the destination: placed ON the 18/20/22/25/28 km family members and told
     # to hold their own altitude, `:altitude_position` holds every one of them to ~0.09 km
-    # for 12 passes with real burns. `ABOVE_50` is the genuinely hard bin — 55 and 60 km
+    # for 12 passes with real burns. `ABOVE_44` is the genuinely hard bin — 55 and 60 km
     # escape by the third pass.
-    if seed_bins && family_table !== nothing
-        for bin in ALT_BINS, band in band_names
-            rep = _bin_rep_alt(bin, alt_edges)
-            m = retarget_to_altitude(family_table, rep)
-            m === nothing && continue
-            seed_ic = collect(float.(m.ic))
-            ps, us = _to_peri(truth_eom!, seed_ic, 4 * one_rev_s)
-            ps === :ok || continue
-
-            tgt_m = retarget_to_altitude(family_table, band_target_km[band])
-            tgt_m === nothing && continue
-            # Apoapsis anchor from the SEEDED orbit, not the nominal one: from an 18 km
-            # halo the nominal 37 km apoapsis is not the apse this vehicle is holding, and
-            # targeting it would measure a transfer rather than an excursion in that bin.
-            _, ra_s = next_apse_positions(seed_ic; eom! = cr3bp_eom!)
-            excurse_walk!(band, tgt_m.info.periapsis_alt_km, ra_s, copy(us),
-                          excurse_seed_trials)
-        end
-    end
-
-    # ── SEED the bins the natural loop never visits ────────────────────────────
-    # ⚠️ WITHOUT THIS, THREE OF FIVE ROWS ARE EMPTY. Measured 2026-08-30: a 50-step
-    # sustained loop puts 50/50 CORRECT trials in A30_40 and 1 in A40_50, and never enters
-    # BELOW_20, A20_30 or ABOVE_50 at all — a working controller has no reason to go there.
-    # Those rows are still needed, because the solver queries every state, and filling them
-    # with a guess would teach the policy something we never measured (e.g. that a low
-    # periapsis is unrecoverable). So we place the spacecraft ON a real halo-family member
-    # at each bin's representative altitude and measure what the controller actually does
-    # from there. A bin with no family member is left unmeasured rather than invented.
+    # ⚠️ SEEDS ARE SPREAD ACROSS EACH BIN, BUT NOT DISPERSED (2026-08-31). Sampling several
+    # ALTITUDES per bin is sound — a bin is a range, and one point should not stand in for
+    # it — and every sampled seed was checked to hold its own orbit for 8 passes. Adding a
+    # state-space PERTURBATION on top was tried and rejected: it breaks the onboard apse
+    # prediction rather than the orbit, so the kernel records solver failures as deaths.
+    # See `_disperse_state` for the measurements. Reachability is handled by `tree_walk!`.
     if seed_bins && family_table !== nothing
         for bin in ALT_BINS
-            rep = _bin_rep_alt(bin, alt_edges)
-            m = retarget_to_altitude(family_table, rep)
-            if m === nothing
-                verbose && @info "seed: no family member near $(rep) km for $bin — row left unmeasured"
-                continue
-            end
-            seed_ic = collect(float.(m.ic))
-            ps, us = _to_peri(truth_eom!, seed_ic, 4 * one_rev_s)
-            ps === :ok || continue
-            # Hold the SEEDED orbit, not the nominal one: targeting a 31 km reference from
-            # 18 km would measure a transfer, not stationkeeping in that bin.
-            rp_s, ra_s = next_apse_positions(seed_ic; eom! = cr3bp_eom!)
+            alts = _bin_sample_alts(bin, alt_edges, seed_samples)
+            # Split each cell's budget across the samples (at least one pass each).
+            corr_each = max(1, seed_trials ÷ length(alts))
+            exc_each  = max(1, excurse_seed_trials ÷ length(alts))
 
-            for _ in 1:seed_trials
-                st_s = copy(us)
-                from = bin_of(alt_of(st_s))
-                from in ALT_BINS || continue
-
-                # CORRECT: burn at the shell toward the seeded orbit, then coast.
-                shs, scs = _to_shell(truth_eom!, st_s, 4 * one_rev_s)
-                if shs !== :ok
-                    bump!(:CORRECT, from, _terminal_dev(shs))
+            for rep in alts
+                m = retarget_to_altitude(family_table, rep)
+                if m === nothing
+                    verbose && @info "seed: no family member near $(rep) km for $bin — sample skipped"
                     continue
                 end
-                bs = solve_burn(scs, one_rev_s; eom! = cr3bp_eom!, mode = mode,
-                                r_peri_nom = rp_s, r_apo_nom = ra_s)
-                bs.converged || (nonconv[:CORRECT][from] += 1)
-                # Lost apse pair = LOST, charged here. See the sustained loop above.
-                if !isfinite(bs.residual_km) || bs.dv_mag_ms == 0.0
-                    bump!(:CORRECT, from, :LOST)
-                    push!(dvs[:CORRECT][from], 0.0)
-                    continue
+                seed_ic = collect(float.(m.ic))
+                ps, us = _to_peri(truth_eom!, seed_ic, 4 * one_rev_s)
+                ps === :ok || continue
+                # Apse anchors from the SEEDED orbit, not the nominal one: from an 18 km
+                # halo the nominal 37 km apses are not what this vehicle is holding, so
+                # targeting them would measure a TRANSFER rather than stationkeeping there.
+                rp_s, ra_s = next_apse_positions(seed_ic; eom! = cr3bp_eom!)
+
+                # CORRECT: hold the seeded orbit.
+                action_walk!(:CORRECT, copy(us), corr_each;
+                             mode_ = mode, rp = rp_s, ra = ra_s)
+
+                # EXCURSE_<band>: aim at each band's commanded altitude from this bin.
+                for band in band_names
+                    tgt_m = retarget_to_altitude(family_table, band_target_km[band])
+                    tgt_m === nothing && continue
+                    action_walk!(Symbol("EXCURSE_", band), copy(us), exc_each;
+                                 mode_ = :altitude_position,
+                                 peri_tgt = tgt_m.info.periapsis_alt_km,
+                                 ra = ra_s, band = band)
                 end
-                sps = copy(scs); sps[4:6] .+= exec_dv(bs.dv)
-                pcs, ucs = _to_peri(truth_eom!, sps, 4 * one_rev_s)
-                bump!(:CORRECT, from, pcs === :ok ? bin_of(alt_of(ucs)) : _terminal_dev(pcs))
-                push!(dvs[:CORRECT][from], bs.dv_mag_ms)
-                pcs === :ok && (us = ucs)
             end
         end
     end
 
     # ── Assemble ──────────────────────────────────────────────────────────────
-    rows = Dict{Symbol,Dict{Symbol,CalibrationRow}}()
-    for a in kernel_keys
-        rows[a] = Dict{Symbol,CalibrationRow}()
-        for d in ALT_BINS
-            c = counts[a][d]
+    rows = Dict{Symbol,Dict{KernelKey,CalibrationRow}}()
+    for a in action_keys
+        rows[a] = Dict{KernelKey,CalibrationRow}()
+        for k in all_keys
+            c = counts[a][k]
             n = sum(c)
-            rows[a][d] = CalibrationRow(c, n == 0 ? Float64[] : c ./ n, n,
-                                        nonconv[a][d], dvs[a][d])
+            rows[a][k] = CalibrationRow(c, n == 0 ? Float64[] : c ./ n, n,
+                                        nonconv[a][k], dvs[a][k])
         end
     end
 
     diagnostics = Dict{String,Any}(
-        "n_loop_steps"       => nlogged,
+        # Total CORRECT passes actually logged. Was the length of the bespoke sustained
+        # loop; now it is just how many CORRECT trials the unified walker booked.
+        "n_loop_steps"       => sum(sum(counts[:CORRECT][k]) for k in all_keys),
         "rows"               => rows,
         "band_dv_ms"         => Dict(string(b) => band_dv[b] for b in band_names),
         "band_achieved_alt"  => Dict(string(b) => band_achieved_alt[b] for b in band_names),
@@ -732,6 +1107,11 @@ function calibrate_tables(;
         "band_target_km"     => Dict(string(b) => band_target_km[b] for b in band_names),
         "mode"               => string(mode),
         "alt_edges"          => collect(alt_edges),
+        # The residual (orbit-damage) discretization these rows are conditioned on. Part of
+        # the STATE-SPACE definition, not θ: it must be identical across every θ in a sweep
+        # (only T_θ and O_θ may vary), so it is recorded to make a mismatch detectable.
+        "residual_edges"     => collect(RESIDUAL_EDGES),
+        "residual_bins"      => string.(collect(RESIDUAL_BINS)),
         "min_trials_trusted" => MIN_TRIALS_TRUSTED,
         # MEASUREMENT EFFORT, recorded separately from θ. Without this you cannot tell a
         # thin row that is thin BY CONFIGURATION from one thin because the walk settled.
@@ -742,10 +1122,61 @@ function calibrate_tables(;
             "seed_trials"         => seed_trials,
             "excurse_seed_trials" => excurse_seed_trials,
             "seed_bins"           => seed_bins,
+            # ⚠️ READ THIS BEFORE READING A TRIAL COUNT. With `seed_samples = 1` and a
+            # noise-free thruster the environment is deterministic, so `n` counts
+            # REPLICATES of one trajectory rather than samples from a distribution.
+            "seed_samples"        => seed_samples,
+            "tree_depth"          => tree_depth,
+            "tree_passes"         => tree_passes,
+            "tree_nodes"          => tree_nodes,
+            "rng_seed"            => rng_seed,
         ),
     )
     return rows, diagnostics
 end
+"""
+    _fill_unmeasured_row(rows, action, key) -> Vector{Float64}
+
+The distribution to use for a row with `n = 0`, i.e. one the measurement never visited.
+
+⚠️ A SELF-TRANSITION FILL IS NOT NEUTRAL, AND IT BIT US TWICE (2026-08-31). Filling an
+unmeasured row with "you stay exactly where you are" hands the solver an action that is
+free, perfectly safe, and — because the coverage gate keys off the landed bin — often
+SCIENCE-BANKING as well. A solver maximising value will find that action and take it. This
+is the identical failure mode that killed the OBSERVE action (four rows measured as 100%
+self-transitions taught the policy that coasting was free; it coasted and escaped at
+3.78 d), and it reappeared the moment the residual split created 34 unmeasured rows: with
+a self-transition fill, `EXCURSE_LOW` from `A27_34/R_CRITICAL` looked like a safe +10.5
+while the measured `EXCURSE_MID` from the same state was a −157.5, so the policy chose the
+unmeasured one.
+
+The fill therefore BACKS OFF ALONG THE DAMAGE AXIS instead: reuse the SAME action's
+measured row at the nearest LESS-DEGRADED residual bin. That is the conservative reading of
+the one monotonicity the measurements do support — more damage never makes an action safer
+(measured: `EXCURSE_LOW/A20_27` goes P(LOST) 0.000 → 0.000 → 1.000 across R_OK →
+R_DEGRADED → R_CRITICAL; `EXCURSE_MID/A27_34` goes 0.000 → 0.000 → 0.800). So inheriting
+the healthier bin's outcome UNDERSTATES the risk rather than fabricating safety, and it
+never invents a free action.
+
+If no less-degraded row was measured either, fall back to the self-transition — there is
+genuinely nothing to infer from — and rely on `meta.unmeasured_rows` to flag it. Such a row
+is not evidence, and a policy leaning on one means nothing.
+"""
+function _fill_unmeasured_row(rows::Dict{Symbol,Dict{KernelKey,CalibrationRow}},
+                              action::Symbol, key::KernelKey)
+    ri = residual_index(key.residual)
+    # Walk DOWN the damage axis: R_CRITICAL falls back to R_DEGRADED, then to R_OK.
+    for j in (ri - 1):-1:1
+        donor = rows[action][KernelKey(key.alt, RESIDUAL_BINS[j])]
+        donor.n == 0 && continue
+        return collect(donor.probs)
+    end
+    # Nothing measured for this action at this altitude at any damage level.
+    fill_row = zeros(Float64, N_KERNEL_COLS)
+    fill_row[kernel_entry_index(key.alt, key.residual)] = 1.0
+    return fill_row
+end
+
 """
     tables_from_rows(rows, diagnostics) -> AltTables
 
@@ -756,34 +1187,37 @@ them into the artifact, so the numbers were copied across by hand and could drif
 run that produced them with nothing to detect it.
 
 ⚠️ A ROW WITH `n = 0` IS NOT MEASURED. `calibrate_tables(seed_bins = true)` seeds a trial
-from every altitude bin precisely so this does not happen, but a bin with no reachable halo
-family member still comes back empty. Such rows are filled with a self-transition ONLY so
-the kernel is a valid stochastic matrix, and `meta.trials` records the count for every row
-so the fill is auditable rather than invisible. A policy is no more trustworthy than its
-least-visited row — check `meta.trials` against [`MIN_TRIALS_TRUSTED`](@ref) before
-believing what the policy does in a rarely-visited bin.
+from every altitude bin precisely so this does not happen, but many (altitude × residual)
+combinations are simply not reachable — the vehicle cannot arrive at 18 km with a pristine
+solve after a violent transfer — so the residual split leaves ~34 of 60 rows empty. They
+are filled by [`_fill_unmeasured_row`](@ref), which inherits the same action's measured
+behaviour at the nearest LESS-DEGRADED damage bin rather than fabricating a self-transition;
+read that function's docstring before changing it, because the obvious fill is actively
+dangerous here. `meta.trials` records the count for every row so the fill is auditable
+rather than invisible. A policy is no more trustworthy than its least-visited row — check
+`meta.trials` against [`MIN_TRIALS_TRUSTED`](@ref) before believing what the policy does in
+a rarely-visited bin.
 """
-function tables_from_rows(rows::Dict{Symbol,Dict{Symbol,CalibrationRow}},
+function tables_from_rows(rows::Dict{Symbol,Dict{KernelKey,CalibrationRow}},
                           diagnostics::AbstractDict)
-    nxt = collect(ALT_ALL)
-    kernels = Dict{Symbol,Dict{Symbol,Vector{Float64}}}()
+    kernels = Dict{Symbol,Dict{KernelKey,Vector{Float64}}}()
     trials  = Dict{String,Dict{String,Int}}()
     unmeasured = String[]
 
     # Whatever action keys `calibrate_tables` produced — `:CORRECT` plus one
     # `:EXCURSE_<BAND>` per band as of 2026-08-30 (previously a single pooled `:EXCURSE`).
     for a in sort(collect(keys(rows)))
-        kernels[a] = Dict{Symbol,Vector{Float64}}()
+        kernels[a] = Dict{KernelKey,Vector{Float64}}()
         trials[string(a)] = Dict{String,Int}()
-        for bin in ALT_BINS
-            row = rows[a][bin]
+        for key in kernel_keys_all()
+            row = rows[a][key]
             if row.n == 0
-                push!(unmeasured, "$a/$bin")
-                kernels[a][bin] = Float64[b === bin ? 1.0 : 0.0 for b in nxt]
+                push!(unmeasured, "$a/$key")
+                kernels[a][key] = _fill_unmeasured_row(rows, a, key)
             else
-                kernels[a][bin] = collect(row.probs)
+                kernels[a][key] = collect(row.probs)
             end
-            trials[string(a)][string(bin)] = row.n
+            trials[string(a)][string(key)] = row.n
         end
     end
 
@@ -808,21 +1242,31 @@ function tables_from_rows(rows::Dict{Symbol,Dict{Symbol,CalibrationRow}},
             "alt_edges"       => get(diagnostics, "alt_edges", Float64[]),
         ),
         "alt_edges"          => get(diagnostics, "alt_edges", Float64[]),
+        # STATE-SPACE definition, not θ — identical across every θ in a sweep.
+        "residual_edges"     => get(diagnostics, "residual_edges", collect(RESIDUAL_EDGES)),
+        "residual_bins"      => get(diagnostics, "residual_bins",
+                                    string.(collect(RESIDUAL_BINS))),
         "n_loop_steps"       => get(diagnostics, "n_loop_steps", 0),
         "effort"             => get(diagnostics, "effort", Dict{String,Any}()),
         "trials"             => trials,
         "unmeasured_rows"    => unmeasured,
         "min_trials_trusted" => MIN_TRIALS_TRUSTED,
         "caveats"            => [
-            "Rows listed in unmeasured_rows have n = 0 and are FILLED with a " *
-            "self-transition, not measured. They are not evidence.",
+            "Rows listed in unmeasured_rows have n = 0 and are FILLED, not measured. " *
+            "They are not evidence. The fill inherits the SAME action's measured row at " *
+            "the nearest less-degraded residual bin (see _fill_unmeasured_row) — never a " *
+            "self-transition, which would hand the solver a free risk-free action.",
             "Rows with 0 < n < min_trials_trusted are indicative only.",
             "Noise-free unless the run was configured otherwise, so any survival number " *
             "derived from these kernels is an UPPER BOUND, not feasibility.",
+            "Rows are conditioned on the RESIDUAL (orbit-damage) bin as well as the " *
+            "altitude bin, so the row count is 3x what it was before 2026-08-31 and the " *
+            "SAME trial budget is spread across all of them. Expect thinner rows; check " *
+            "meta.trials rather than assuming the previous counts carried over.",
         ],
     )
     # Split into the CORRECT kernel and the per-action EXCURSE kernels.
-    excurse = Dict{Symbol,Dict{Symbol,Vector{Float64}}}(
+    excurse = Dict{Symbol,Dict{KernelKey,Vector{Float64}}}(
         a => k for (a, k) in kernels if a !== :CORRECT)
     return AltTables(kernels[:CORRECT], excurse, meta)
 end
