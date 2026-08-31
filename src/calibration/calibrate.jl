@@ -33,9 +33,13 @@ METHOD
   EXCURSE : one step of a PERSISTENT walk toward a band's commanded altitude, carried across
             trials so the walk accumulates — single-pass authority is not the quantity the
             policy reasons about, the settling walk is. Seeded from every (bin × band) pair
-            for the same reason as CORRECT. All EXCURSE_* share one kernel: exp 12 found
-            excursion SAFETY did not differ meaningfully by band, only ΔV cost.
-            ⚠️ That finding predates the band rebase to 25/35/45 km — re-check it.
+            for the same reason as CORRECT. ONE KERNEL PER EXCURSE ACTION.
+            ⚠️ CHANGED 2026-08-30. Every EXCURSE_* used to SHARE one kernel, on exp 12's
+            finding that excursion SAFETY did not differ meaningfully by band (only ΔV
+            did). That is right for the safety question and wrong for the science one: a
+            kernel also encodes WHERE YOU LAND, which is the point of aiming at a band.
+            Pooling made EXCURSE_{LOW,MID,HIGH} identical in T — a degenerate action set
+            in which nothing steers altitude. See `alt_kernel` in tables.jl.
 
 ⚠️ SEEDING IS WHAT MAKES THE ROWS MEAN ANYTHING, AND IT HAS A KNOWN BIAS. A seeded state is
 a freshly-placed PERIODIC family member, which is the most stable state in the system; a row
@@ -127,10 +131,132 @@ _terminal_dev(outcome::Symbol) = outcome === :crash ? :CRASHED : :LOST
 # ~0.2 km, which is what made these rows measurable at all.
 
 """
-    calibrate_tables(; truth_eom!, n_steps, horizon_s, alt_edges, band_target_km,
-                     mode, verbose) -> (AltTables, diagnostics)
+    CALIBRATION_EFFORT
 
-Measure all three kernels and return them alongside a per-row diagnostics dict.
+The MEASUREMENT-EFFORT defaults, in one named place rather than scattered as inline
+literals across the signature.
+
+⚠️ EFFORT IS NOT θ. These control how HARD the environment is sampled — trial counts, loop
+lengths, the RNG seed. The same environment measured with 8 or 24 trials is the SAME θ
+measured with different confidence, so these are deliberately NOT fields on
+`StationkeepingPOMDP` (which holds the environment) and are NOT part of a sweep grid. They
+are recorded into `meta.effort` so an artifact says how hard it was measured, which is the
+only way to tell a thin row that is thin BY CONFIGURATION from one thin because the walk
+settled.
+
+  - `n_steps`             — sustained CORRECT-loop steps to log.
+  - `horizon_s`           — wall-clock cap on the sustained loop (s).
+  - `excurse_trials`      — steps per primary excursion walk.
+  - `seed_trials`         — CORRECT trials per seeded altitude bin.
+  - `excurse_seed_trials` — EXCURSE trials per (bin × band) seed.
+  - `seed_bins`           — seed the bins a working controller never visits at all.
+  - `rng_seed`            — reproducibility seed.
+
+⚠️ `excurse_trials`/`excurse_seed_trials` were RAISED 8 → 24 on 2026-08-30 when the EXCURSE
+kernel became per-action (splitting one pooled row three ways divides the trials). That did
+NOT fix the thin ORIGIN rows, and more trials cannot: an accurate walk SETTLES into its
+destination bin after 1–2 passes, so a longer walk feeds the destination row (n = 139) while
+the origin row it departed keeps n = 1. Fixing that needs more RESTARTS, not longer walks —
+deferred, see docs/todo.md.
+"""
+const CALIBRATION_EFFORT = (
+    n_steps             = 120,
+    horizon_s           = 25 * 86400.0,
+    excurse_trials      = 24,
+    seed_trials         = 8,
+    excurse_seed_trials = 24,
+    seed_bins           = true,
+    rng_seed            = 0,
+)
+
+"""
+    needs_recalibration(field::Symbol) -> Bool
+    needs_recalibration(θ::NamedTuple)  -> Bool
+
+Does changing this θ field require re-measuring the transition kernels?
+
+⚠️ THIS DISTINCTION IS WORTH ~7 MINUTES PER θ. Some environment parameters enter T/O/R
+ANALYTICALLY and cost nothing to sweep; others change the orbital dynamics and force a full
+`calibrate_tables` run. Measured 2026-08-31:
+
+  | θ field            | how it enters            | cost per θ |
+  |--------------------|--------------------------|------------|
+  | `sigma_nav_km`     | `observation_matrix`     | ~2 s       |
+  | `plume_gradient`   | `transition_matrix`      | ~2 s       |
+  | `noisy_thruster`   | RE-MEASURED kernels      | ~7 min     |
+  | `thruster_kwargs`  | RE-MEASURED kernels      | ~7 min     |
+
+So a 3-value nav sweep is seconds and a 3-value thruster sweep is ~20 minutes. A sweep
+driver that does not know the difference either wastes 20 minutes or, worse, reuses stale
+kernels for a dynamics-changing θ.
+"""
+needs_recalibration(field::Symbol) =
+    field in (:noisy_thruster, :thruster_kwargs)
+needs_recalibration(θ::NamedTuple) = any(needs_recalibration, keys(θ))
+
+"""
+    calibrate_tables(config::StationkeepingPOMDP; effort..., truth_eom!, verbose)
+        -> (rows, diagnostics)
+
+Measure the transition kernels for the environment described by `config`.
+
+⚠️ THE CONFIG IS THE SINGLE OWNER OF θ (2026-08-31). This method reads `alt_edges`,
+`band_names`, `band_target_km`, `noisy_thruster` and `thruster_kwargs` FROM the config.
+Before this existed, `calibrate_tables` had its own keyword defaults for the same
+quantities and every driver hand-mapped the config across — with defaults that silently
+DISAGREED (`alt_edges` was `(20,30,40,50)` here vs `(20,27,34,44)` in the struct, and
+`band_target_km` `25/35/45` vs `23.5/30.5/46`). Calling it without the hand-mapping
+measured kernels keyed to bins the model does not use, and nothing errored.
+
+Remaining keywords are MEASUREMENT EFFORT (see [`CALIBRATION_EFFORT`](@ref)), not
+environment, plus `truth_eom!`.
+
+    cfg  = StationkeepingPOMDP(; plume_gradient = 4.0)
+    rows, diag = calibrate_tables(cfg; verbose = true)
+    write_tables(tables_from_rows(rows, diag); path = theta_path("tables", (plume_gradient = 4.0,)))
+"""
+function calibrate_tables(config::StationkeepingPOMDP;
+                          truth_eom! = cr3bp_j2_eom!,
+                          truth_name::AbstractString = "CR3BP + Enceladus J2",
+                          n_steps::Integer = CALIBRATION_EFFORT.n_steps,
+                          horizon_s::Real = CALIBRATION_EFFORT.horizon_s,
+                          excurse_trials::Integer = CALIBRATION_EFFORT.excurse_trials,
+                          seed_trials::Integer = CALIBRATION_EFFORT.seed_trials,
+                          excurse_seed_trials::Integer =
+                              CALIBRATION_EFFORT.excurse_seed_trials,
+                          seed_bins::Bool = CALIBRATION_EFFORT.seed_bins,
+                          rng::AbstractRNG = Xoshiro(CALIBRATION_EFFORT.rng_seed),
+                          kwargs...)
+    return calibrate_tables(;
+        # ── θ, read from the config: ONE owner ────────────────────────────────
+        alt_edges       = config.alt_edges,
+        band_names      = config.band_names,
+        band_target_km  = config.band_target_km,
+        noisy_thruster  = config.noisy_thruster,
+        thruster_kwargs = config.thruster_kwargs,
+        # ── effort + truth model ──────────────────────────────────────────────
+        truth_eom!          = truth_eom!,
+        truth_name          = truth_name,
+        n_steps             = n_steps,
+        horizon_s           = horizon_s,
+        excurse_trials      = excurse_trials,
+        seed_trials         = seed_trials,
+        excurse_seed_trials = excurse_seed_trials,
+        seed_bins           = seed_bins,
+        rng                 = rng,
+        kwargs...)
+end
+
+"""
+    calibrate_tables(; truth_eom!, n_steps, horizon_s, alt_edges, band_target_km,
+                     mode, verbose) -> (rows, diagnostics)
+
+Low-level form. Measure all kernels and return them with a per-row diagnostics dict.
+
+⚠️ PREFER THE `calibrate_tables(config)` METHOD. This one's `alt_edges` /
+`band_target_km` defaults are LEGACY and do not match `StationkeepingPOMDP`'s — calling it
+bare measures kernels for bins the model does not use. It stays public only so a
+measurement can be run against hand-specified bins without inventing a whole config.
 
   - `truth_eom!` — the truth model to calibrate against. Defaults to
     [`cr3bp_j2_eom!`](@ref) (CR3BP + Enceladus J2), which is the rung the committed
@@ -138,6 +264,9 @@ Measure all three kernels and return them alongside a per-row diagnostics dict.
   - `n_steps` — sustained-loop steps to log for the CORRECT rows.
   - `mode` — targeting mode for `solve_burn`. `:position` is Strategy 3 proper and matches
     how the kernels are defined; see caveat 4 above about its convergence.
+    ⚠️ Applies to the CORRECT burns only — `excurse_walk!` always uses
+    `:altitude_position`, which is why band delivery is ~0.2 km while `meta.mode` reads
+    `:position`.
 """
 function calibrate_tables(;
     truth_eom! = cr3bp_j2_eom!,
@@ -167,7 +296,21 @@ function calibrate_tables(;
     noisy_thruster::Bool = false,
     rng::AbstractRNG = Xoshiro(0),
     thruster_kwargs::NamedTuple = NamedTuple(),
-    ic::AbstractVector{<:Real} = nondim_to_cr3bp(collect(PERIOD1_NORTH_IC_ND)),
+    # ⚠️ SOUTH POLAR, ALWAYS (2026-08-31). The plumes are at Enceladus's SOUTH pole, so the
+    # science case only makes sense with periapsis over that hemisphere — and the plume
+    # gradient θ is meaningless on a north-polar orbit. This default used to be
+    # `PERIOD1_NORTH_IC_ND`, which repeatedly read as "we are measuring the wrong orbit".
+    #
+    # It was not actually wrong, and the reason is worth keeping: `PERIOD1_SOUTH_IC_ND =
+    # mirror_z(PERIOD1_NORTH_IC_ND)` is an EXACT z-reflection, both primaries are
+    # z-symmetric under CR3BP+J2, and every kernel here is keyed on periapsis ALTITUDE —
+    # which is reflection-invariant. So the two ICs give identical kernels (see halo_ic.jl:
+    # "every controller result measured on the north-polar IC transfers to this one
+    # unchanged"), and the seeded walks already used the south family table.
+    #
+    # Defaulting to south anyway, permanently, so the config STATES the science case instead
+    # of relying on a reader knowing the symmetry argument. Do not change this back.
+    ic::AbstractVector{<:Real} = nondim_to_cr3bp(collect(PERIOD1_SOUTH_IC_ND)),
     period_s::Real = PERIOD1_TRIPLE_PERIOD_S,
     n_steps::Integer = 120,
     horizon_s::Real = 25 * 86400.0,
@@ -202,11 +345,10 @@ function calibrate_tables(;
 
     # Bin by achieved periapsis ALTITUDE. ⚠️ This must stay bit-identical to `alt_bin`
     # in states.jl, or the kernels are labelled with bins the model does not use.
-    bin_of(h) = !isfinite(h) ? :LOST :
-                h < alt_edges[1] ? :BELOW_20 :
-                h < alt_edges[2] ? :A20_27 :
-                h < alt_edges[3] ? :A27_34 :
-                h < alt_edges[4] ? :A34_44 : :ABOVE_44
+    # ⚠️ ONE binning implementation, shared with the model. This used to be a hand-copied
+    # inline closure carrying a comment that it "must stay bit-identical to `alt_bin` in
+    # states.jl" — so it now simply IS `alt_bin`. See states.jl for the edges-only method.
+    bin_of(h) = alt_bin(alt_edges, h)
     alt_of(u) = norm(_enc_relative(u[1:3])) - R_ENCELADUS
 
     # Apply a commanded ΔV the way the ENVIRONMENT does. Routed through the same
@@ -217,13 +359,38 @@ function calibrate_tables(;
                                    apply_dv(dv)
 
     nxt = collect(ALT_ALL)
+    # ⚠️ KEYED PER BAND AS OF 2026-08-30. This replaces ONE pooled EXCURSE kernel.
+    #
+    # The old keys were just `(:CORRECT, :EXCURSE)`, on the exp-12 finding that excursion
+    # RISK did not differ by band — only ΔV did. True for the SAFETY question, and wrong for
+    # the SCIENCE question, because a kernel also encodes WHERE YOU LAND, which is the whole
+    # point of aiming at a band. The file's own note said to re-check it after the band
+    # rebase; this is that re-check.
+    #
+    # The measured consequence, from the artifact this replaces: the `A34_44` EXCURSE row
+    # (from the limit cycle) read 1/3 A20_27, 1/3 A27_34, 1/3 ABOVE_44 over n = 3. That is
+    # not "an excursion lands randomly" — it is the LOW walk landing in LOW, the MID walk in
+    # MID and the HIGH walk in HIGH, one trial each, POOLED. Aiming was measured, then
+    # averaged away.
+    #
+    # Why it stayed invisible: `action_dv_cost` gave the three actions distinct prices, so
+    # the policy looked like it was choosing among three excursions when it was really
+    # choosing among three prices. At `fuel_weight = 0` the reward spread across
+    # EXCURSE_{LOW,MID,HIGH} is exactly 0.0 and the action set is degenerate — no action
+    # raises P(landing in a deep band), so a plume-gradient θ cannot change behaviour.
+    #
+    # ⚠️ TRIAL COUNTS ARE DIVIDED, NOT MULTIPLIED. Splitting one pooled row into three gives
+    # each new row ~1/3 of the trials, so rows that previously cleared `MIN_TRIALS_TRUSTED`
+    # may no longer. Raise `excurse_trials` / `excurse_seed_trials` to compensate and CHECK
+    # `meta.trials` — a thin row is exactly what this file exists to make auditable.
+    kernel_keys = (:CORRECT, (Symbol("EXCURSE_", b) for b in band_names)...)
     # counts[action][alt_from] -> Vector{Int} over ALT_ALL
     counts = Dict(a => Dict(d => zeros(Int, length(nxt)) for d in ALT_BINS)
-                  for a in (:CORRECT, :EXCURSE))
+                  for a in kernel_keys)
     nonconv = Dict(a => Dict(d => 0 for d in ALT_BINS)
-                   for a in (:CORRECT, :EXCURSE))
+                   for a in kernel_keys)
     dvs = Dict(a => Dict(d => Float64[] for d in ALT_BINS)
-               for a in (:CORRECT, :EXCURSE))
+               for a in kernel_keys)
     # ΔV per band, for the action_dv_cost proxy.
     band_dv = Dict(b => Float64[] for b in band_names)
     band_achieved_alt = Dict(b => Float64[] for b in band_names)
@@ -309,6 +476,10 @@ function calibrate_tables(;
     # bin-seeded walks below run the IDENTICAL measurement as the primary ones — a
     # hand-copied second loop is how the two would silently diverge.
     function excurse_walk!(band, peri_tgt, ra, start_state, n_trials)
+        # The kernel this walk measures is the one for the ACTION that aims at `band`.
+        # ⚠️ Previously every walk bumped a single shared `:EXCURSE` key, which pooled the
+        # three bands' outcomes and discarded the aiming. See `kernel_keys` above.
+        akey = Symbol("EXCURSE_", band)
         walker = copy(start_state)      # carried across trials: the walk accumulates
         for _ in 1:n_trials
             from = bin_of(alt_of(walker))
@@ -316,7 +487,7 @@ function calibrate_tables(;
 
             sh, sc = _to_shell(truth_eom!, walker, 4 * one_rev_s)
             if sh !== :ok
-                bump!(:EXCURSE, from, _terminal_dev(sh))
+                bump!(akey, from, _terminal_dev(sh))
                 break
             end
 
@@ -327,7 +498,7 @@ function calibrate_tables(;
             # `converged` would flag every excursion as failed. The delivery question is
             # whether the COMMANDED ALTITUDE was met, which is `peri_err_km`.
             isfinite(b.peri_err_km) && b.peri_err_km < TARGET_TOL_KM ||
-                (nonconv[:EXCURSE][from] += 1)
+                (nonconv[akey][from] += 1)
 
             # ⚠️ A LOST APSE PAIR IS A LOSS, AND IT MUST BE CHARGED TO *THIS* BIN.
             #
@@ -350,8 +521,8 @@ function calibrate_tables(;
             # A control step with no control is a loss of the orbit at the bin where the
             # decision was made, so record it there and stop the walk.
             if !isfinite(b.residual_km) || b.dv_mag_ms == 0.0
-                bump!(:EXCURSE, from, :LOST)
-                push!(dvs[:EXCURSE][from], 0.0)
+                bump!(akey, from, :LOST)
+                push!(dvs[akey][from], 0.0)
                 push!(band_dv[band], 0.0)
                 verbose && @printf("  excurse %-4s step from %-8s NO APSE PAIR (ΔV=0) -> LOST\n",
                                    band, from)
@@ -362,14 +533,14 @@ function calibrate_tables(;
             sp[4:6] .+= exec_dv(b.dv)
             pe, ue = _to_peri(truth_eom!, sp, 4 * one_rev_s)
             if pe !== :ok
-                bump!(:EXCURSE, from, _terminal_dev(pe))
-                push!(dvs[:EXCURSE][from], b.dv_mag_ms)
+                bump!(akey, from, _terminal_dev(pe))
+                push!(dvs[akey][from], b.dv_mag_ms)
                 push!(band_dv[band], b.dv_mag_ms)
                 break
             end
 
-            bump!(:EXCURSE, from, bin_of(alt_of(ue)))
-            push!(dvs[:EXCURSE][from], b.dv_mag_ms)
+            bump!(akey, from, bin_of(alt_of(ue)))
+            push!(dvs[akey][from], b.dv_mag_ms)
             push!(band_dv[band], b.dv_mag_ms)
             push!(band_achieved_alt[band], altitude(ue))
 
@@ -492,7 +663,7 @@ function calibrate_tables(;
 
     # ── Assemble ──────────────────────────────────────────────────────────────
     rows = Dict{Symbol,Dict{Symbol,CalibrationRow}}()
-    for a in (:CORRECT, :EXCURSE)
+    for a in kernel_keys
         rows[a] = Dict{Symbol,CalibrationRow}()
         for d in ALT_BINS
             c = counts[a][d]
@@ -516,6 +687,16 @@ function calibrate_tables(;
         "mode"               => string(mode),
         "alt_edges"          => collect(alt_edges),
         "min_trials_trusted" => MIN_TRIALS_TRUSTED,
+        # MEASUREMENT EFFORT, recorded separately from θ. Without this you cannot tell a
+        # thin row that is thin BY CONFIGURATION from one thin because the walk settled.
+        "effort" => Dict{String,Any}(
+            "n_steps"             => n_steps,
+            "horizon_s"           => horizon_s,
+            "excurse_trials"      => excurse_trials,
+            "seed_trials"         => seed_trials,
+            "excurse_seed_trials" => excurse_seed_trials,
+            "seed_bins"           => seed_bins,
+        ),
     )
     return rows, diagnostics
 end
@@ -543,7 +724,9 @@ function tables_from_rows(rows::Dict{Symbol,Dict{Symbol,CalibrationRow}},
     trials  = Dict{String,Dict{String,Int}}()
     unmeasured = String[]
 
-    for a in (:CORRECT, :EXCURSE)
+    # Whatever action keys `calibrate_tables` produced — `:CORRECT` plus one
+    # `:EXCURSE_<BAND>` per band as of 2026-08-30 (previously a single pooled `:EXCURSE`).
+    for a in sort(collect(keys(rows)))
         kernels[a] = Dict{Symbol,Vector{Float64}}()
         trials[string(a)] = Dict{String,Int}()
         for bin in ALT_BINS
@@ -568,6 +751,10 @@ function tables_from_rows(rows::Dict{Symbol,Dict{Symbol,CalibrationRow}},
         # T_θ and O_θ), not "the" model. Recorded here so the committed JSON is
         # self-describing rather than relying on whoever ran it to remember.
         "theta" => Dict{String,Any}(
+            # `truth_eom` lives ONLY here, not on `StationkeepingPOMDP`: `build_pomdp` never
+            # touches the truth model (it loads pre-measured kernels), so a copy on the
+            # config would be a second owner free to disagree with the artifact that the
+            # kernels were actually measured against. The artifact is the record.
             "truth_eom"       => get(diagnostics, "truth_name", "unknown"),
             "noisy_thruster"  => get(diagnostics, "noisy_thruster", false),
             "thruster_kwargs" => get(diagnostics, "thruster_kwargs", Dict{String,Any}()),
@@ -576,6 +763,7 @@ function tables_from_rows(rows::Dict{Symbol,Dict{Symbol,CalibrationRow}},
         ),
         "alt_edges"          => get(diagnostics, "alt_edges", Float64[]),
         "n_loop_steps"       => get(diagnostics, "n_loop_steps", 0),
+        "effort"             => get(diagnostics, "effort", Dict{String,Any}()),
         "trials"             => trials,
         "unmeasured_rows"    => unmeasured,
         "min_trials_trusted" => MIN_TRIALS_TRUSTED,
@@ -587,5 +775,8 @@ function tables_from_rows(rows::Dict{Symbol,Dict{Symbol,CalibrationRow}},
             "derived from these kernels is an UPPER BOUND, not feasibility.",
         ],
     )
-    return AltTables(kernels[:CORRECT], kernels[:EXCURSE], meta)
+    # Split into the CORRECT kernel and the per-action EXCURSE kernels.
+    excurse = Dict{Symbol,Dict{Symbol,Vector{Float64}}}(
+        a => k for (a, k) in kernels if a !== :CORRECT)
+    return AltTables(kernels[:CORRECT], excurse, meta)
 end

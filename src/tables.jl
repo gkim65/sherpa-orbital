@@ -33,21 +33,46 @@ plus the provenance metadata carried alongside them.
 """
 struct AltTables
     correct::Dict{Symbol,Vector{Float64}}
-    excurse::Dict{Symbol,Vector{Float64}}
+    # ⚠️ TWO-LEVEL AS OF 2026-08-30: excurse[ACTION][from_bin], one kernel PER EXCURSE
+    # ACTION. It was previously `excurse[from_bin]` — a single kernel shared by every band.
+    # See `alt_kernel` for why that was wrong and what it cost.
+    excurse::Dict{Symbol,Dict{Symbol,Vector{Float64}}}
     meta::Dict{String,Any}
 end
 
 """
     alt_kernel(tables, action, alt) -> Vector{Float64}
 
-The measured next-altitude distribution for `action` from bin `alt`, over `ALT_ALL`. All
-EXCURSE_* actions share one kernel: the measured safety cost of an excursion did not
-differ meaningfully by band (exp 12), only its ΔV cost did. ⚠️ That finding predates the
-band rebase to 20–50 km — re-check it when the kernels are re-measured.
+The measured next-altitude distribution for `action` from bin `alt`, over `ALT_ALL`.
+
+⚠️ ONE KERNEL PER EXCURSE ACTION (changed 2026-08-30). This previously returned a SINGLE
+pooled `excurse[alt]` row for every band, on the exp-12 finding that excursion RISK does not
+differ meaningfully by band — only ΔV cost does. That is true for the SAFETY question and
+wrong for the SCIENCE question, because a kernel also encodes WHERE YOU LAND, and where you
+land is the entire point of aiming at a band.
+
+What the pooling cost, measured: the old `A34_44` EXCURSE row (from the limit cycle) read
+1/3 `A20_27`, 1/3 `A27_34`, 1/3 `ABOVE_44` over n = 3 — which is not "an excursion lands
+randomly" but the LOW walk landing in LOW, the MID walk in MID and the HIGH walk in HIGH,
+one trial each, averaged together. So the model was told `EXCURSE_HIGH` and `EXCURSE_LOW`
+have IDENTICAL successor distributions.
+
+Why it went unnoticed: `action_dv_cost` gave the three actions different prices, so the
+policy appeared to choose among three excursions while actually choosing among three
+prices. At `fuel_weight = 0` the reward spread across `EXCURSE_{LOW,MID,HIGH}` is exactly
+0.0, the action set is degenerate, and no action raises P(landing in a deep band) — which
+makes a plume-gradient θ unable to change behaviour at all.
+
+Falls back to a pooled row if `action` has no measured kernel, so a legacy artifact still
+loads (`load_tables` handles the format bump).
 """
 function alt_kernel(tables::AltTables, action::Symbol, alt::Symbol)
     action === :CORRECT && return tables.correct[alt]
-    return tables.excurse[alt]
+    haskey(tables.excurse, action) && return tables.excurse[action][alt]
+    # Legacy / unmeasured action: fall back to any available EXCURSE kernel rather than
+    # throwing, but this is a DEGENERATE model — see the warning above.
+    isempty(tables.excurse) && error("tables has no EXCURSE kernel for $action")
+    return first(values(tables.excurse))[alt]
 end
 
 # ── Serialization ─────────────────────────────────────────────────────────────
@@ -56,6 +81,14 @@ _kernel_to_json(d::Dict{Symbol,Vector{Float64}}) =
 
 _kernel_from_json(d::AbstractDict) =
     Dict{Symbol,Vector{Float64}}(Symbol(k) => Float64.(v) for (k, v) in d)
+
+"""Serialize/parse the two-level `excurse[action][from_bin]` kernel."""
+_excurse_to_json(d::Dict{Symbol,Dict{Symbol,Vector{Float64}}}) =
+    Dict(string(a) => _kernel_to_json(k) for (a, k) in d)
+
+_excurse_from_json(d::AbstractDict) =
+    Dict{Symbol,Dict{Symbol,Vector{Float64}}}(
+        Symbol(a) => _kernel_from_json(k) for (a, k) in d)
 
 """
     write_tables(tables; path = DEFAULT_TABLES_PATH)
@@ -68,7 +101,9 @@ function write_tables(tables::AltTables; path::AbstractString = DEFAULT_TABLES_P
     payload = Dict(
         "alt_next" => string.(collect(ALT_ALL)),
         "correct"  => _kernel_to_json(tables.correct),
-        "excurse"  => _kernel_to_json(tables.excurse),
+        "excurse"  => _excurse_to_json(tables.excurse),
+        # Format marker: 1 = pooled `excurse[bin]`, 2 = per-action `excurse[action][bin]`.
+        "format"   => 2,
         "meta"     => tables.meta,
     )
     open(path, "w") do io
@@ -98,9 +133,25 @@ function load_tables(path::AbstractString = DEFAULT_TABLES_PATH)
         "tables.json alt_next = $got disagrees with ALT_ALL = $(collect(ALT_ALL)); " *
         "the kernel columns would be misaligned")
 
+    # ⚠️ FORMAT 2 IS REQUIRED (2026-08-30). Format 1 stored a SINGLE pooled `excurse[bin]`
+    # row shared by every band, which makes EXCURSE_{LOW,MID,HIGH} mathematically identical
+    # in T — a degenerate action set that silently defeats any science/altitude objective
+    # (see `alt_kernel`). Detect it by shape (format 1's values are arrays of numbers,
+    # format 2's are dicts keyed by action) and REJECT rather than remap: the per-band
+    # aiming was never recorded in format 1, so it cannot be recovered from the file.
+    fmt = get(raw, "format", 1)
+    exc_raw = raw["excurse"]
+    looks_pooled = !isempty(exc_raw) && first(values(exc_raw)) isa AbstractVector
+    if fmt < 2 || looks_pooled
+        error("$path is a FORMAT 1 artifact: `excurse` is a single pooled kernel shared " *
+              "by every band, so EXCURSE_LOW/MID/HIGH would be identical in T and no " *
+              "action would steer altitude. The per-band aiming is not recoverable from " *
+              "this file — re-measure with `experiments/calibrate.jl`.")
+    end
+
     tables = AltTables(
         _kernel_from_json(raw["correct"]),
-        _kernel_from_json(raw["excurse"]),
+        _excurse_from_json(exc_raw),
         Dict{String,Any}(get(raw, "meta", Dict())),
     )
     validate_tables(tables)
@@ -114,7 +165,14 @@ Check every kernel row covers the live altitude bins and sums to 1. Cheap, and i
 a hand-edited artifact before the error reaches the solver as a subtly wrong policy.
 """
 function validate_tables(tables::AltTables)
-    for (name, k) in (("correct", tables.correct), ("excurse", tables.excurse))
+    # Flatten the two-level excurse kernel into ("excurse/ACTION", rows) pairs so every
+    # per-action row gets the same checks the pooled one used to get.
+    groups = Pair{String,Dict{Symbol,Vector{Float64}}}[("correct" => tables.correct)]
+    for (a, k) in tables.excurse
+        push!(groups, "excurse/$a" => k)
+    end
+    isempty(tables.excurse) && error("tables has no EXCURSE kernels at all")
+    for (name, k) in groups
         for alt in ALT_BINS
             haskey(k, alt) || error("tables.$name is missing a row for alt=$alt")
             row = k[alt]

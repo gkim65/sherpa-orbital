@@ -31,17 +31,16 @@ println("  bands          : ", config.band_names, " -> ", config.band_bins,
         "  commanded(km)=", [config.band_target_km[b] for b in config.band_names])
 println()
 
-rows, diag = calibrate_tables(;
-    alt_edges      = config.alt_edges,
-    band_names     = config.band_names,
-    band_target_km = config.band_target_km,
-    verbose        = true,
-)
+# ⚠️ THE CONFIG IS THE ONLY SOURCE OF θ (2026-08-31). This used to hand-map `alt_edges` /
+# `band_names` / `band_target_km` across one by one, against `calibrate_tables` defaults
+# that silently DISAGREED with the struct's — so forgetting one argument measured kernels
+# keyed to the wrong bins with no error. Effort knobs come from `CALIBRATION_EFFORT`.
+rows, diag = calibrate_tables(config; verbose = false)
 
 # ── Per-row provenance ───────────────────────────────────────────────────────
 println("\nMeasured rows (n = trials; a row with n = 0 is FILLED, not measured):")
 @printf("  %-9s %-10s %6s %7s  %s\n", "action", "from", "n", "nonconv", "P(next)")
-for a in (:CORRECT, :EXCURSE), b in ALT_BINS
+for a in sort(collect(keys(rows))), b in ALT_BINS
     r = rows[a][b]
     @printf("  %-9s %-10s %6d %7d  %s\n", a, b, r.n, r.n_nonconverged,
             r.n == 0 ? "(UNMEASURED -> self-transition)" :
