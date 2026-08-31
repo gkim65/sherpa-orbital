@@ -21,7 +21,11 @@ using SherpaOrbital, NativeSARSOP, POMDPs
 
 config = StationkeepingPOMDP()          # baseline scenario
 pomdp  = build_pomdp(config)
-policy = solve(SARSOPSolver(; precision = 1e-3, max_time = 30.0), pomdp)
+
+# ⚠️ `use_binning = false` is REQUIRED, not a tuning choice — NativeSARSOP's
+# `entropy(::SparseVector)` throws `InexactError` on this model otherwise.
+policy = solve(SARSOPSolver(; precision = 1e-3, max_time = 120.0,
+                            use_binning = false), pomdp)
 
 print_policy_table(policy, config)
 export_policy(policy, config)           # -> artifacts/policy.json
@@ -33,28 +37,85 @@ Or just run the worked example:
 julia --project=experiments experiments/example.jl
 ```
 
+### Using it as a library
+
+The package is consumed by [ClusterPolicyGen](https://github.com/gkim65/ClusterPolicyGen)
+for regret-based policy reuse:
+
+```julia
+Pkg.add(url = "https://github.com/gkim65/sherpa-orbital")
+```
+
+It satisfies that project's env-spec contract directly — `make_pomdp(spec, θ)` is
+`build_pomdp(StationkeepingPOMDP(; θ...))`, and `POMDPs.RolloutSimulator` runs on the
+resulting `QuickPOMDP`, so the discounted return regret needs is available for free.
+
+---
+
+## Sweeping the environment (θ)
+
+The struct **is** the environment, so a parameterized POMDP family is one loop:
+
+```julia
+for θ in [(plume_gradient = g,) for g in (0.0, 2.0, 4.0, 6.0)]
+    cfg = StationkeepingPOMDP(; θ...)
+
+    tbl = if needs_recalibration(θ)        # dynamics axis -> re-measure (~7 min)
+        rows, diag = calibrate_tables(cfg)
+        t = tables_from_rows(rows, diag)
+        write_tables(t; path = theta_path("tables", θ)); t
+    else                                    # analytic axis -> reuse kernels (~0 s)
+        nothing
+    end
+
+    policy = solve(solver, build_pomdp(cfg; tables = tbl))
+    export_policy(policy, cfg; path = theta_path("policy", θ))
+end
+```
+
+Three axes, all shaped identically as scalar fields on the config:
+
+| axis | field | paper category | cost per θ |
+|---|---|---|---|
+| nav noise | `sigma_nav_km` | `O_θ` | ~2 s — analytic (`observation_matrix`) |
+| plume gradient | `plume_gradient` | `T_θ` | ~2 s — analytic (`transition_matrix`) |
+| thruster error | `noisy_thruster`, `thruster_kwargs` | `T_θ` | **~7 min — re-measures the kernels** |
+
+`needs_recalibration(θ)` reports which of the two regimes a θ falls into. `theta_path`
+keys artifacts by θ so a sweep cannot overwrite its own output.
+
+`S`, `A`, `O` and `γ` stay fixed across a sweep, as the formulation requires — note this
+makes `plume_levels` (which changes `|S|`) **not** a legal θ.
+
 ---
 
 ## The model
 
 |              | |
 |--------------|--|
-| **State**    | `(dev, cov)`. `dev` = apse-position deviation bin (`OK`/`DRIFT`/`FAR`, plus terminal `LOST`/`CRASHED`) — the safety variable. `cov` = 3-bit mask over science altitude bands (`LOW`/`MID`/`HIGH`) — the science variable. \|S\| = 3·2³ + 2 = 26 |
-| **Actions**  | `OBSERVE`, `CORRECT`, `EXCURSE_LOW`, `EXCURSE_MID`, `EXCURSE_HIGH`. \|A\| = 5 |
-| **Obs**      | Noisy read of the dev bin (Gaussian nav noise on the measured deviation). `cov` is known exactly. \|O\| = 5 |
-| **Reward**   | `+r_science` per newly sampled band, −fuel per burn, large − on crash/escape |
+| **State**    | `(alt, visits, intensity)`. `alt` = achieved periapsis-**altitude** bin (`BELOW_20`/`A20_27`/`A27_34`/`A34_44`/`ABOVE_44`, plus terminal `CRASHED`/`LOST` — there is no separate safety variable). `visits` = per-band sample **count**, saturating at `visit_cap`. `intensity` = the plume sample intensity the last pass yielded, `1:plume_levels`. \|S\| = 5·(cap+1)³·k + 2 = **1877** at cap 4, k 3 |
+| **Actions**  | `CORRECT`, `EXCURSE_LOW`, `EXCURSE_MID`, `EXCURSE_HIGH`. \|A\| = **4**. Every action burns — **there is no `OBSERVE`** (removed 2026-08-30: on this orbit a no-burn coast is not a decision, it is a slow loss of the vehicle) |
+| **Obs**      | Noisy read of the achieved periapsis altitude (Gaussian nav noise, σ = `sigma_nav_km`), binned. Visit counts and intensity are deterministic functions of the observed bin. \|O\| = 7 |
+| **Reward**   | `+r_science ×` realized intensity per band sample (× `repeat_factor` past the cap), −fuel per burn, large − on crash/escape |
 
-Two things worth knowing about the formulation:
+Four things worth knowing about the formulation:
 
 **Actions encode intent, not a burn vector.** A fixed menu of burn directions was measured
 and shown to fail; the burn direction is solved live by the planner against the onboard
 model, so the POMDP only chooses *what to attempt*.
 
-**Science is banked only on survival.** An excursion adds its band to `cov` only if the
-pass did not go terminal. That coupling is what forces the policy to sequence excursions
-rather than attempt everything at once — and it is visible in the solved policy, which
-excurses toward whichever band is unsampled from `OK`, but always `CORRECT`s from
-`DRIFT`/`FAR`.
+**Science is banked on the OBSERVED altitude, not the commanded one.** A band pays when
+the pass actually lands in its bin, so a missed excursion earns nothing and `CORRECT` banks
+its own bin passively. Coverage therefore carries the observation model's ~15–20%
+edge-driven misbin rate; report the science product with that attached.
+
+**Science is banked only on survival.** A pass banks its band only if it did not go
+terminal. That coupling is what forces the policy to sequence excursions rather than
+attempt everything at once.
+
+**The altitude bins bracket the controller's limit cycle.** `CORRECT` settles at 37.17 km,
+which sits in `A34_44` — deliberately **not** a science band. Without that, two of three
+bands were banked by doing nothing and the science/safety tradeoff was vacuous.
 
 ### Editing the scenario
 
@@ -63,31 +124,54 @@ config (see [src/StationkeepingPOMDP.jl](src/StationkeepingPOMDP.jl)):
 
 ```julia
 StationkeepingPOMDP(; r_science = 40.0)                     # value science more
-StationkeepingPOMDP(; dev_edges = (10.0, 50.0, 150.0))      # tighter safety bins
+StationkeepingPOMDP(; plume_gradient = 4.0)                 # steep plume altitude gradient
 StationkeepingPOMDP(; discount = 0.99, fuel_weight = 2.0)   # patient, fuel-conscious
 ```
+
+`fuel_weight` defaults to **0** — the study is science yield under environmental
+uncertainty, not fuel feasibility. The fuel machinery is intact, so raising the weight
+restores the tradeoff with no code change.
 
 ---
 
 ## Measured tables, not analytic guesses
 
-The dev-transition kernels are **measured** from CR3BP+J2 experiments, not derived in
-closed form. They live in [artifacts/tables.json](artifacts/tables.json) alongside their
-provenance (which experiment produced each row, and how much to trust it), and are loaded
-at model-build time:
+The altitude-transition kernels are **measured** from the Julia truth model (CR3BP + J2),
+not derived in closed form. They live in [artifacts/tables.json](artifacts/tables.json)
+alongside their provenance — θ (which environment), effort (how hard it was sampled),
+per-row trial counts — and are loaded at model-build time:
 
 ```julia
-tables = load_tables()          # validates: row-stochastic, correct dev ordering
+tables = load_tables()          # validates: row-stochastic, correct altitude ordering
 validate_tables(tables)
+```
+
+Regenerate them with:
+
+```bash
+julia --project=experiments experiments/calibrate.jl     # ~7 min
 ```
 
 `artifacts/` is committed on purpose. These are a scientific provenance record — being
 able to see a probability change in a diff is how a re-measurement gets noticed.
 
-> **Current status:** the kernels are still hand-transcribed from the Python experiment
-> output rather than machine-generated, and the `DRIFT`/`FAR` rows rest on few trials.
-> See the `meta.caveats` field in the artifact. Replacing this with a Julia calibration
-> step that measures them directly is the next milestone.
+**One kernel per action.** `excurse` is keyed `[action][from_bin]` (artifact `format: 2`).
+This matters: the kernels were previously pooled across bands, which made
+`EXCURSE_LOW/MID/HIGH` mathematically identical in `T` and left nothing in the model able
+to steer altitude. `load_tables` **rejects** format-1 artifacts rather than silently
+rebuilding that degeneracy.
+
+> ### ⚠️ Read `meta.trials` before quoting a policy behaviour
+> **16 of 20 rows currently sit below `MIN_TRIALS_TRUSTED = 20`, most at n = 1** — including
+> the rows the policy leans on most (`EXCURSE_*` from the limit-cycle bin `A34_44`). Those
+> read as 100% success with zero measured failure probability off a single sample.
+>
+> More trials will not fix it: an accurate excursion walk *settles*, so a longer walk feeds
+> the destination row (n = 139) while the origin row it departed stays at n = 1. Fixing it
+> needs more **restarts**, not longer walks. Tracked in `docs/todo.md`.
+>
+> Also: kernels are noise-free unless calibrated with `noisy_thruster = true`, so any
+> survival number derived from them is an **upper bound**, not feasibility.
 
 ---
 
@@ -98,18 +182,26 @@ Project.toml            Julia package (SherpaOrbital)
 Manifest.toml           committed — reproducible environment
 src/
   SherpaOrbital.jl      module + exports
-  StationkeepingPOMDP.jl  the @kwdef config struct
-  states.jl             (dev, cov) space, binning, coverage bitmask
+  StationkeepingPOMDP.jl  the @kwdef config struct — holds ALL of θ
+  states.jl             (alt, visits, intensity) space, altitude binning
   actions.jl            action set, excursion -> band mapping
   observations.jl       O[s,o] — analytic Gaussian nav model
+  plume.jl              P_θ(intensity | band) — the plume altitude gradient
   tables.jl             load/write/validate the measured kernels
-  transition.jl         T[s,a,s'] — includes the science-banking coupling
+  transition.jl         T[s,a,s'] — science banking + the intensity draw
   rewards.jl            r(s,a) — science / fuel / expected terminal cost
   model.jl              build_pomdp
-  export.jl             solved policy -> JSON
+  export.jl             solved policy -> JSON, θ-keyed artifact paths
+  calibration/          MEASURE the kernels from the truth model
+  dynamics/             CR3BP (onboard) + J2 variants (truth) — kept separate
+  planner.jl            onboard burn planner (CR3BP only)
+  baselines/mpc.jl      MPC baseline
+  spacecraft/           thruster + nav models (explicit rng)
+  common/simulate.jl    unified rollout harness
   common/report.jl      model + policy pretty-printing
 experiments/            own Project.toml — isolates the solver dependency
   example.jl            worked end-to-end example
+  calibrate.jl          regenerates artifacts/tables.json
 artifacts/              measured tables + exported policy (committed)
 test/                   runtests.jl
 legacy/                 frozen Python, NOT part of the pipeline (see below)
@@ -143,13 +235,21 @@ kept as specifications for a Makie port.
 ## Tests
 
 ```bash
-julia --project=. -e 'using Pkg; Pkg.test()'    # 59/59
+julia --project=. -e 'using Pkg; Pkg.test()'    # 266/266, ~3 min
 ```
 
-The suite covers the **POMDP model layer** (state space, dev binning, actions, measured
-tables, transition/observation matrices, rewards, config plumbing). The physics layer is
-cross-checked by `scratch/compare/*.jl` against the frozen Python dumps rather than by
-unit tests — see the Session-5 log for why that split is deliberate and when it changes.
+The orbit-geometry, family-continuation and rollout testsets take minutes, which is too
+slow for an edit loop on the model layer. Pass substrings to run only matching testsets:
+
+```bash
+julia --project=. -e 'using Pkg; Pkg.test(test_args=["plume","rewards"])'   # ~8 s
+```
+
+The suite covers the **POMDP model layer** (state space, altitude binning, actions, measured
+tables, transition/observation matrices, rewards, the plume gradient, config plumbing) plus
+orbit geometry and the controller. The physics layer is additionally cross-checked by
+`scratch/compare/*.jl` against frozen Python dumps — see the Session-5 log for why that
+split is deliberate.
 
 ---
 
