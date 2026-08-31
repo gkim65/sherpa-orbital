@@ -30,10 +30,14 @@ METHOD
   CORRECT : run the sustained shell-cadence CORRECT loop and log alt_before → alt_after,
             then seed one short loop per altitude bin from a real halo-family member there,
             so the bins a working controller never visits are measured rather than invented.
-  EXCURSE : one step of a PERSISTENT walk toward a band's commanded altitude, carried across
-            trials so the walk accumulates — single-pass authority is not the quantity the
-            policy reasons about, the settling walk is. Seeded from every (bin × band) pair
-            for the same reason as CORRECT. ONE KERNEL PER EXCURSE ACTION.
+  EXCURSE : short walks toward a band's commanded altitude, RESTARTED from the seed every
+            `EXCURSE_PASSES_PER_RESTART` passes so each restart contributes a fresh
+            departure from the origin bin. Seeded from every (bin × band) pair for the same
+            reason as CORRECT. ONE KERNEL PER EXCURSE ACTION.
+            ⚠️ CHANGED 2026-08-31: the walk used to be carried forward across ALL trials,
+            which made the trial count a WALK LENGTH. Because an accurate excursion settles
+            after 1–2 passes, every later pass was recorded departing the DESTINATION bin
+            and the origin rows stayed at n = 1 — see `excurse_walk!`.
             ⚠️ CHANGED 2026-08-30. Every EXCURSE_* used to SHARE one kernel, on exp 12's
             finding that excursion SAFETY did not differ meaningfully by band (only ΔV
             did). That is right for the safety question and wrong for the science one: a
@@ -46,9 +50,10 @@ a freshly-placed PERIODIC family member, which is the most stable state in the s
 measured only from seeds therefore understates how fast the orbit diverges. That bias is what
 made the old OBSERVE rows come back as 100% self-transitions and taught the solved policy
 that coasting was free — it chose OBSERVE twice and escaped at 3.78 d (2026-08-30). The
-EXCURSE walks mitigate it by carrying the walker forward across trials rather than re-seeding
-each time, so later trials condition on drifted states. Prefer a row with sustained-loop
-trials in it over one that is purely seeded.
+EXCURSE walks mitigate it by flying a few passes per restart rather than one, so the later
+passes of each restart condition on drifted states. Prefer a row with sustained-loop trials in
+it over one that is purely seeded. (Before 2026-08-31 the walker was never re-seeded at all,
+which avoided the bias but produced n = 1 origin rows — a worse failure.)
 
 ⚠️ TRUTH/ONBOARD SPLIT. `truth_eom!` is an argument and is integrated only in the coast
 helpers; all planning goes through `solve_burn` on the onboard CR3BP.
@@ -86,6 +91,16 @@ end
 
 """Minimum trials before a measured row is considered anything but indicative."""
 const MIN_TRIALS_TRUSTED = 20
+
+"""
+Passes flown per EXCURSE restart before the walker is returned to its seed.
+
+The trial budget is redistributed, not increased: `n_trials` total passes become
+`n_trials / passes_per_restart` fresh DEPARTURES from the origin bin. Small because an
+accurate excursion settles in 1-2 passes, so extra passes only re-measure the destination
+bin; large enough to see whether the excursion actually survives the pass after arrival.
+"""
+const EXCURSE_PASSES_PER_RESTART = 3
 
 # ── Coast helpers (the ONLY place truth is integrated) ─────────────────────────
 """
@@ -164,7 +179,7 @@ const CALIBRATION_EFFORT = (
     horizon_s           = 25 * 86400.0,
     excurse_trials      = 24,
     seed_trials         = 8,
-    excurse_seed_trials = 24,
+    excurse_seed_trials = 48,
     seed_bins           = true,
     rng_seed            = 0,
 )
@@ -475,20 +490,49 @@ function calibrate_tables(;
     # One persistent-reference walk, logged into the EXCURSE kernel. Factored out so the
     # bin-seeded walks below run the IDENTICAL measurement as the primary ones — a
     # hand-copied second loop is how the two would silently diverge.
-    function excurse_walk!(band, peri_tgt, ra, start_state, n_trials)
+    function excurse_walk!(band, peri_tgt, ra, start_state, n_trials;
+                           passes_per_restart::Integer = EXCURSE_PASSES_PER_RESTART)
         # The kernel this walk measures is the one for the ACTION that aims at `band`.
         # ⚠️ Previously every walk bumped a single shared `:EXCURSE` key, which pooled the
         # three bands' outcomes and discarded the aiming. See `kernel_keys` above.
         akey = Symbol("EXCURSE_", band)
-        walker = copy(start_state)      # carried across trials: the walk accumulates
-        for _ in 1:n_trials
+
+        # ⚠️ RESTARTS, NOT ONE LONG WALK (fixed 2026-08-31). `walker` used to be initialised
+        # ONCE outside this loop and carried forward, so `n_trials` was a WALK LENGTH, not a
+        # trial count. An accurate excursion SETTLES — it reaches the commanded band on pass
+        # 1–2 and stays — so every later pass was recorded departing the DESTINATION bin and
+        # the origin row kept n = 1. That is why raising the trial counts 8 → 24 on
+        # 2026-08-30 changed nothing for the rows the policy leans on hardest
+        # (`EXCURSE_*` from the limit-cycle bin: "I am holding station, what if I dive?"),
+        # which read as 100% success off a single sample — the same shape as the thin-kernel
+        # bug that killed the OBSERVE action.
+        #
+        # Now: restart from `start_state` every `passes_per_restart` passes, so each restart
+        # contributes a fresh DEPARTURE from the origin bin. `n_trials` is still the total
+        # pass budget, so cost is unchanged; the passes are just redistributed.
+        #
+        # The trade-off is real and is the reason for short walks rather than one pass per
+        # restart: `start_state` is a fresh PERIODIC family member, the most stable state in
+        # the system, so restarting understates divergence. That seeding bias is what
+        # corrupted the OBSERVE kernel. A few passes per restart sees whether the excursion
+        # actually survives while still producing many departures.
+        walker = copy(start_state)
+        for t in 1:n_trials
+            # Fresh departure at the start of each restart block.
+            t > 1 && (t - 1) % passes_per_restart == 0 && (walker = copy(start_state))
+
             from = bin_of(alt_of(walker))
-            from in ALT_BINS || break
+            # Out of the live bins -> this restart is done; begin the next one.
+            if !(from in ALT_BINS)
+                walker = copy(start_state)
+                continue
+            end
 
             sh, sc = _to_shell(truth_eom!, walker, 4 * one_rev_s)
             if sh !== :ok
                 bump!(akey, from, _terminal_dev(sh))
-                break
+                walker = copy(start_state)   # terminal: restart, do not cancel the rest
+                continue
             end
 
             b = solve_burn(sc, one_rev_s; eom! = cr3bp_eom!, mode = :altitude_position,
@@ -526,7 +570,8 @@ function calibrate_tables(;
                 push!(band_dv[band], 0.0)
                 verbose && @printf("  excurse %-4s step from %-8s NO APSE PAIR (ΔV=0) -> LOST\n",
                                    band, from)
-                break
+                walker = copy(start_state)   # terminal: restart, do not cancel the rest
+                continue
             end
 
             sp = copy(sc)
@@ -536,7 +581,8 @@ function calibrate_tables(;
                 bump!(akey, from, _terminal_dev(pe))
                 push!(dvs[akey][from], b.dv_mag_ms)
                 push!(band_dv[band], b.dv_mag_ms)
-                break
+                walker = copy(start_state)   # terminal: restart, do not cancel the rest
+                continue
             end
 
             bump!(akey, from, bin_of(alt_of(ue)))
