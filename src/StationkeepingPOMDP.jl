@@ -239,6 +239,38 @@ Base.@kwdef struct StationkeepingPOMDP
     # entirely (|S| unchanged), so the pre-intensity model stays reachable for comparison.
     # ⚠️ |S| scales LINEARLY in this: 5*(cap+1)^bands*k + 2, so k=3 is 1877 and k=5 is 3127.
     plume_levels::Int               = 3
+    # Science value of the WEAKEST intensity level; the strongest is always 1.0 and the
+    # levels in between are evenly spaced. At k = 3 this gives 0.3 / 0.65 / 1.0.
+    #
+    # ⚠️ THE FLOOR EXISTS BECAUSE 0.0 WAS A DEFECT (2026-08-31). The scale used to be
+    # `(level-1)/(k-1)`, so the weakest level was worth exactly nothing — which zeroed both
+    # a weak sample taken inside a real science band AND every pass outside a band (those
+    # carry level 1 as a "no sample" marker). A `CORRECT` pass therefore earned nothing no
+    # matter how the rest of the reward was tuned, because anything × 0.0 is 0.0.
+    #
+    # ⚠️ NOT A MEASURED QUANTITY. `aa50429-24_cassini.pdf` gives plume transits at 95 km and
+    # 49 km, both ABOVE our bands, and no yield-vs-altitude table — see `plume.jl`. This is
+    # a modelling choice (user, 2026-08-31: "it should never be zero, lets do .3 .6 and 1"),
+    # and like `plume_gradient` it is a hypothesis to sweep, not a datum.
+    intensity_value_min::Float64    = 0.3
+    # Science yield multiplier by the ORBIT-DAMAGE bin the pass landed in, in
+    # `RESIDUAL_BINS` order (R_OK, R_DEGRADED, R_CRITICAL). A sample taken from a badly
+    # degraded orbit is worth less: pointing and geometry are worse, so the measurement is.
+    #
+    # ⚠️ ON THE SAME FOOTING AS THE INTENSITY SCALE, deliberately (user, 2026-08-31). Both
+    # are unit-free multipliers on `r_science` running from a nonzero floor up to 1.0, so
+    # "half the damage penalty" and "one intensity level" are comparable magnitudes and
+    # neither silently dominates. Values mirror `intensity_value_min`'s 0.3 floor.
+    #
+    # ⚠️ IT KEYS ON THE SUCCESSOR'S DAMAGE, NOT THE DEPARTING STATE — see `rewards.jl`. A
+    # departing-state penalty is identical across actions and CANCELS out of the comparison;
+    # measured 2026-08-31, it changed the greedy action in 0 of 15 states. Keying on where
+    # the action LEAVES you is what discriminates: `CORRECT` clears the damage and keeps
+    # full value, an excursion that deepens it pays the multiplier.
+    #
+    # ⚠️ NOT A MEASURED QUANTITY — a modelling choice, like `plume_gradient`. Set all three
+    # to 1.0 to disable the term and recover the pre-2026-08-31 reward.
+    damage_yield::NTuple{3,Float64} = (1.0, 0.65, 0.3)
 
     # -- rewards -------------------------------------------------------------
     r_science::Float64              =   20.0

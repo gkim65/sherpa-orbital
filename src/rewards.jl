@@ -3,9 +3,35 @@ rewards.jl — r(s, a): the science-vs-safety tradeoff.
 
 Four terms:
   + `r_step_ok`   for surviving a non-terminal step (a small living reward)
-  + `r_science`   EXPECTED, for each band sample banked on this step while under the cap
+  + `r_science`   EXPECTED, for the sample this step collected
   − fuel          `fuel_weight * action_dv_cost[a]`
   − terminal risk the EXPECTED cost of entering CRASHED/LOST on this step
+
+THE SCIENCE TERM, in full (2026-08-31):
+
+    r_science * visit_factor * value(intensity) * damage_yield(residual)
+
+with three independent factors, each answering a different question about the pass:
+
+  | factor              | question                          | source                     |
+  |---------------------|-----------------------------------|----------------------------|
+  | `visit_factor`      | first visit to this band, or not? | `SKState.visits`           |
+  | `value(intensity)`  | how strong was the sample?        | `SKState.intensity`        |
+  | `damage_yield`      | how degraded was the orbit?       | `SKState.residual`         |
+
+`visit_factor` is `gained` under the cap and `repeat_factor` once saturated. The other two
+are unit-free multipliers on the same 0.3-to-1.0 scale, so one intensity level and one
+damage level are comparable in magnitude and neither silently dominates.
+
+⚠️ EVERY PASS COLLECTS. There is no "non-sampling" pass: sampling in the mission concept is
+PASSIVE (the spacecraft collects by flying THROUGH the plume region), so every altitude bin
+draws an intensity and every pass is paid. Only the VISIT COUNT is per science band. See
+`transition.jl` and `plume_band_depth`.
+
+⚠️ DANGER IS NOT A REWARD COEFFICIENT. How risky an action is enters through `T` — the
+measured `P(LOST)` multiplied by `r_lost` below — not through the science term.
+`damage_yield` prices the QUALITY of a sample taken from a degraded orbit; it is not the
+safety penalty.
 
 Two of those terms are expectations over T, which is why the reward needs the transition
 matrix. The mission-loss cost attaches to the transition, not to occupying the state; and
@@ -41,13 +67,8 @@ function reward_function(pomdp::StationkeepingPOMDP, T::Array{Float64,3})
     nb   = n_bands(pomdp)
 
     zero_v    = _zero_visits(pomdp)
-    i_crashed = sidx[SKState(:CRASHED, zero_v, 1)]
-    i_lost    = sidx[SKState(:LOST, zero_v, 1)]
-
-    # Which band each live altitude bin banks, precomputed: the reward has to know whether
-    # a successor represents a SAMPLE (payable, possibly past the cap) or merely a pass
-    # through an unproductive bin.
-    band_of_bin = Dict(bin => findfirst(==(bin), pomdp.band_bins) for bin in ALT_BINS)
+    i_crashed = sidx[SKState(:CRASHED, zero_v, 1, :R_OK)]
+    i_lost    = sidx[SKState(:LOST, zero_v, 1, :R_OK)]
 
     function reward(s::SKState, a::Symbol)
         isterminal_state(s) && return 0.0
@@ -68,15 +89,38 @@ function reward_function(pomdp::StationkeepingPOMDP, T::Array{Float64,3})
             p = row[spi]
             p == 0.0 && continue
             isterminal_state(sp) && continue
-            val = plume_intensity_value(pomdp, sp.intensity)
+            # Two multipliers, on the same 0.3-to-1.0 footing so neither dominates:
+            #   value(intensity) — how strong a sample the pass actually collected;
+            #   damage_yield     — how degraded the orbit was when it collected it.
+            # ⚠️ Damage keys on the SUCCESSOR `sp`, i.e. the damage the action LEAVES you
+            # in. Keying on the departing state `s` would apply the same factor to every
+            # action and cancel out of the comparison entirely (measured: 0 of 15 greedy
+            # actions changed). This way `CORRECT`, which clears the damage, keeps full
+            # value while an excursion that deepens it is discounted.
+            val = plume_intensity_value(pomdp, sp.intensity) *
+                  pomdp.damage_yield[residual_index(sp.residual)]
             gained = visit_total(sp.visits) - visit_total(s.visits)
             if gained > 0
                 r += p * pomdp.r_science * gained * val
             else
-                # No count increment. It is still a sample IFF the pass landed in a band —
-                # which means that band was already saturated.
-                b = band_of_bin[sp.alt]
-                b === nothing && continue
+                # No count increment — either the band saturated, or the pass landed outside
+                # every science band. EITHER WAY A SAMPLE WAS TAKEN, so it pays at the
+                # diminishing-returns rate.
+                #
+                # ⚠️ THIS USED TO `continue` FOR A NON-BAND PASS, paying it nothing
+                # (2026-08-31). Sampling is PASSIVE — the spacecraft collects by flying
+                # THROUGH the plume region, not by commanding an observation — so a
+                # `CORRECT` pass at the ~37 km limit cycle does collect. Paying it zero made
+                # stationkeeping worthless in the objective even after the residual
+                # dimension made the danger visible: measured, `CORRECT` at
+                # `A27_34/R_DEGRADED` repaired the orbit with P = 1.000 (n = 2412 at tree
+                # depth 9) and still scored 0.5 against an excursion's 10.5, so the policy
+                # excursed until it died.
+                #
+                # The 2026-08-30 edge rebase is PRESERVED: `A34_44` is still not a science
+                # band, so it never banks a visit and never earns the full `r_science` — it
+                # earns the repeat rate, scaled by the intensity its own depth draws. A
+                # chosen excursion into an unsaturated band is still worth strictly more.
                 r += p * pomdp.r_science * pomdp.repeat_factor * val
             end
         end

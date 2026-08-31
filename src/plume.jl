@@ -76,21 +76,45 @@ function plume_level_scores(k::Int)
 end
 
 """
-    plume_band_depth(pomdp, b) -> Float64
+    plume_band_depth(pomdp, bin::Symbol) -> Float64
+    plume_band_depth(pomdp, b::Int) -> Float64
 
-Normalized DEPTH `d_b ∈ [0, 1]` of science band `b`: 1.0 for the lowest-altitude band,
-0.0 for the highest, linear in the band's representative altitude in between.
+Normalized DEPTH `d ∈ [0, 1]` of an ALTITUDE BIN: 1.0 for the lowest-altitude bin, 0.0 for
+the highest, linear in the bin's representative altitude in between.
 
-Keyed off `alt_rep_km[band_bins[b]]` rather than `band_target_km`, so depth reflects where
-a pass is BINNED (which is what the state records) rather than what was commanded. With a
-single band, depth is 1.0 by convention.
+⚠️ DEFINED OVER EVERY LIVE ALTITUDE BIN, NOT JUST THE SCIENCE BANDS (2026-08-31). It used to
+span only `band_bins`, which meant the limit-cycle bin `A34_44` had no depth and therefore
+no intensity distribution — so a `CORRECT` pass could not draw a sample at all and was
+assigned the canonical "no sample" level. But sampling in the mission concept is PASSIVE:
+the spacecraft collects by flying THROUGH the plume region, so EVERY pass yields something
+and every altitude needs its own distribution. Spanning all of `ALT_BINS` also makes the
+gradient continuous in altitude rather than defined at three isolated points.
+
+Measured against the current `alt_rep_km`:
+
+  | bin      | rep alt | depth |
+  |----------|---------|-------|
+  | BELOW_20 |    18.0 |  1.00 |
+  | A20_27   |    23.5 |  0.80 |
+  | A27_34   |    30.5 |  0.55 |
+  | A34_44   |    37.2 |  0.31 |   <- the limit cycle: a real value, not a special case
+  | ABOVE_44 |    46.0 |  0.00 |
+
+Keyed off `alt_rep_km` rather than `band_target_km`, so depth reflects where a pass is
+BINNED (which is what the state records) rather than what was commanded.
+
+The `Int` method takes a SCIENCE BAND index and is retained for callers that think in
+bands; it resolves through `band_bins` to the same per-bin scale, so the two agree.
 """
-function plume_band_depth(pomdp::StationkeepingPOMDP, b::Int)
-    alts = [pomdp.alt_rep_km[bin] for bin in pomdp.band_bins]
+function plume_band_depth(pomdp::StationkeepingPOMDP, bin::Symbol)
+    alts = [pomdp.alt_rep_km[b] for b in ALT_BINS]
     lo, hi = minimum(alts), maximum(alts)
     hi ≈ lo && return 1.0
-    return (hi - alts[b]) / (hi - lo)
+    return (hi - pomdp.alt_rep_km[bin]) / (hi - lo)
 end
+
+plume_band_depth(pomdp::StationkeepingPOMDP, b::Int) =
+    plume_band_depth(pomdp, pomdp.band_bins[b])
 
 """
     plume_intensity_dist(pomdp, b) -> Vector{Float64}
@@ -102,11 +126,11 @@ At `plume_gradient = 0` this is uniform for EVERY band — the θ = 0 sanity gat
 mass shifts toward high intensity in DEEP (low-altitude) bands and toward low intensity in
 shallow ones.
 """
-function plume_intensity_dist(pomdp::StationkeepingPOMDP, b::Int)
+function plume_intensity_dist(pomdp::StationkeepingPOMDP, bin::Symbol)
     k = pomdp.plume_levels
     k == 1 && return [1.0]
     z = plume_level_scores(k)
-    d = plume_band_depth(pomdp, b)
+    d = plume_band_depth(pomdp, bin)
     # Softmax with inverse temperature θ·d. Subtract the max for numerical stability; it
     # cancels in the normalization.
     e = pomdp.plume_gradient .* d .* z
@@ -114,27 +138,49 @@ function plume_intensity_dist(pomdp::StationkeepingPOMDP, b::Int)
     return w ./ sum(w)
 end
 
+"""Band-index form. Resolves through `band_bins` to the per-bin method above."""
+plume_intensity_dist(pomdp::StationkeepingPOMDP, b::Int) =
+    plume_intensity_dist(pomdp, pomdp.band_bins[b])
+
 """
     plume_intensity_value(pomdp, level) -> Float64
 
-The science VALUE multiplier of a realized intensity level, in `[0, 1]`: level 1 pays the
-least, level `plume_levels` pays the most, evenly spaced. `k = 1` pays 1.0.
+The science VALUE multiplier of a realized intensity LEVEL. `level` is an INDEX into
+`1:plume_levels` (1 = weakest sample, `plume_levels` = strongest); the returned value is
+what that level is worth. `k = 1` pays 1.0.
 
-⚠️ THIS IS WHAT MAKES THE GRADIENT BITE. The reward pays for the REALIZED intensity, not
-for the band label (see `rewards.jl`), so a band whose intensity distribution is tilted
-high by θ is genuinely worth more — that is the mechanism by which θ changes the optimal
-policy rather than just relabeling states.
+⚠️ READ THE SIGNATURE CAREFULLY — `plume_intensity_value(pomdp, 1)` is "the value of the
+LOWEST level", not "the value 1". At k = 3 the levels map to `0.3, 0.65, 1.0`.
 
-⚠️ The MEAN multiplier is 0.5 at k > 1, not 1.0, so raising `plume_levels` with
-`r_science` fixed roughly HALVES expected science relative to the pre-intensity model.
-Intentional and documented rather than rescaled: the k = 1 model is the one that matches
-the old reward scale exactly.
+⚠️ **THE LOWEST LEVEL IS NEVER ZERO, AND THAT IS A FIX** (2026-08-31). The scale was
+`(level - 1) / (k - 1)`, which put level 1 at exactly 0.0. That zeroed two distinct things,
+and neither was intended:
+
+  1. **A weak sample in a real science band paid nothing.** The spacecraft flew through the
+     plume, took the weakest reading, and the reward scored it identically to not sampling.
+     A weak sample is still a sample.
+  2. **Every pass outside a science band paid nothing, unconditionally** — `transition.jl`
+     used level 1 as a canonical "no sample" MARKER, so a `CORRECT` pass at the ~37 km limit
+     cycle landed on the zero-valued level by construction. No coefficient anywhere else
+     could rescue it: anything × 0.0 is 0.0. This is the same trap already documented for
+     `r_crashed`/`r_lost`, reappearing in the science term.
+
+Since every altitude bin now draws a genuine intensity (see `plume_band_depth` and
+`transition.jl`), level 1 no longer means "nothing happened" — it means the weakest real
+measurement — so a zero floor is wrong on its own terms.
+
+The scale is `intensity_value_min` at level 1 rising evenly to 1.0 at level k.
+
+⚠️ THE MEAN MULTIPLIER IS NOT 1.0 (it is `(1 + min)/2` at k > 1), so raising `plume_levels`
+with `r_science` fixed still reduces expected science relative to the pre-intensity model.
+The k = 1 model is the one that matches the old reward scale exactly.
 """
 function plume_intensity_value(pomdp::StationkeepingPOMDP, level::Int)
     k = pomdp.plume_levels
     k == 1 && return 1.0
     1 <= level <= k || error("intensity level $level outside 1:$k")
-    return (level - 1) / (k - 1)
+    lo = pomdp.intensity_value_min
+    return lo + (1.0 - lo) * (level - 1) / (k - 1)
 end
 
 """

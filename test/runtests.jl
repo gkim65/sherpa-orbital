@@ -154,11 +154,20 @@ end
             @test plume_intensity_dist(flat, b) ≈ d1
         end
 
-        # Rising θ tilts the DEEPEST band toward high intensity and the shallowest away
-        # from it. Bands are (LOW, MID, HIGH) so band 1 is deepest, band 3 shallowest.
+        # Rising θ tilts DEEPER bins toward high intensity and shallower ones away from it.
+        # Bands are (LOW, MID, HIGH) so band 1 is the deepest band, band 3 the shallowest.
+        #
+        # ⚠️ DEPTH IS NORMALIZED OVER EVERY ALTITUDE BIN, NOT JUST THE BANDS (2026-08-31),
+        # so the LOW band is no longer depth 1.0 — `BELOW_20` sits below it and takes the
+        # 1.0 endpoint. This used to assert `depth(band 1) ≈ 1.0`, which pinned the old
+        # band-only scale and would now fail at 0.804. What must hold is the ORDERING and
+        # the endpoints of the full bin range.
         steep = StationkeepingPOMDP(; plume_gradient = 3.0, plume_levels = 3)
-        @test plume_band_depth(steep, 1) ≈ 1.0        # LOW is the deepest
-        @test plume_band_depth(steep, 3) ≈ 0.0        # HIGH is the shallowest
+        @test plume_band_depth(steep, :BELOW_20) ≈ 1.0   # lowest bin overall
+        @test plume_band_depth(steep, :ABOVE_44) ≈ 0.0   # highest bin overall
+        @test plume_band_depth(steep, 1) > plume_band_depth(steep, 2) >
+              plume_band_depth(steep, 3)                 # LOW deeper than MID than HIGH
+        @test plume_band_depth(steep, 3) ≈ 0.0           # HIGH *is* the shallowest bin
         top = steep.plume_levels
         @test plume_intensity_dist(steep, 1)[top] > d1[top]     # LOW gains high intensity
         @test plume_intensity_dist(steep, 3) ≈ d1               # depth 0 ⟹ still uniform
@@ -182,20 +191,45 @@ end
             end
         end
 
-        # Intensity values span [0, 1] and are ordered, so a higher level pays more.
+        # Intensity values are ordered and span [intensity_value_min, 1].
+        #
+        # ⚠️ THE FLOOR IS NONZERO AND THAT IS THE POINT (changed 2026-08-31). This used to
+        # assert `plume_intensity_value(k5, 1) == 0.0`, which pinned a real defect: the
+        # weakest level paid NOTHING, so a weak sample in a science band scored the same as
+        # no sample, and — because `transition.jl` marked every non-band pass with level 1 —
+        # a `CORRECT` pass earned exactly zero science however the reward was tuned.
+        # Anything × 0.0 is 0.0. See `plume_intensity_value`.
         k5 = StationkeepingPOMDP(; plume_levels = 5)
-        @test plume_intensity_value(k5, 1) == 0.0
+        @test plume_intensity_value(k5, 1) == k5.intensity_value_min
+        @test plume_intensity_value(k5, 1) > 0.0
         @test plume_intensity_value(k5, 5) == 1.0
         @test issorted([plume_intensity_value(k5, l) for l in 1:5])
         # k = 1 disables the dimension: |S| must match the pre-intensity model exactly.
         k1 = StationkeepingPOMDP(; plume_levels = 1)
         @test plume_intensity_value(k1, 1) == 1.0
         @test SherpaOrbital.n_states(k1) ==
-              length(ALT_BINS) * SherpaOrbital.n_visit_combos(k1) + 2
+              length(ALT_BINS) * SherpaOrbital.n_visit_combos(k1) *
+              length(SherpaOrbital.RESIDUAL_BINS) + 2
         # |S| is LINEAR in k, and the intensity dimension actually enumerates.
         @test SherpaOrbital.n_states(StationkeepingPOMDP(; plume_levels = 3)) ==
               3 * (SherpaOrbital.n_states(k1) - 2) + 2
         @test length(SherpaOrbital.states(k5)) == SherpaOrbital.n_states(k5)
+
+        # EVERY altitude bin has a depth and an intensity distribution, not just the three
+        # science bands (2026-08-31). Sampling is passive — the spacecraft collects by
+        # flying through the plume region — so a pass outside every band still yields.
+        every = StationkeepingPOMDP()
+        for bin in ALT_BINS
+            d = SherpaOrbital.plume_band_depth(every, bin)
+            @test 0.0 <= d <= 1.0
+            @test sum(SherpaOrbital.plume_intensity_dist(every, bin)) ≈ 1.0
+        end
+        # The limit-cycle bin is NOT a science band, yet must still have a real depth
+        # strictly between the bands that bracket it in altitude.
+        @test !(every.correct_bin in every.band_bins)
+        @test SherpaOrbital.plume_band_depth(every, :ABOVE_44) <
+              SherpaOrbital.plume_band_depth(every, every.correct_bin) <
+              SherpaOrbital.plume_band_depth(every, :A27_34)
     end
 
     # θ must reach the SOLVABLE MODEL, not just the helper functions. A gradient that
@@ -278,17 +312,24 @@ end
         # at a band does not change where you land — which makes the three EXCURSE actions
         # identical in T and leaves nothing in the model able to steer altitude. Aiming at
         # different bands MUST give different successor distributions.
-        @test SherpaOrbital.alt_kernel(tables, :EXCURSE_LOW, :A34_44) !=
-              SherpaOrbital.alt_kernel(tables, :EXCURSE_HIGH, :A34_44)
+        # ⚠️ ROWS ARE NOW KEYED (altitude, residual) and columns are the JOINT successor
+        # (2026-08-31) — the kernel is conditioned on ORBIT DAMAGE, because keyed on
+        # altitude alone a row averages a fresh departure with a degraded one and reports
+        # P(loss) = 0 for the transition that actually loses the vehicle.
+        key = SherpaOrbital.KernelKey(:A34_44, :R_OK)
+        @test SherpaOrbital.alt_kernel(tables, :EXCURSE_LOW, key) !=
+              SherpaOrbital.alt_kernel(tables, :EXCURSE_HIGH, key)
 
         # And the aiming must point the right way: from the limit cycle, aiming LOW must put
         # strictly more mass in the LOW band's bin than aiming HIGH does, and vice versa.
-        # This is the property the whole plume-gradient θ axis rests on.
-        oi = Dict(b => i for (i, b) in enumerate(ALT_ALL))
-        k_lo = SherpaOrbital.alt_kernel(tables, :EXCURSE_LOW,  :A34_44)
-        k_hi = SherpaOrbital.alt_kernel(tables, :EXCURSE_HIGH, :A34_44)
-        @test k_lo[oi[:A20_27]]   > k_hi[oi[:A20_27]]
-        @test k_hi[oi[:ABOVE_44]] > k_lo[oi[:ABOVE_44]]
+        # This is the property the whole plume-gradient θ axis rests on. Successor mass is
+        # summed over the residual bins, since the columns are joint (alt, residual).
+        k_lo = SherpaOrbital.alt_kernel(tables, :EXCURSE_LOW,  key)
+        k_hi = SherpaOrbital.alt_kernel(tables, :EXCURSE_HIGH, key)
+        alt_mass(row, a) = sum(row[SherpaOrbital.kernel_entry_index(a, r)]
+                               for r in SherpaOrbital.RESIDUAL_BINS)
+        @test alt_mass(k_lo, :A20_27)   > alt_mass(k_hi, :A20_27)
+        @test alt_mass(k_hi, :ABOVE_44) > alt_mass(k_lo, :ABOVE_44)
 
         # Every EXCURSE action must have its own kernel, or `alt_kernel` silently falls
         # back to a pooled row and the degeneracy returns unnoticed.
