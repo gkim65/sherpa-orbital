@@ -88,7 +88,7 @@ resulting `QuickPOMDP`, so the discounted return regret needs is available for f
 The struct **is** the environment, so a parameterized POMDP family is one loop:
 
 ```julia
-for θ in [(plume_gradient = g,) for g in (0.0, 2.0, 4.0, 6.0)]
+for θ in [(plume_gradient = g,) for g in (0.0, 0.5, 1.0, 2.0)]
     cfg = StationkeepingPOMDP(; θ...)
 
     tbl = if needs_recalibration(θ)        # dynamics axis -> re-measure (~7 min)
@@ -114,6 +114,33 @@ Three axes, all shaped identically as scalar fields on the config:
 
 `needs_recalibration(θ)` reports which of the two regimes a θ falls into. `theta_path`
 keys artifacts by θ so a sweep cannot overwrite its own output.
+
+**Choosing `plume_gradient` values — the axis SATURATES.** θ is the inverse temperature of a
+softmax, so past roughly θ ≈ 4 essentially all intensity mass already sits on the top level
+and further increases barely change the model. Expected science per pass
+(`r_science × E[value]`), measured:
+
+| bin | depth | θ=0 | θ=1.5 | θ=3 | θ=4.5 | θ=8 |
+|---|---|---|---|---|---|---|
+| `BELOW_20` | 1.00 | 13.0 | 18.2 | 19.6 | 19.9 | 20.0 |
+| `A20_27` (LOW) | 0.80 | 13.0 | 17.6 | 19.3 | 19.8 | 20.0 |
+| `A27_34` (MID) | 0.55 | 13.0 | 16.5 | 18.5 | 19.4 | 19.9 |
+| `A34_44` (cycle) | 0.31 | 13.0 | 15.1 | 16.9 | 18.1 | 19.4 |
+| `ABOVE_44` (HIGH) | 0.00 | 13.0 | 13.0 | 13.0 | 13.0 | 13.0 |
+
+θ = 0 is the null hypothesis — no altitude gradient, every bin worth the same — and is the
+structural sanity gate (the exponent vanishes, so every bin is exactly uniform).
+
+**Most of the range is spent by θ ≈ 1.5.** LOW goes 13.0 → 17.6 over `[0, 1.5]`, which is
+~70% of its total movement, then only 17.6 → 20.0 over the whole of `[1.5, 8]`. So a grid
+should be dense at the bottom, not evenly spaced to a large θ: **`(0, 0.5, 1, 2)`** gives
+four clearly distinct models, whereas `(0, 2, 4, 6)` spends three of its four points in the
+flat region where θ = 4 and θ = 6 are nearly the same POMDP. Two θ collapsing onto one model
+is exactly what a sweep axis must not do — the regret between them would be noise.
+
+⚠️ `plume_gradient` reprices altitude but does NOT change the physics: the measured kernels
+are altitude dynamics and are shared across θ. A high θ makes low passes more valuable, not
+more survivable.
 
 `S`, `A`, `O` and `γ` stay fixed across a sweep, as the formulation requires — note this
 makes `plume_levels` (which changes `|S|`) **not** a legal θ.
@@ -147,10 +174,51 @@ matrix must use one or the other throughout.
 
 |              | |
 |--------------|--|
-| **State**    | `(alt, visits, intensity)`. `alt` = achieved periapsis-**altitude** bin (`BELOW_20`/`A20_27`/`A27_34`/`A34_44`/`ABOVE_44`, plus terminal `CRASHED`/`LOST` — there is no separate safety variable). `visits` = per-band sample **count**, saturating at `visit_cap`. `intensity` = the plume sample intensity the last pass yielded, `1:plume_levels`. \|S\| = 5·(cap+1)³·k + 2 = **1877** at cap 4, k 3 |
+| **State**    | `(alt, visits, intensity, residual)`. `alt` = achieved periapsis-**altitude** bin (`BELOW_20`/`A20_27`/`A27_34`/`A34_44`/`ABOVE_44`, plus terminal `CRASHED`/`LOST` — there is no separate safety variable). `visits` = per-band sample **count**, saturating at `visit_cap`. `intensity` = the plume sample intensity the last pass yielded, `1:plume_levels`. `residual` = **orbit-damage** bin (`R_OK`/`R_DEGRADED`/`R_CRITICAL`) — see below. \|S\| = 5·(cap+1)³·k·3 + 2 = **5627** at cap 4, k 3 |
 | **Actions**  | `CORRECT`, `EXCURSE_LOW`, `EXCURSE_MID`, `EXCURSE_HIGH`. \|A\| = **4**. Every action burns — **there is no `OBSERVE`** (removed 2026-08-30: on this orbit a no-burn coast is not a decision, it is a slow loss of the vehicle) |
-| **Obs**      | Noisy read of the achieved periapsis altitude (Gaussian nav noise, σ = `sigma_nav_km`), binned. Visit counts and intensity are deterministic functions of the observed bin. \|O\| = 7 |
-| **Reward**   | `+r_science ×` realized intensity per band sample (× `repeat_factor` past the cap), −fuel per burn, large − on crash/escape |
+| **Obs**      | Noisy read of the achieved periapsis altitude (Gaussian nav noise, σ = `sigma_nav_km`), binned. Visit counts, intensity and residual are all known exactly given the observed bin. \|O\| = 7 |
+| **Reward**   | `r_science × visit_factor × value(intensity) × damage_yield(residual)`, −fuel per burn, large − on crash/escape. **Every pass collects** — sampling is passive |
+
+### The residual (orbit-damage) dimension
+
+`residual` bins the **onboard `solve_burn` residual**: how badly the six apse constraints
+failed to be satisfiable by one impulse, i.e. how far the orbit has drifted from what the
+controller can fix in a single burn. It is the model's damage variable, and it exists
+because without it *the policy cannot represent how degraded the orbit is*, so it cannot
+learn that a LOW excursion needs two corrections before the next one.
+
+Bin edges are **measured, not chosen** — over 3671 pooled pass-to-pass transitions, scored
+on whether the *next* pass loses the apse pair (the failure that flies an uncontrolled pass
+and loses the vehicle):
+
+| bin | residual | n | P(lose apse pair next pass) |
+|---|---|---|---|
+| `R_OK` | < 15 km | 2363 | **0.000** |
+| `R_DEGRADED` | 15–25 km | 661 | 0.009 |
+| `R_CRITICAL` | ≥ 25 km | 647 | 0.062 |
+
+The hard zero on `R_OK` is the load-bearing property: it is what lets the policy tell a safe
+excursion from a dangerous one. Before this dimension existed the kernel reported
+`P(loss) = 0.0` for the transition that actually kills the vehicle — correct for a *fresh*
+excursion, but the danger is conditional on damage the state could not see. Neither more
+calibration (which averages fresh and degraded together) nor larger loss penalties (which
+multiply `P(loss)`, and anything × 0.0 is 0.0) can fix that.
+
+**It is observed exactly**, unlike altitude. The residual is computed by the onboard solver
+from the onboard model, not measured by a sensor, so the spacecraft knows it to machine
+precision; modelling it as noisy would invent uncertainty that does not exist.
+
+What the measured kernels say about recovery (tree depth 9):
+
+```
+CORRECT  A27_34   R_DEGRADED   P(damage decreases) = 1.000   P(LOST) = 0.000   n=2412
+CORRECT  A27_34   R_CRITICAL                        0.928             0.072   n=2452
+CORRECT  ABOVE_44 R_DEGRADED                        1.000             0.000   n=2792
+CORRECT  A20_27   R_CRITICAL                        0.179             0.821   n=5373
+```
+
+Correcting reliably repairs a degraded orbit **everywhere except low**, where it mostly
+fails and the vehicle is usually lost. That is the "LOW is special" result, measured.
 
 Four things worth knowing about the formulation:
 
@@ -265,6 +333,35 @@ legacy/                 frozen Python, NOT part of the pipeline (see below)
 
 The library declares **no solver dependency** — `NativeSARSOP` lives only in
 `experiments/Project.toml`, so anyone who wants the model without the solver can have it.
+
+---
+
+## Current result: the policy holds the orbit for 30 days
+
+Rolling the solved θ = 0 policy against the CR3BP + Enceladus J2 truth model, 30-day
+horizon, seeds 0–2:
+
+| thruster | outcome | discounted return | ΔV (m/s) | bands | samples | `CORRECT` |
+|---|---|---|---|---|---|---|
+| noise-free | survives 30 d, 3/3 | 147–150 | 90–94 | 3 | 11–12 | 29–37 of 60 |
+| noisy | survives 30 d, 3/3 | 138–164 | 99–187 | 3 | 9–12 | 25–38 of 60 |
+
+Before the residual dimension and the reward fix this policy **escaped at 3.8 d** having
+chosen `CORRECT` once in six passes.
+
+Two behaviours worth noting, neither of which was engineered:
+
+- **It corrects heavily** — roughly half of all passes — and interleaves excursions between
+  corrections rather than chaining them.
+- **It runs LOW as a bounded campaign.** `EXCURSE_LOW` fires at passes 11, 14, 17, 20 —
+  four times, spaced three apart — and then never again in the remaining 40 passes. The
+  3-pass spacing is "excurse, then correct twice", which is exactly the pattern the measured
+  kernels say is required; the policy found it from the kernel, not from being told.
+
+⚠️ `outcome = :idle` means the horizon was reached with no crash and no escape, but the
+controller stopped triggering before the end — survival, not a claim of active hold to the
+last second. And every number here is one policy at one θ; at θ = 8 one noisy seed crashes
+at 11.2 d, in a run where `CORRECT` was chosen only 2 of 23 times.
 
 ---
 
