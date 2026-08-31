@@ -1,10 +1,41 @@
 # SherpaOrbital — Enceladus Orbilander POMDP stationkeeping
 
 Offline POMDP stationkeeping for the Enceladus Orbilander mission concept
-(MacKenzie et al. 2020). The spacecraft holds a period-3 L1 halo orbit around Enceladus
-and must stationkeep without ground contact, trading **science** (sampling a range of
-periapsis altitudes) against **safety** (not crashing into Enceladus or escaping an
-unstable orbit).
+(MacKenzie et al. 2020). The spacecraft holds an L1 halo orbit with periapsis over
+Enceladus's south pole and must stationkeep without ground contact, trading **science**
+(sampling a range of periapsis altitudes, where the plumes are denser lower down) against
+**safety** (not crashing into Enceladus or escaping an unstable orbit).
+
+> **On the orbit: this is a TEST SCENARIO, not MacKenzie's exact science orbit.**
+>
+> We fly a **period-1** L1 halo — true period **11.996 hr**, one periapsis per revolution,
+> periapsis over the south pole at ~23–46 km depending on the commanded band. It is in the same
+> family and altitude range as the mission concept's orbit and poses the same control problem:
+> an orbit that must be actively held, where lower passes pay more science and cost more risk.
+> That is what the POMDP formulation is being tested on, and it is sufficient for the policy
+> question this repo is asking.
+>
+> MacKenzie §B.2.3 specifies a **period-3** orbit whose three periapses are geometrically
+> distinct and grouped over the south pole, chosen for ground-track diversity. We do not have
+> that orbit. Getting it is a branch-switching problem — locate a period-tripling bifurcation
+> along the family and continue off it — and no such crossing has been shown to exist in this
+> family at these altitudes. Future work, not a blocker.
+>
+> Reading older material in this repo: text before 2026-08-29 (including this README)
+> described the orbit as period-3. That was wrong, and it survived because the 11.996 hr period
+> happens to reproduce MacKenzie's ~12 hr periapsis spacing. It closes at `T/3` to 0.009 km —
+> better than at the nominal 35.988 hr — its three apparent "passes" are the same point
+> revisited to 3+ decimals in altitude, latitude and longitude, and it matches the JPL
+> Three-Body Periodic Orbit Catalog at 11.99604 hr, whose L1 halo periods span 7.80–16.14 hr.
+> `PERIOD1_TRIPLE_PERIOD_S` is 3x the true period, kept only because every controller
+> measurement to date used it as the rollout horizon.
+>
+> On "unstable": stationkeeping is genuinely required — uncontrolled, the orbit runs
+> 31 → 52 → 113 → 950 → 43,819 km in five passes under the truth model, and a 1 m error grows
+> ~183x over 8 revolutions. The precise form is worth knowing: all six Floquet multipliers lie
+> on the unit circle, so it is **marginally** stable rather than hyperbolically unstable, and
+> the fast divergence is driven by the **J2 model gap** between the truth and onboard models.
+> Growth is polynomial, not exponential.
 
 This is SHERPA-RPA Direction 3.
 
@@ -86,6 +117,29 @@ keys artifacts by θ so a sweep cannot overwrite its own output.
 
 `S`, `A`, `O` and `γ` stay fixed across a sweep, as the formulation requires — note this
 makes `plume_levels` (which changes `|S|`) **not** a legal θ.
+
+### Evaluating a policy: the discounted return
+
+Regret is a difference of value functions, `R_ij = V^{π_i}_{θ_i}(b₀) − V^{π_j}_{θ_i}(b₀)`
+with `V^π_θ(b₀) = E[Σ γᵗ R(sₜ,aₜ)]`, so an evaluator needs a **discounted return**.
+`run_rollout` reports survival, ΔV, band visits and achieved altitudes — none of which is
+one. [`discounted_return`](src/common/simulate.jl) supplies it:
+
+```julia
+res = run_rollout(SARSOPController(load_policy(p_i), ref_ic = ic), ic,
+                  cr3bp_j2_eom!, PERIOD1_TRIPLE_PERIOD_S, 30*24*3600.0)
+
+V = discounted_return(res, StationkeepingPOMDP(; plume_gradient = θ_j))   # V^{π_i}_{θ_j}
+```
+
+Scoring is **post-hoc over the trace**, deliberately: the reward belongs to a θ, the
+trajectory belongs to the physics, and one trajectory is legitimately scored under several θ
+to fill a matrix row. So an N×N matrix costs **N rollouts, not N²**.
+
+⚠️ This is the **truth-model** return (~10 s per 30-day rollout, real CR3BP dynamics), not
+the discrete-model one from `POMDPs.simulate` with a `RolloutSimulator` (milliseconds,
+states sampled from `T`). Both are valid; they are **not** interchangeable, and a regret
+matrix must use one or the other throughout.
 
 ---
 
