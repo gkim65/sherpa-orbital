@@ -61,16 +61,32 @@ _zero_visits(pomdp::StationkeepingPOMDP) = ntuple(_ -> 0, n_bands(pomdp))
 
 # ── State type ────────────────────────────────────────────────────────────────
 """
-    SKState(alt, visits)
+    SKState(alt, visits, intensity = 1)
 
 A stationkeeping state. `alt ∈ ALT_ALL`; `visits` is a per-band visit count, saturating at
 the POMDP's `visit_cap`. Terminal states carry all-zero visits: once the orbit is lost,
 banked science no longer affects the decision.
+
+`intensity ∈ 1:plume_levels` is the plume sample intensity the LAST pass yielded — an
+OBSERVED dimension (it is what the instrument measured), drawn by the transition from
+`P_θ(i | band)` and paid for by the reward. See [`plume_intensity_dist`](@ref).
+
+⚠️ INTENSITY IS A PROPERTY OF THE PASS JUST FLOWN, not of the vehicle. A pass that lands
+OUTSIDE every science band collects nothing, and carries `intensity = 1` (the lowest
+level) as a canonical "no sample" marker rather than a separate value — so the state space
+stays a clean product and no reward is paid, because the band gate in `rewards.jl` is what
+authorizes payment, not the intensity field alone.
+
+`intensity` defaults to 1 so every pre-intensity construction site (`plume_levels = 1`,
+tests, terminal states) keeps working unchanged.
 """
 struct SKState{N}
     alt::Symbol
     visits::NTuple{N,Int}
+    intensity::Int
 end
+
+SKState(alt::Symbol, visits::NTuple{N,Int}) where {N} = SKState(alt, visits, 1)
 
 """isterminal_state(s) -> Bool."""
 isterminal_state(s::SKState) = isterminal_alt(s.alt)
@@ -118,12 +134,16 @@ vectors.
 function states(pomdp::StationkeepingPOMDP)
     nb = n_bands(pomdp)
     S = SKState{nb}[]
-    for a in ALT_BINS, v in visit_tuples(pomdp)
-        push!(S, SKState(a, v))
+    # Intensity varies FASTEST, inside (alt, visits). Terminal states are appended last and
+    # carry intensity 1 only — a lost orbit measured nothing, so duplicating the two
+    # absorbing states across k levels would add unreachable states and k-1 spurious
+    # self-absorbing sinks.
+    for a in ALT_BINS, v in visit_tuples(pomdp), i in plume_levels_range(pomdp)
+        push!(S, SKState(a, v, i))
     end
     zero_v = ntuple(_ -> 0, nb)
     for a in TERMINAL_ALT
-        push!(S, SKState(a, zero_v))
+        push!(S, SKState(a, zero_v, 1))
     end
     return S
 end
@@ -132,9 +152,15 @@ end
 state_index(pomdp::StationkeepingPOMDP) =
     Dict(s => i for (i, s) in enumerate(states(pomdp)))
 
-"""n_states(pomdp) -> Int. |S| = 5 * (visit_cap + 1)^n_bands + 2."""
+"""
+n_states(pomdp) -> Int. |S| = 5 * (visit_cap + 1)^n_bands * plume_levels + 2.
+
+⚠️ LINEAR in `plume_levels`, EXPONENTIAL in `n_bands`. At cap 4 / 3 bands: k=1 → 627,
+k=3 → 1877, k=5 → 3127.
+"""
 n_states(pomdp::StationkeepingPOMDP) =
-    length(ALT_BINS) * n_visit_combos(pomdp) + length(TERMINAL_ALT)
+    length(ALT_BINS) * n_visit_combos(pomdp) * pomdp.plume_levels +
+    length(TERMINAL_ALT)
 
 # ── Binning ───────────────────────────────────────────────────────────────────
 """
@@ -165,12 +191,27 @@ This must stay bit-identical to the consumer-side binning in any rollout harness
 belief filter is fed wrong labels.
 """
 function alt_bin(pomdp::StationkeepingPOMDP, alt_km::Real)
+    return alt_bin(pomdp.alt_edges, alt_km)
+end
+
+"""
+    alt_bin(alt_edges, alt_km) -> Symbol
+
+Edges-only form, for callers that have `alt_edges` but no full config — notably
+`calibrate_tables`, which used to carry its own hand-copied `bin_of` closure.
+
+⚠️ THIS EXISTS SO THERE IS EXACTLY ONE COPY OF THE BINNING RULE. The calibration module
+previously re-implemented this inline with a comment reading "must stay bit-identical to
+`alt_bin` in states.jl, or the kernels are labelled with bins the model does not use" — two
+copies of a rule that must match, which is a drift bug waiting to happen. One
+implementation, two entry points.
+"""
+function alt_bin(alt_edges::NTuple{4,<:Real}, alt_km::Real)
     !isfinite(alt_km) && return :LOST
-    e = pomdp.alt_edges
-    alt_km < e[1] && return :BELOW_20
-    alt_km < e[2] && return :A20_27
-    alt_km < e[3] && return :A27_34
-    alt_km < e[4] && return :A34_44
+    alt_km < alt_edges[1] && return :BELOW_20
+    alt_km < alt_edges[2] && return :A20_27
+    alt_km < alt_edges[3] && return :A27_34
+    alt_km < alt_edges[4] && return :A34_44
     return :ABOVE_44
 end
 
@@ -191,10 +232,10 @@ end
 """
     state_label(s) -> String
 
-Serialization label `"ALT|v1-v2-v3"`, used in the exported policy JSON so a consumer can
-reconstruct `(alt, visits)` without knowing the enumeration order.
+Serialization label `"ALT|v1-v2-v3|i"`, used in the exported policy JSON so a consumer can
+reconstruct `(alt, visits, intensity)` without knowing the enumeration order.
 """
-state_label(s::SKState) = "$(s.alt)|" * join(s.visits, "-")
+state_label(s::SKState) = "$(s.alt)|" * join(s.visits, "-") * "|" * string(s.intensity)
 
 """visit_label(pomdp, visits) -> String. Human-readable coverage, e.g. "LOW×2+MID×1"."""
 function visit_label(pomdp::StationkeepingPOMDP, visits::NTuple{N,Int}) where {N}

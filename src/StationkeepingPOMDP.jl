@@ -68,19 +68,24 @@ km/s, m/s (ΔV costs), matching the Python truth model's conventions.
 - `sigma_nav_km`: 1σ Gaussian nav noise on the measured altitude (km). Ours is a
   deliberately conservative 2.0 vs MacKenzie §C.1.1.2's ~0.3–1 km. Drives the coverage
   misbin rate — see `alt_bin`.
-- `thruster_model`: `:uniform` (legacy `η_eff ~ U(eta_eff_min, eta_eff_max)`) or
-  `:gaussian_pct` (symmetric `η_eff ~ N(1, thruster_sigma_pct/100)`).
-  ⚠️ The `:uniform` default is a KNOWN-WRONG model kept only for continuity: it is 0–20%
-  underburn, mean 10% short, and NEVER over, whereas MacKenzie Exhibit B-24 (Cassini)
-  reports a SYMMETRIC 1σ magnitude error of 0.7% (Model 1) / 2.0% (Model 2). That is ~10×
-  too much error plus a systematic one-directional bias, and it is known to flip a 0/5
-  survival result to 5/5 (`docs/todo.md`). Sweep it; do not trust the default.
-- `thruster_sigma_pct`: 1σ magnitude error (%) for `:gaussian_pct`. B-24 presets are 0.7
-  and 2.0.
-- `eta_eff_min`, `eta_eff_max`: bounds for `:uniform`.
+- `noisy_thruster`: whether burns execute with error. `false` applies commanded ΔV exactly
+  (the optimistic corner of the family); `true` routes through `apply_dv_noisy`.
+  ⚠️ RECALIBRATION AXIS — changing it requires re-running `calibrate_tables`, unlike
+  `sigma_nav_km`/`plume_gradient` which are analytic.
+- `thruster_kwargs`: forwarded to `sample_eta_eff` to pick the error law — `model`
+  (`:uniform` | `:gaussian_pct`), `sigma_pct`, `eta_min`, `eta_max`. MacKenzie Exhibit B-24
+  (Cassini) reports a SYMMETRIC 1σ magnitude error of 0.7% (Model 1) / 2.0% (Model 2), so
+  `(model = :gaussian_pct, sigma_pct = 2.0)` is the cited choice. The `:uniform` legacy law
+  is 0–20% underburn, mean 10% short and NEVER over — ~10× B-24's error plus a
+  one-directional bias — so do not use it for a quoted result.
+- `plume_gradient`: θ, the altitude-gradient strength of plume intensity (softmax inverse
+  temperature over band depth). 0 = no gradient, all bands identical. See `plume.jl`.
+- `plume_levels`: k, the number of observed intensity levels. 1 disables the dimension.
 
 # Rewards
 - `r_science`: reward for sampling a band not yet in `cov`.
+- `repeat_factor`: multiplies `r_science` for samples taken AFTER a band hits `visit_cap`.
+  Replaces a hard zero — you do not stop collecting plume material after four passes.
 - `r_step_ok`: small living reward for surviving a non-terminal step.
 - `r_crashed`, `r_lost`: mission-loss penalties.
 - `fuel_weight`: multiplies `action_dv_cost` (m/s) as a penalty.
@@ -202,17 +207,56 @@ Base.@kwdef struct StationkeepingPOMDP
 
     # -- noise hyperparameters (swept) ----------------------------------------
     sigma_nav_km::Float64           = 2.0
-    thruster_model::Symbol          = :uniform
-    thruster_sigma_pct::Float64     = 2.0
-    eta_eff_min::Float64            = ETA_EFF_MIN
-    eta_eff_max::Float64            = ETA_EFF_MAX
+    # ⚠️ REPLACED `thruster_model` / `thruster_sigma_pct` / `eta_eff_min` / `eta_eff_max`
+    # (2026-08-31). Those four fields were DEAD — grep found no reader anywhere in `src/`
+    # outside this struct, so sweeping them changed nothing (measured: 1/3 distinct policies
+    # across thruster_sigma_pct ∈ {0.7, 2.0, 5.0}). They duplicated, and silently disagreed
+    # with, the arguments `calibrate_tables` actually uses.
+    #
+    # `noisy_thruster` is the live path: `calibrate_tables` routes burns through
+    # `apply_dv_noisy` when it is true, so this genuinely re-measures T. `thruster_kwargs`
+    # forwards to `sample_eta_eff` (`model`, `sigma_pct`, `eta_min`, `eta_max`), keeping the
+    # B-24 presets reachable without four more struct fields to fall out of sync.
+    #
+    # ⚠️ THIS IS A RECALIBRATION AXIS, not an analytic one — see `needs_recalibration`.
+    # Measured consequence of turning it on (2026-08-30): P(LOST) for LOW/MID goes 0.19 /
+    # 0.056 → 1.00 / 1.00 over 12 seeds. Noise-free is a legitimate optimistic θ, not a bug,
+    # but it is NOT the deployment environment.
+    noisy_thruster::Bool            = false
+    thruster_kwargs::NamedTuple     = NamedTuple()
+    # ⚠️ THE THIRD SWEEP AXIS, SHAPED LIKE THE TWO ABOVE — one scalar, no special-casing.
+    # `plume_gradient` (θ) is the inverse temperature of a softmax over normalized band
+    # DEPTH; see `plume.jl` for the functional form and why softmax rather than a linear
+    # tilt. θ = 0 makes every band's intensity distribution IDENTICAL and uniform, which is
+    # the sanity gate: with no gradient there is no reason to prefer any altitude. Rising θ
+    # concentrates intensity mass toward the LOW band.
+    #
+    # ⚠️ UNLIKE the two axes above, this one changes `T`, so a sweep over it needs its own
+    # `calibrate_tables` call per θ (~2 min). `sigma_nav_km` only enters the ANALYTIC
+    # `observation_matrix` and needs no re-measurement at all. Cost a sweep accordingly.
+    plume_gradient::Float64         = 0.0
+    # Number of observed intensity levels a pass can yield. `1` disables the dimension
+    # entirely (|S| unchanged), so the pre-intensity model stays reachable for comparison.
+    # ⚠️ |S| scales LINEARLY in this: 5*(cap+1)^bands*k + 2, so k=3 is 1877 and k=5 is 3127.
+    plume_levels::Int               = 3
 
     # -- rewards -------------------------------------------------------------
     r_science::Float64              =   20.0
     r_step_ok::Float64              =    0.5
     r_crashed::Float64              = -200.0
     r_lost::Float64                 = -200.0
-    fuel_weight::Float64            =    1.0
+    # ⚠️ ZEROED 2026-08-30 (user's call). The study is SCIENCE YIELD UNDER ENVIRONMENTAL
+    # UNCERTAINTY, not fuel feasibility, and zeroing the weight sidesteps an unresolved
+    # ΔV-budget question rather than pretending to answer it. The fuel machinery is
+    # deliberately LEFT INTACT — `action_dv_cost` is still measured and still multiplied
+    # here — so restoring the tradeoff is a one-field change, not a re-implementation.
+    fuel_weight::Float64            =    0.0
+    # Diminishing-returns factor for samples past `visit_cap`. ⚠️ REPLACES A HARD CLIFF: the
+    # reward is `visit_total(sp) - visit_total(s)` and the counts SATURATE, so before this
+    # existed visits 1–4 paid full `r_science` and visit 5+ paid exactly zero — once all
+    # three bands capped, NO action earned science and the policy was indifferent between
+    # sampling and not. 0.2 keeps long rollouts informative and is the more honest model.
+    repeat_factor::Float64          =    0.2
 
     # ΔV cost proxy (m/s) per action.
     # ⚠️ MEASURED, not placeholders (2026-08-30). Per-pass ΔV medians from the calibration

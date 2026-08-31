@@ -57,6 +57,9 @@ include("spacecraft/nav.jl")
 
 # Configuration struct first: everything below dispatches on it.
 include("StationkeepingPOMDP.jl")
+# P_θ(intensity | band) — the plume gradient, the third sweep axis. Before `states.jl`,
+# which enumerates the intensity dimension it defines.
+include("plume.jl")
 include("states.jl")
 include("actions.jl")
 include("observations.jl")
@@ -164,6 +167,8 @@ export
     calibrate_tables,
     tables_from_rows,
     MIN_TRIALS_TRUSTED,
+    CALIBRATION_EFFORT,
+    needs_recalibration,
     # configuration + model
     StationkeepingPOMDP,
     build_pomdp,
@@ -182,6 +187,12 @@ export
     visit_tuples,
     visit_label,
     state_label,
+    # plume gradient — P_θ(intensity | band), the third sweep axis
+    plume_level_scores,
+    plume_band_depth,
+    plume_intensity_dist,
+    plume_intensity_value,
+    plume_levels_range,
     # measured tables
     AltTables,
     load_tables,
@@ -189,6 +200,8 @@ export
     validate_tables,
     # export + reporting
     export_policy,
+    theta_slug,
+    theta_path,
     print_policy_table,
     print_model_summary
 

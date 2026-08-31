@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "d1193f3d3ca91bb1a8a6bf2ecd17e2f486b91e45"
+project_hash = "be7da677b2b709ea99e0683fff44de328471ead6"
 
 [[deps.ADTypes]]
 deps = ["PrecompileTools"]
@@ -747,6 +747,18 @@ version = "1.11.3+1"
 uuid = "8f399da3-3557-5675-b5ff-fb832c97cbdb"
 version = "1.11.0"
 
+[[deps.Libiconv_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl"]
+git-tree-sha1 = "be484f5c92fad0bd8acfef35fe017900b0b73809"
+uuid = "94ce4f54-9a6c-5748-9c1c-f9c7231a4531"
+version = "1.18.0+0"
+
+[[deps.LightXML]]
+deps = ["Libdl", "XML2_jll"]
+git-tree-sha1 = "aa971a09f0f1fe92fe772713a564aa48abe510df"
+uuid = "9c8b4983-aa76-5018-a973-4c85ecc9e179"
+version = "0.9.3"
+
 [[deps.LineSearch]]
 deps = ["ADTypes", "CommonSolve", "ConcreteStructs", "FastClosures", "LinearAlgebra", "MaybeInplace", "PrecompileTools", "SciMLBase", "SciMLJacobianOperators", "StaticArraysCore"]
 git-tree-sha1 = "e3f00a2de8e2faf41381f583bd92ce8ebdff5c22"
@@ -890,6 +902,12 @@ deps = ["Artifacts", "IntelOpenMP_jll", "JLLWrappers", "LazyArtifacts", "Libdl",
 git-tree-sha1 = "282cadc186e7b2ae0eeadbd7a4dffed4196ae2aa"
 uuid = "856f044c-d86e-5d09-b602-aeab76dc8ba7"
 version = "2025.2.0+0"
+
+[[deps.MOMDPs]]
+deps = ["LinearAlgebra", "POMDPLinter", "POMDPTools", "POMDPs"]
+git-tree-sha1 = "f6594028cf9bf936123ba7e38f9d1196e50570e2"
+uuid = "77fc6e33-3f81-4304-8123-5a68e6b3eeb4"
+version = "0.1.2"
 
 [[deps.MacroTools]]
 git-tree-sha1 = "1e0228a030642014fe5cfe68c2c0a818f9e3f522"
@@ -1172,6 +1190,12 @@ git-tree-sha1 = "723a9378f08879c019220dc125afd6043799d7d4"
 uuid = "7588e00f-9cae-40de-98dc-e0c70c48cdd7"
 version = "1.1.0"
 
+[[deps.POMDPXFiles]]
+deps = ["LightXML", "MOMDPs", "POMDPTools", "POMDPs", "ProgressMeter"]
+git-tree-sha1 = "6048ddc096c7e20621feb97423b7e28a58e3b365"
+uuid = "c6f6ee83-58c6-5336-a19f-2c76817e1af6"
+version = "0.3.1"
+
 [[deps.POMDPs]]
 deps = ["Distributions", "Graphs", "NamedTupleTools", "POMDPLinter", "Pkg", "Random", "Statistics"]
 git-tree-sha1 = "285ead6c9d16f35c652c45fb983d5766eadfb833"
@@ -1403,6 +1427,18 @@ deps = ["ExprTools", "PrecompileTools", "SHA", "Serialization"]
 git-tree-sha1 = "6cb9b83354089fcb33c643773acfd3235f2f1bf5"
 uuid = "7e49a35a-f44a-4d26-94aa-eba1b4ca6b47"
 version = "0.5.25"
+
+[[deps.SARSOP]]
+deps = ["MOMDPs", "POMDPLinter", "POMDPTools", "POMDPXFiles", "POMDPs", "Parameters", "SARSOP_jll"]
+git-tree-sha1 = "2bf340f35a20ee3a50ffb8e7b8d33ab0c274c5f4"
+uuid = "cef570c6-3a94-5604-96b7-1a5e143043f2"
+version = "0.6.0"
+
+[[deps.SARSOP_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Pkg"]
+git-tree-sha1 = "8b3b6abc098d2feb206e5c2fc59fd88b890acc4a"
+uuid = "e478675d-f996-546e-baa1-da59d9de2062"
+version = "0.96.1+0"
 
 [[deps.SHA]]
 uuid = "ea8e919c-243c-51af-8825-aaa63cd721ce"
@@ -1790,6 +1826,12 @@ version = "3.8.4"
     IntervalSets = "8197267c-284f-5f27-9208-e0e47529a953"
     Term = "22787eb5-b846-44ae-b979-8e399b8463ab"
     Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+
+[[deps.XML2_jll]]
+deps = ["Artifacts", "JLLWrappers", "Libdl", "Libiconv_jll", "Zlib_jll"]
+git-tree-sha1 = "3f3315d89fc954a28f5b471bce698ed6e27481be"
+uuid = "02c8fc9c-b97f-50b9-bbe4-9be30ff0a78a"
+version = "2.15.3+0"
 
 [[deps.Zlib_jll]]
 deps = ["Libdl"]

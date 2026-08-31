@@ -14,6 +14,34 @@ const DEFAULT_POLICY_PATH =
     normpath(joinpath(@__DIR__, "..", "artifacts", "policy.json"))
 
 """
+    theta_slug(θ) -> String
+
+A filesystem-safe slug for a θ NamedTuple, e.g.
+`(sigma_nav_km = 2.0, plume_gradient = 4.0)` → `"sigma_nav_km=2.0_plume_gradient=4.0"`.
+
+⚠️ WHY THIS EXISTS. `DEFAULT_TABLES_PATH` and `DEFAULT_POLICY_PATH` are SINGLE-SLOT, so a
+sweep that does not key its output by θ silently overwrites itself and leaves one artifact
+that claims to describe the whole family. Field order is preserved from the NamedTuple, so
+the same θ always yields the same slug.
+"""
+theta_slug(θ::NamedTuple) =
+    join(["$(k)=$(v)" for (k, v) in pairs(θ)], "_")
+
+"""
+    theta_path(base, θ; ext = ".json") -> String
+
+θ-keyed artifact path: `artifacts/<base>_<slug>.json`. Use for both tables and policies so a
+sweep's outputs sit beside each other and are self-identifying.
+
+    write_tables(tbl; path = theta_path("tables", (plume_gradient = 4.0,)))
+    export_policy(pol, cfg; path = theta_path("policy", (plume_gradient = 4.0,)))
+"""
+function theta_path(base::AbstractString, θ::NamedTuple; ext::AbstractString = ".json")
+    dir = normpath(joinpath(@__DIR__, "..", "artifacts"))
+    return joinpath(dir, string(base, "_", theta_slug(θ), ext))
+end
+
+"""
     alpha_vectors(policy, action_list) -> (alphas, alpha_actions)
 
 Pull the alpha vectors and their 1-based action indices out of a solved

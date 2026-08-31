@@ -40,15 +40,32 @@ function transition_matrix(pomdp::StationkeepingPOMDP, tables::AltTables)
             for (di, an) in enumerate(ALT_ALL)
                 p = k[di]
                 p == 0.0 && continue
-                sp = if isterminal_alt(an)
-                    SKState(an, zero_v)
-                else
-                    # Survived → bank the band this pass actually landed in, if any.
-                    b = findfirst(==(an), pomdp.band_bins)
-                    SKState(an, b === nothing ? s.visits :
-                                visit_inc(s.visits, b, pomdp.visit_cap))
+                if isterminal_alt(an)
+                    T[si, ai, sidx[SKState(an, zero_v, 1)]] += p
+                    continue
                 end
-                T[si, ai, sidx[sp]] += p
+                # Survived → bank the band this pass actually landed in, if any.
+                b = findfirst(==(an), pomdp.band_bins)
+                v = b === nothing ? s.visits :
+                    visit_inc(s.visits, b, pomdp.visit_cap)
+                if b === nothing
+                    # Outside every science band: nothing was sampled, so the intensity
+                    # slot takes its canonical "no sample" value rather than a draw. Keeping
+                    # it deterministic here is what stops |S| inflating with states that
+                    # record an intensity for a pass that measured nothing.
+                    T[si, ai, sidx[SKState(an, v, 1)]] += p
+                else
+                    # ⚠️ THE GRADIENT ENTERS HERE, AND ONLY HERE. The pass landed in band b,
+                    # so the intensity it yielded is drawn from P_θ(i | b) — this is the
+                    # single point at which `plume_gradient` touches the model. The reward
+                    # then pays for the REALIZED level (see `rewards.jl`), so a θ that
+                    # tilts deep bands high genuinely makes them worth more.
+                    pi_dist = plume_intensity_dist(pomdp, b)
+                    for (lvl, pl) in enumerate(pi_dist)
+                        pl == 0.0 && continue
+                        T[si, ai, sidx[SKState(an, v, lvl)]] += p * pl
+                    end
+                end
             end
         end
     end

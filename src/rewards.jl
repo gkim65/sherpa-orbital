@@ -41,8 +41,13 @@ function reward_function(pomdp::StationkeepingPOMDP, T::Array{Float64,3})
     nb   = n_bands(pomdp)
 
     zero_v    = _zero_visits(pomdp)
-    i_crashed = sidx[SKState(:CRASHED, zero_v)]
-    i_lost    = sidx[SKState(:LOST, zero_v)]
+    i_crashed = sidx[SKState(:CRASHED, zero_v, 1)]
+    i_lost    = sidx[SKState(:LOST, zero_v, 1)]
+
+    # Which band each live altitude bin banks, precomputed: the reward has to know whether
+    # a successor represents a SAMPLE (payable, possibly past the cap) or merely a pass
+    # through an unproductive bin.
+    band_of_bin = Dict(bin => findfirst(==(bin), pomdp.band_bins) for bin in ALT_BINS)
 
     function reward(s::SKState, a::Symbol)
         isterminal_state(s) && return 0.0
@@ -51,15 +56,29 @@ function reward_function(pomdp::StationkeepingPOMDP, T::Array{Float64,3})
 
         row = @view T[sidx[s], aidx[a], :]
 
-        # Expected science: how many visit counts the successor banks over this state's,
-        # weighted by transition probability. Counts saturate at `visit_cap`, so a band
-        # at the cap contributes nothing and the sum is bounded.
+        # Expected science, paid for the REALIZED intensity the successor records rather
+        # than for the band label. Two regimes, and the second is new:
+        #   under the cap  — the visit count increments, so `gained > 0` and the sample pays
+        #                    `r_science * value(intensity)`.
+        #   at the cap     — the count SATURATES, so `gained == 0` even though a real sample
+        #                    was taken. Those pay `r_science * repeat_factor * value`.
+        # ⚠️ Without the second branch this is a hard cliff: once every band caps, no action
+        # earns science at all and the policy goes indifferent. See `repeat_factor`.
         for (spi, sp) in enumerate(S)
             p = row[spi]
             p == 0.0 && continue
             isterminal_state(sp) && continue
+            val = plume_intensity_value(pomdp, sp.intensity)
             gained = visit_total(sp.visits) - visit_total(s.visits)
-            gained > 0 && (r += p * pomdp.r_science * gained)
+            if gained > 0
+                r += p * pomdp.r_science * gained * val
+            else
+                # No count increment. It is still a sample IFF the pass landed in a band —
+                # which means that band was already saturated.
+                b = band_of_bin[sp.alt]
+                b === nothing && continue
+                r += p * pomdp.r_science * pomdp.repeat_factor * val
+            end
         end
 
         # Expected mission-loss cost for this (s, a).

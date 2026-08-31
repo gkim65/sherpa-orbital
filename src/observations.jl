@@ -21,6 +21,14 @@ Terminal states are self-announcing: a crash or an escape is unambiguous.
     observations(pomdp) -> Vector{Symbol}
 
 The altitude-bin observation labels: the five live bins plus the two terminal outcomes.
+
+⚠️ INTENSITY IS NOT A SEPARATE OBSERVATION SYMBOL, deliberately (2026-08-30). It is
+observed — it is what the instrument measured — but it is a DETERMINISTIC function of the
+observed altitude bin plus the transition draw, exactly as the visit counts already are
+(see this file's header). Adding it to `Ω` would multiply |O| by `plume_levels` for no
+inferential gain and would make the belief filter's hard projection harder to license.
+The intensity dimension is therefore observed via the SAME channel that already reveals
+which band the pass landed in.
 """
 observations(pomdp::StationkeepingPOMDP) = collect(ALT_ALL)
 
