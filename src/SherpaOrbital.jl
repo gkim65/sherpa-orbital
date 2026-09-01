@@ -199,6 +199,7 @@ export
     # plume gradient — P_θ(intensity | band), the third sweep axis
     plume_level_scores,
     plume_band_depth,
+    mean_plume_depth,
     plume_intensity_dist,
     plume_intensity_value,
     plume_levels_range,

@@ -62,8 +62,8 @@ km/s, m/s (ΔV costs), matching the Python truth model's conventions.
 - `thruster_kwargs`: forwarded to `sample_eta_eff` to pick the error law — `model`
   (`:uniform` | `:gaussian_pct`), `sigma_pct`, `eta_min`, `eta_max`. See `thruster.jl` for
   which law is defensible and which is the default.
-- `plume_gradient`: θ, the altitude-gradient strength of plume intensity (softmax inverse
-  temperature over band depth). 0 = no gradient, all bands identical. See `plume.jl`.
+- `plume_gradient`: θ, the altitude-gradient strength of plume intensity (slope of a linear
+  tilt in band depth). 0 = no gradient, all bands identical. See `plume.jl`.
 - `plume_levels`: k, the number of observed intensity levels. 1 disables the dimension.
 
 # Rewards

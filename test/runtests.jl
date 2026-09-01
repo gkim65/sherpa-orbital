@@ -170,7 +170,7 @@ end
         @test plume_band_depth(steep, 3) ≈ 0.0           # HIGH *is* the shallowest bin
         top = steep.plume_levels
         @test plume_intensity_dist(steep, 1)[top] > d1[top]     # LOW gains high intensity
-        @test plume_intensity_dist(steep, 3) ≈ d1               # depth 0 ⟹ still uniform
+        @test plume_intensity_dist(steep, 3)[top] < d1[top]     # shallow bin loses it back
 
         # Monotone in θ: a steeper gradient must put strictly more mass on high intensity
         # in the deepest band. A form that saturates would break the sweep (two θ, one POMDP).

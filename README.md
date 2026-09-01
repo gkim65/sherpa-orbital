@@ -88,7 +88,7 @@ resulting `QuickPOMDP`, so the discounted return regret needs is available for f
 The struct **is** the environment, so a parameterized POMDP family is one loop:
 
 ```julia
-for θ in [(plume_gradient = g,) for g in (0.0, 0.5, 1.0, 2.0)]
+for θ in [(plume_gradient = g,) for g in (0.0, 1.0, 2.0, 4.0)]
     cfg = StationkeepingPOMDP(; θ...)
 
     tbl = if needs_recalibration(θ)        # dynamics axis -> re-measure (~7 min)
@@ -115,28 +115,32 @@ Three axes, all shaped identically as scalar fields on the config:
 `needs_recalibration(θ)` reports which of the two regimes a θ falls into. `theta_path`
 keys artifacts by θ so a sweep cannot overwrite its own output.
 
-**Choosing `plume_gradient` values — the axis SATURATES.** θ is the inverse temperature of a
-softmax, so past roughly θ ≈ 4 essentially all intensity mass already sits on the top level
-and further increases barely change the model. Expected science per pass
+**Choosing `plume_gradient` values — θ REDISTRIBUTES, it does not inflate.** θ is the slope
+of a linear tilt in band depth, centered on the mean depth over `ALT_BINS`, so bins deeper
+than the mean gain exactly what shallower bins lose. Expected science per pass
 (`r_science × E[value]`), measured:
 
-| bin | depth | θ=0 | θ=1.5 | θ=3 | θ=4.5 | θ=8 |
+| bin | depth | θ=0 | θ=1 | θ=2 | θ=4 | θ=8 |
 |---|---|---|---|---|---|---|
-| `BELOW_20` | 1.00 | 13.0 | 18.2 | 19.6 | 19.9 | 20.0 |
-| `A20_27` (LOW) | 0.80 | 13.0 | 17.6 | 19.3 | 19.8 | 20.0 |
-| `A27_34` (MID) | 0.55 | 13.0 | 16.5 | 18.5 | 19.4 | 19.9 |
-| `A34_44` (cycle) | 0.31 | 13.0 | 15.1 | 16.9 | 18.1 | 19.4 |
-| `ABOVE_44` (HIGH) | 0.00 | 13.0 | 13.0 | 13.0 | 13.0 | 13.0 |
+| `BELOW_20` | 1.00 | 13.00 | 15.17 | 17.35 | 17.67 | 17.67 |
+| `A20_27` (LOW) | 0.80 | 13.00 | 14.26 | 15.51 | 17.67 | 17.67 |
+| `A27_34` (MID) | 0.55 | 13.00 | 13.09 | 13.18 | 13.36 | 13.72 |
+| `A34_44` (cycle) | 0.31 | 13.00 | 11.97 | 10.95 | 8.89 | 8.33 |
+| `ABOVE_44` (HIGH) | 0.00 | 13.00 | 10.51 | 8.33 | 8.33 | 8.33 |
+| **five-bin mean** | | **0.6500** | **0.6500** | **0.6532** | **0.6592** | **0.6572** |
 
 θ = 0 is the null hypothesis — no altitude gradient, every bin worth the same — and is the
-structural sanity gate (the exponent vanishes, so every bin is exactly uniform).
+structural sanity gate (every tilt vanishes, so every bin is exactly uniform).
 
-**Most of the range is spent by θ ≈ 1.5.** LOW goes 13.0 → 17.6 over `[0, 1.5]`, which is
-~70% of its total movement, then only 17.6 → 20.0 over the whole of `[1.5, 8]`. So a grid
-should be dense at the bottom, not evenly spaced to a large θ: **`(0, 0.5, 1, 2)`** gives
-four clearly distinct models, whereas `(0, 2, 4, 6)` spends three of its four points in the
-flat region where θ = 4 and θ = 6 are nearly the same POMDP. Two θ collapsing onto one model
-is exactly what a sweep axis must not do — the regret between them would be noise.
+The invariant five-bin mean is what makes returns comparable **across** θ: a high-θ
+environment repriced altitude, it did not get richer. Regret compares columns of the matrix,
+so an axis that inflated total value would confound "better policy" with "richer world".
+
+**Usable range is θ ∈ [0, 4].** The tilt is clamped to keep probabilities non-negative, and
+with the default `alt_rep_km` the mean depth is ≈ 0.534, so the shallowest bin pins at
+θ ≈ 1.87 and the deepest two pin together by θ ≈ 4. Past that θ buys almost nothing — LOW−MID
+stops growing — and the clamp lets the five-bin mean drift ~1.4% off its θ = 0 value. An
+evenly spaced **`(0, 1, 2, 4)`** stays inside the usable range and gives four distinct models.
 
 ⚠️ `plume_gradient` reprices altitude but does NOT change the physics: the measured kernels
 are altitude dynamics and are shared across θ. A high θ makes low passes more valuable, not
@@ -408,7 +412,7 @@ kept as specifications for a Makie port.
 ## Tests
 
 ```bash
-julia --project=. -e 'using Pkg; Pkg.test()'    # 266/266, ~3 min
+julia --project=. -e 'using Pkg; Pkg.test()'    # 281/281, ~5 min
 ```
 
 The orbit-geometry, family-continuation and rollout testsets take minutes, which is too
