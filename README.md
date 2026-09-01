@@ -341,10 +341,28 @@ The library declares **no solver dependency** — `NativeSARSOP` lives only in
 Rolling the solved θ = 0 policy against the CR3BP + Enceladus J2 truth model, 30-day
 horizon, seeds 0–2:
 
-| thruster | outcome | discounted return | ΔV (m/s) | bands | samples | `CORRECT` |
-|---|---|---|---|---|---|---|
-| noise-free | survives 30 d, 3/3 | 147–150 | 90–94 | 3 | 11–12 | 29–37 of 60 |
-| noisy | survives 30 d, 3/3 | 138–164 | 99–187 | 3 | 9–12 | 25–38 of 60 |
+| thruster | outcome | return (mean ± sd) | ΔV (m/s) | bands | samples |
+|---|---|---|---|---|---|
+| **noise-free** (matched) | **holds 30 d, 5/5** | **152.1 ± 9.6** | 90–95 | 3 | 11–12 |
+| noisy (mismatched) | holds 30 d, 4/5 | 115.4 ± 67.7 | 73–187 | 3 | 7–12 |
+
+**Noise-free is the matched experiment and the one to quote.** The committed kernels are
+calibrated with `noisy_thruster = false`, so a noisy rollout of a policy solved against them
+is testing a model mismatch, not the policy — and `run_rollout` therefore defaults to
+`noisy_thruster = false`.
+
+The mismatch is not cosmetic. Under noise the return spread is **145% of the mean** against
+15% noise-free, one seed in five crashes (return −3.7), an `EXCURSE_LOW` commanded at 23.5 km
+lands at 14.65–16.94 km — in `BELOW_20`, not the LOW band — and the residual runs 45–60 km,
+deep in `R_CRITICAL`. Note also that the noisy path uses the legacy `:uniform` error law
+unless told otherwise (0–20% underburn, mean 10% short, never over), which is ~10×
+MacKenzie Exhibit B-24's symmetric 0.7–2.0% and therefore a worst case rather than a
+realistic thruster.
+
+⚠️ **A regret matrix built on noisy rollouts would be mostly noise.** At sd ≈ 68, resolving a
+plausible ~20-point θ effect needs on the order of 50 seeds per cell; noise-free at sd ≈ 10
+needs a handful. Either sweep noise-free, or calibrate *and* fly noisy with the cited
+`(model = :gaussian_pct, sigma_pct = 2.0)` law.
 
 Before the residual dimension and the reward fix this policy **escaped at 3.8 d** having
 chosen `CORRECT` once in six passes.

@@ -695,8 +695,36 @@ deprecated alias so the exploratory scripts in `scratch/` keep running.
   - `rng` — random stream for the thruster and nav noise. Required whenever
     `noisy_thruster = true` or the controller draws observations; defaults to a fresh
     `Xoshiro(0)` so a caller cannot accidentally consume global RNG state.
-  - `noisy_thruster` — execute ΔV through [`apply_dv_noisy`](@ref) (η_eff ~ U(0.8, 1.0))
-    rather than [`apply_dv`](@ref). Default `true`; set `false` for a deterministic run.
+  - `noisy_thruster` — execute ΔV through [`apply_dv_noisy`](@ref) rather than
+    [`apply_dv`](@ref). **Default `false`** — see below.
+
+    ⚠️ THE DEFAULT FLIPPED true → false ON 2026-08-31, TO MATCH THE KERNELS. The measured
+    kernels in `artifacts/tables.json` are calibrated with `noisy_thruster = false`
+    (`meta.theta.noisy_thruster`), so a noisy rollout of a policy solved against them is
+    MISMATCHED: the policy is acting on a transition model that understates execution
+    error. A default that silently produces the mismatched experiment is the wrong default.
+
+    Measured over 5 seeds, the same policy, 30-day horizon — the mismatch is not cosmetic:
+
+    | thruster   | outcome  | return mean | return sd | spread as % of mean |
+    |------------|----------|-------------|-----------|---------------------|
+    | noise-free | 5/5 hold |      152.14 |      9.58 |                 15% |
+    | noisy      | 4/5 hold |      115.38 |     67.74 |                145% |
+
+    The noisy runs also miss their science bands badly (an `EXCURSE_LOW` commanded at
+    23.5 km lands at 14.65–16.94 km, i.e. in `BELOW_20`) and run at residual 45–60 km,
+    deep in `R_CRITICAL`.
+
+    ⚠️ AND THE NOISY PATH CURRENTLY USES AN UNPHYSICAL ERROR LAW unless told otherwise. With
+    empty `thruster_kwargs`, `apply_dv_noisy` takes the legacy `:uniform` law — 0–20%
+    underburn, mean 10% short and NEVER over. That is ~10× MacKenzie Exhibit B-24's Cassini
+    figure (a SYMMETRIC 1σ of 0.7–2.0%) plus a one-directional bias, so it is a worst case
+    rather than a realistic thruster. For a quoted noisy result pass
+    `(model = :gaussian_pct, sigma_pct = 2.0)`.
+
+    So: set `noisy_thruster = true` deliberately, ideally against kernels calibrated the
+    same way (`calibrate_tables` with `noisy_thruster = true`, a ~7-minute re-measurement —
+    see `needs_recalibration`).
   - `max_steps` — hard cap on control steps (safety guard; outcome `:max_steps`).
 
 Returns a NamedTuple with the SAME fields for every baseline, so a comparison table needs
@@ -740,7 +768,10 @@ function run_rollout(
     period_s::Real,
     horizon_s::Real;
     rng::AbstractRNG = Xoshiro(0),
-    noisy_thruster::Bool = true,
+    # ⚠️ DEFAULT false SO THE ROLLOUT MATCHES THE KERNELS — see the docstring. The committed
+    # kernels are measured noise-free, so a noisy rollout of a policy solved against them
+    # tests a model mismatch rather than the policy.
+    noisy_thruster::Bool = false,
     rtol_truth::Real = RTOL_TRUTH,
     atol_truth::Real = ATOL_TRUTH,
     max_steps::Integer = 2000,
