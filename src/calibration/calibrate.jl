@@ -151,68 +151,6 @@ function _bin_sample_alts(bin::Symbol, e::NTuple{4,<:Real}, n::Integer)
 end
 
 """
-    _disperse_state(state, rng; sigma_pos_km, sigma_vel_kms) -> Vector{Float64}
-
-Perturb a state by a small Gaussian dispersion in position and velocity.
-
-⚠️ **DO NOT USE THIS TO DISPERSE A CALIBRATION SEED — MEASURED AND REJECTED 2026-08-31.**
-The intent was to attack a real, documented bias (a seeded state is a freshly-placed
-PERIODIC family member, the most stable state in the system, so seeded rows understate
-divergence). It does not work, and the failure is not graceful.
-
-Dispersing the state AT PERIAPSIS breaks the ONBOARD APSE PREDICTION: `solve_burn` can no
-longer find the next apse pair, returns a non-finite residual and ΔV = 0, and the pass is
-booked as a loss. Measured from the 30.5 km family member, identical targets:
-
-  | departure    | residual | ΔV        |
-  |--------------|----------|-----------|
-  | undispersed  |   12.231 | 1.884 m/s |
-  | dispersed    |    **Inf** | **0.000** |
-
-So the kernel records SOLVER FAILURES as orbit deaths. The whole-run symptom was
-`CORRECT / A27_34 / R_OK` reading P(LOST) = 0.471 over n = 85 — physically absurd, since
-correcting from a healthy mid orbit is the safe baseline that holds 30 days.
-
-⚠️ AND THE OBVIOUS DIAGNOSIS IS WRONG, which is why this note is long. It is NOT that the
-perturbation destabilises the orbit: a dispersed CORRECT walk SURVIVES at every scale
-tried, up to 0.5 km / 0.5 m/s, holding the ~7.6 km residual floor. Nor is it the seed
-altitudes: every one of them holds its own orbit for 8 passes. The orbit is fine; the
-PLANNER is what the perturbation breaks. Shrinking the scale is not a fix, because the
-failure mode is a discontinuous loss of the apse pair rather than a gradual degradation.
-
-Reachability is measured instead by the ACTION TREE (see `tree_walk!`), which only ever
-visits states the vehicle can actually fly to, so no perturbation is needed.
-
-Retained because the dispersion itself is correct and may be useful elsewhere (e.g.
-injecting nav-scale uncertainty into a ROLLOUT, where no apse solve is pending).
-"""
-function _disperse_state(state::AbstractVector{<:Real}, rng::AbstractRNG;
-                         sigma_pos_km::Real = SEED_DISPERSION_POS_KM,
-                         sigma_vel_kms::Real = SEED_DISPERSION_VEL_KMS)
-    s = collect(float.(state))
-    s[1:3] .+= sigma_pos_km  .* randn(rng, 3)
-    s[4:6] .+= sigma_vel_kms .* randn(rng, 3)
-    return s
-end
-
-"""
-    _cell_rng(rng_seed, parts...) -> Xoshiro
-
-A per-cell RNG derived DETERMINISTICALLY from the measurement seed and the cell's identity
-(altitude bin, action, sample index, …).
-
-⚠️ WHY NOT ONE SHARED STREAM. With a single sequential RNG, the dispersion a given cell
-receives depends on how many draws every earlier cell happened to make — so adding a walk,
-reordering a loop, or short-circuiting on an escape silently changes the perturbation
-applied to unrelated cells, and the artifact stops being reproducible across code changes.
-Hashing the cell identity makes each cell's randomness independent of the others and of the
-iteration order: re-running gives bit-identical results, while different cells still get
-genuinely different perturbations.
-"""
-_cell_rng(rng_seed::Integer, parts...) =
-    Xoshiro(hash((rng_seed, parts...)))
-
-"""
 Samples per (altitude bin × action) seeding cell — how many DISPERSED departures to fly.
 
 ⚠️ THIS IS WHAT MAKES A ROW A DISTRIBUTION RATHER THAN A REPLICATE. Noise-free, the truth
@@ -251,13 +189,6 @@ never save more than ~1/|A| of the work — the frontier, which is the bulk, alw
 flown. Threading is the speedup that actually pays; see `tree_walk!`.
 """
 const TREE_DEPTH = 5
-
-"""1σ dispersion applied to a seed state's position (km) — nav-scale, see `_disperse_state`."""
-const SEED_DISPERSION_POS_KM = 0.5
-
-"""1σ dispersion applied to a seed state's velocity (km/s). ~0.5 m/s, a small fraction of a
-typical 1.3 m/s stationkeeping burn."""
-const SEED_DISPERSION_VEL_KMS = 5.0e-4
 
 """Minimum trials before a measured row is considered anything but indicative.
 
@@ -339,17 +270,22 @@ settled.
                             ⚠️ Was the length of ONE sustained loop; since the 2026-08-31
                             walker unification it is a total pass budget spread over
                             restarts, exactly like `excurse_trials`.
-  - `horizon_s`           — wall-clock cap on the sustained loop (s).
+  - `horizon_s`           — ⚠️ DEAD as of 2026-08-31. It capped the wall-clock of the
+                            bespoke sustained CORRECT loop, which no longer exists: every
+                            action now goes through the restarting `action_walk!` or the
+                            action tree, both bounded by pass COUNT rather than elapsed
+                            time. Still accepted and recorded into `meta.effort` so older
+                            drivers keep working and older artifacts stay comparable, but
+                            changing it has NO effect on the measurement.
   - `excurse_trials`      — steps per primary excursion walk.
   - `seed_trials`         — CORRECT trials per seeded altitude bin.
   - `excurse_seed_trials` — EXCURSE trials per (bin × band) seed.
   - `seed_bins`           — seed the bins a working controller never visits at all.
-  - `seed_samples`        — DISPERSED departures per (bin × action) cell. The cell's trial
-                            budget is split across them, so this trades replicates for
-                            genuine spread rather than costing more.
-  - `rng_seed`            — reproducibility seed. Mixed with each cell's identity by
-                            [`_cell_rng`](@ref), so a cell's dispersion does not depend on
-                            iteration order and a re-run is bit-identical.
+  - `seed_samples`        — how many ALTITUDES to sample across each bin when seeding. The
+                            cell's trial budget is split across them, so this trades
+                            replicates for genuine spread rather than costing more.
+  - `rng_seed`            — reproducibility seed. Only consumed when `noisy_thruster` is
+                            on; noise-free the measurement is fully deterministic.
 
 ⚠️ `excurse_trials`/`excurse_seed_trials` were RAISED 8 → 24 on 2026-08-30 when the EXCURSE
 kernel became per-action (splitting one pooled row three ways divides the trials). That did
@@ -522,6 +458,7 @@ function calibrate_tables(;
     ic::AbstractVector{<:Real} = nondim_to_cr3bp(collect(PERIOD1_SOUTH_IC_ND)),
     period_s::Real = PERIOD1_TRIPLE_PERIOD_S,
     n_steps::Integer = 120,
+    # ⚠️ DEAD — see CALIBRATION_EFFORT. Recorded into meta, never read by the measurement.
     horizon_s::Real = 25 * 86400.0,
     alt_edges::NTuple{4,Float64} = (20.0, 30.0, 40.0, 50.0),
     band_names::NTuple{3,Symbol} = (:LOW, :MID, :HIGH),
@@ -842,7 +779,14 @@ function calibrate_tables(;
         a property of how far the orbit has drifted from what one impulse can fix, not a
         location.
       * perturbing a seed into a damaged state — breaks the onboard apse prediction and
-        books solver failures as deaths (see `_disperse_state`).
+        books solver failures as deaths. Measured 2026-08-31 from the 30.5 km member with
+        identical targets: undispersed solves to residual 12.231 km / ΔV 1.884 m/s, while a
+        0.5 km / 0.5 m/s perturbation gives residual = Inf and ΔV = 0. Whole-run symptom was
+        CORRECT/A27_34/R_OK at P(LOST) = 0.471 — absurd, since correcting from a healthy mid
+        orbit is the safe baseline. NOT a stability problem: a dispersed CORRECT walk
+        survives at every scale tried and every seed altitude holds its own orbit for 8
+        passes. The orbit is fine; the PLANNER is what the perturbation breaks, and it fails
+        discontinuously, so shrinking the scale is not a fix.
 
     A tree needs neither: every node is a state the vehicle genuinely flew to, reached the
     way it would actually reach it.
@@ -1041,7 +985,7 @@ function calibrate_tables(;
     # it — and every sampled seed was checked to hold its own orbit for 8 passes. Adding a
     # state-space PERTURBATION on top was tried and rejected: it breaks the onboard apse
     # prediction rather than the orbit, so the kernel records solver failures as deaths.
-    # See `_disperse_state` for the measurements. Reachability is handled by `tree_walk!`.
+    # See `tree_walk!` for the measurements; reachability is handled by the tree instead.
     if seed_bins && family_table !== nothing
         for bin in ALT_BINS
             alts = _bin_sample_alts(bin, alt_edges, seed_samples)
