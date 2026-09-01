@@ -13,8 +13,8 @@ using NativeSARSOP
 using POMDPs
 
 # ── Scenario ─────────────────────────────────────────────────────────────────
-# Baseline. Try r_science = 40.0 to value science more, or tighten the safety bins
-# with dev_edges = (10.0, 50.0, 150.0).
+# Baseline. Try r_science = 40.0 to value science more, or plume_gradient = 4.0 for a
+# steep plume altitude gradient.
 config = StationkeepingPOMDP()
 
 print_model_summary(config)

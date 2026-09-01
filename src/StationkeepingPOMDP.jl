@@ -6,7 +6,7 @@ default, so a scenario is one constructor call and nothing is hidden in globals.
 
     pomdp = StationkeepingPOMDP()                              # baseline scenario
     pomdp = StationkeepingPOMDP(; r_science = 40.0)             # value science more
-    pomdp = StationkeepingPOMDP(; dev_edges = (10.0, 50.0, 150.0))  # tighter safety bins
+    pomdp = StationkeepingPOMDP(; plume_gradient = 4.0)         # steep plume gradient
 
 Formulation
   State   : (alt, visits, intensity, residual). `alt` = achieved periapsis-ALTITUDE bin,
@@ -154,9 +154,13 @@ Base.@kwdef struct StationkeepingPOMDP
     # deployment environment.
     noisy_thruster::Bool            = false
     thruster_kwargs::NamedTuple     = NamedTuple()
-    # Inverse temperature of a softmax over normalized band depth; see `plume.jl` for the
-    # functional form. 0 makes every band's intensity distribution identical and uniform;
-    # rising values concentrate intensity toward the LOW band.
+    # Slope of a linear tilt in band depth, centered on the mean depth over `ALT_BINS`; see
+    # `plume.jl` for the functional form. 0 makes every bin's intensity distribution
+    # identical and uniform; rising values shift intensity toward the deeper bins and away
+    # from the shallower ones, holding the five-bin mean fixed.
+    #
+    # NOTE: usable range is [0, 4]. The tilt is clamped to keep probabilities non-negative,
+    # so the shallowest bin pins at about 1.87 and the two deepest by 4.
     #
     # NOTE: enters `transition_matrix` analytically, so a sweep needs no recalibration.
     plume_gradient::Float64         = 0.0
