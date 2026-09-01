@@ -272,9 +272,10 @@ Which science band an altitude falls in.
 
 Returns a 1-based band index, or `nothing` if the altitude is outside every band.
 
-NOTE: this is the coverage gate. It is fed the OBSERVED altitude, never the true one, and
-is indifferent to which action ran — so `CORRECT` banks its band passively just as an
-`EXCURSE_*` does.
+NOTE: this is the coverage gate, and it is indifferent to which action ran — so `CORRECT`
+banks its band passively just as an `EXCURSE_*` does. Onboard (`controller_observe!`) it is
+fed the OBSERVED altitude, because coverage is what the vehicle believes it has flown;
+`discounted_return` scoring on truth feeds it the ACHIEVED altitude instead.
 """
 function band_of_alt(pomdp::StationkeepingPOMDP, alt_km::Real)
     b = alt_bin(pomdp, alt_km)

@@ -947,7 +947,7 @@ function summarize_rollouts(results::AbstractVector)
 end
 
 """
-    discounted_return(result, pomdp; gamma = pomdp.discount) -> Float64
+    discounted_return(result, pomdp; gamma = pomdp.discount, score_on = :true_bin) -> Float64
 
 The discounted return `Σ γᵗ r(sₜ, aₜ)` of a [`run_rollout`](@ref) result, scored under
 `pomdp`'s reward function.
@@ -978,9 +978,46 @@ convention and the kernel's own accounting (`calibrate.jl` charges a lost apse p
 bin the decision was made in, not the bin the vehicle fled to). A terminal step contributes
 the mission-loss cost through the same reward, since the reward already carries it as an
 expectation over `T`; `t` still advances so the discount is right.
+
+  - `result` — a [`run_rollout`](@ref) result
+  - `pomdp` — the `θ` whose reward the trajectory is scored under
+  - `gamma` — discount per step (dimensionless)
+  - `score_on` — which altitude bin drives the scored trajectory, `:true_bin` or `:obs_bin`
+
+Returns the discounted return (reward units).
+
+# Scoring on truth versus on the observation
+
+`:true_bin` (the DEFAULT) advances the scored trajectory on the altitude the vehicle
+ACTUALLY reached: the successor bin, the banked visit counts, and the terminal test all
+come from truth. `:obs_bin` instead replays what the controller believed, binning exactly
+as the policy did.
+
+NOTE: the default is `:true_bin`, so returns reported before this keyword existed were
+`:obs_bin` numbers and do not compare against current ones.
+
+Truth is the right default because a return is a property of the trajectory, not of the
+observer. Under `:obs_bin` nav noise leaks into the score through three channels at once —
+the successor bin the next reward is charged at, the visit counts the science term reads,
+and the terminal test — so a noisy sensor can credit the vehicle with a science band it
+never reached and end the scored episode on a misread. That makes measurement error a
+source of reward, and returns then RISE with `sigma_nav_km`, which inverts the sweep it is
+meant to measure.
+
+`:obs_bin` stays reachable because "score it the way the policy saw it" is a legitimate
+question, and it is the like-for-like setting when comparing against a controller whose
+own banking is observation-driven.
+
+Only the action and the solve residual come from the controller under either setting.
+`MPCController` records an EMPTY `extra` (only `SARSOPController` observes), so both
+settings fall back to binning `peri_alt_km` for it — which is already the truth, leaving
+an MPC rollout scored identically either way.
 """
 function discounted_return(result, pomdp::StationkeepingPOMDP;
-                           gamma::Real = pomdp.discount)
+                           gamma::Real = pomdp.discount,
+                           score_on::Symbol = :true_bin)
+    score_on in (:true_bin, :obs_bin) || throw(ArgumentError(
+        "score_on must be :true_bin or :obs_bin, got :$score_on"))
     T, _ = model_tables(pomdp)
     r    = reward_function(pomdp, T)
     idx  = state_index(pomdp)
@@ -996,23 +1033,27 @@ function discounted_return(result, pomdp::StationkeepingPOMDP;
         haskey(idx, s) || break
         total += gamma^(t - 1) * r(s, Symbol(step.action))
 
-        # Advance to where the pass actually landed. Prefer the controller's own OBSERVED
-        # bin when it recorded one, so the scoring bins exactly as the policy did; fall
-        # back to binning the achieved altitude, because `MPCController` records an EMPTY
-        # `extra` (only `SARSOPController` observes) and the baseline must still be
-        # scoreable — comparing a POMDP policy against MPC is the point.
-        nxt = if hasproperty(step.extra, :obs_bin)
-            Symbol(step.extra.obs_bin)
+        # Advance to where the pass landed. Under `:true_bin` that is the altitude the
+        # vehicle ACTUALLY reached; under `:obs_bin` it is what the controller believed.
+        # Both fall back to binning the achieved altitude, because `MPCController` records
+        # an EMPTY `extra` (only `SARSOPController` observes) and the baseline must still
+        # be scoreable — comparing a POMDP policy against MPC is the point.
+        nxt = if hasproperty(step.extra, score_on)
+            Symbol(getproperty(step.extra, score_on))
         elseif isfinite(step.peri_alt_km)
             alt_bin(pomdp, step.peri_alt_km)
         else
             :LOST
         end
+        # Terminating on `nxt` means `:true_bin` ends the episode on a real loss, while
+        # `:obs_bin` can end it on a misread. That is the point of the distinction.
         isterminal_alt(nxt) && break      # cost already charged above
 
-        # Visit counts likewise: use the controller's if present, else bank from the bin
-        # the pass landed in, saturating at the cap exactly as `transition.jl` does.
-        visits = if hasproperty(step.extra, :visits)
+        # Visit counts. Under `:true_bin`, bank from the altitude actually achieved —
+        # never from `extra.visits`, which `controller_observe!` banks from the OBSERVED
+        # bin and which would otherwise re-introduce phantom coverage the reward pays for.
+        # Saturates at the cap exactly as `transition.jl` does.
+        visits = if score_on === :obs_bin && hasproperty(step.extra, :visits)
             # `SARSOPController` stores visits as a Vector; `SKState` needs an NTuple.
             v = step.extra.visits
             v isa Tuple ? v : ntuple(i -> Int(v[i]), n_bands(pomdp))
