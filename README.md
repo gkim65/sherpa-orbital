@@ -4,40 +4,25 @@ Offline POMDP stationkeeping for the Enceladus Orbilander mission concept
 (MacKenzie et al. 2020). The spacecraft holds an L1 halo orbit with periapsis over
 Enceladus's south pole and must stationkeep without ground contact, trading **science**
 (sampling a range of periapsis altitudes, where the plumes are denser lower down) against
-**safety** (not crashing into Enceladus or escaping an unstable orbit).
+**safety** (not crashing into Enceladus or escaping the orbit).
 
-> **On the orbit: this is a TEST SCENARIO, not MacKenzie's exact science orbit.**
+> **The orbit: a period-1 L1 halo, studied for the altitude problem.**
 >
-> We fly a **period-1** L1 halo — true period **11.996 hr**, one periapsis per revolution,
-> periapsis over the south pole at ~23–46 km depending on the commanded band. It is in the same
-> family and altitude range as the mission concept's orbit and poses the same control problem:
-> an orbit that must be actively held, where lower passes pay more science and cost more risk.
-> That is what the POMDP formulation is being tested on, and it is sufficient for the policy
-> question this repo is asking.
+> We fly a period-1 member of the Saturn–Enceladus L1 halo family — 11.996 hr, one periapsis
+> per revolution, south-polar periapsis, commanded between ~23 and ~46 km. It poses the
+> problem this repo is about: an orbit that must be actively held, where lower passes pay
+> more science and cost more risk, and where the controller has to choose how deep to go.
 >
-> MacKenzie §B.2.3 specifies a **period-3** orbit whose three periapses are geometrically
-> distinct and grouped over the south pole, chosen for ground-track diversity. We do not have
-> that orbit. Getting it is a branch-switching problem — locate a period-tripling bifurcation
-> along the family and continue off it — and no such crossing has been shown to exist in this
-> family at these altitudes. Future work, not a blocker.
+> MacKenzie §B.2.3 specifies a period-3 member instead, whose three geometrically distinct
+> periapses buy ground-track diversity. That is a different orbit in the same family, and
+> reaching it is a branch-switching problem — no period-tripling bifurcation has been shown
+> to exist here at these altitudes. The altitude/risk tradeoff the POMDP solves is the same
+> either way.
 >
-> Reading older material in this repo: text before 2026-08-29 (including this README)
-> described the orbit as period-3. That was wrong, and it survived because the 11.996 hr period
-> happens to reproduce MacKenzie's ~12 hr periapsis spacing. It closes at `T/3` to 0.009 km —
-> better than at the nominal 35.988 hr — its three apparent "passes" are the same point
-> revisited to 3+ decimals in altitude, latitude and longitude, and it matches the JPL
-> Three-Body Periodic Orbit Catalog at 11.99604 hr, whose L1 halo periods span 7.80–16.14 hr.
-> `PERIOD1_TRIPLE_PERIOD_S` is 3x the true period, kept only because every controller
-> measurement to date used it as the rollout horizon.
->
-> On "unstable": stationkeeping is genuinely required — uncontrolled, the orbit runs
-> 31 → 52 → 113 → 950 → 43,819 km in five passes under the truth model, and a 1 m error grows
-> ~183x over 8 revolutions. The precise form is worth knowing: all six Floquet multipliers lie
-> on the unit circle, so it is **marginally** stable rather than hyperbolically unstable, and
-> the fast divergence is driven by the **J2 model gap** between the truth and onboard models.
-> Growth is polynomial, not exponential.
-
-This is SHERPA-RPA Direction 3.
+> Stationkeeping is genuinely required: uncontrolled, the orbit runs away within a few
+> passes under the truth model. All six Floquet multipliers lie on the unit circle, so it is
+> **marginally** stable rather than hyperbolically unstable — the fast divergence is the
+> **J2 model gap** between the truth and onboard models, not orbital instability.
 
 ---
 
@@ -53,7 +38,7 @@ using SherpaOrbital, NativeSARSOP, POMDPs
 config = StationkeepingPOMDP()          # baseline scenario
 pomdp  = build_pomdp(config)
 
-# ⚠️ `use_binning = false` is REQUIRED, not a tuning choice — NativeSARSOP's
+# NOTE: `use_binning = false` is required, not a tuning choice — NativeSARSOP's
 # `entropy(::SparseVector)` throws `InexactError` on this model otherwise.
 policy = solve(SARSOPSolver(; precision = 1e-3, max_time = 120.0,
                             use_binning = false), pomdp)
@@ -129,22 +114,19 @@ than the mean gain exactly what shallower bins lose. Expected science per pass
 | `ABOVE_44` (HIGH) | 0.00 | 13.00 | 10.51 | 8.33 | 8.33 | 8.33 |
 | **five-bin mean** | | **0.6500** | **0.6500** | **0.6532** | **0.6592** | **0.6572** |
 
-θ = 0 is the null hypothesis — no altitude gradient, every bin worth the same — and is the
-structural sanity gate (every tilt vanishes, so every bin is exactly uniform).
+θ = 0 is the null hypothesis and the structural sanity gate: every tilt vanishes, so every
+bin is worth the same. The invariant five-bin mean is what makes returns comparable across
+θ — regret compares matrix columns, so an axis that inflated total value would confound
+"better policy" with "richer world".
 
-The invariant five-bin mean is what makes returns comparable **across** θ: a high-θ
-environment repriced altitude, it did not get richer. Regret compares columns of the matrix,
-so an axis that inflated total value would confound "better policy" with "richer world".
+**Usable range is θ ∈ [0, 4].** The tilt is clamped to keep probabilities non-negative, so
+the shallowest bin pins around θ ≈ 1.9 and the deepest two by θ ≈ 4; past that θ buys
+almost nothing and the clamp drifts the mean ~1.4%. **`(0, 1, 2, 4)`** gives four distinct
+models inside the range.
 
-**Usable range is θ ∈ [0, 4].** The tilt is clamped to keep probabilities non-negative, and
-with the default `alt_rep_km` the mean depth is ≈ 0.534, so the shallowest bin pins at
-θ ≈ 1.87 and the deepest two pin together by θ ≈ 4. Past that θ buys almost nothing — LOW−MID
-stops growing — and the clamp lets the five-bin mean drift ~1.4% off its θ = 0 value. An
-evenly spaced **`(0, 1, 2, 4)`** stays inside the usable range and gives four distinct models.
-
-⚠️ `plume_gradient` reprices altitude but does NOT change the physics: the measured kernels
-are altitude dynamics and are shared across θ. A high θ makes low passes more valuable, not
-more survivable.
+**Note:** θ reprices altitude, it does not change the physics. The kernels are altitude
+dynamics and are shared across θ, so a high θ makes low passes more valuable, not more
+survivable.
 
 `S`, `A`, `O` and `γ` stay fixed across a sweep, as the formulation requires — note this
 makes `plume_levels` (which changes `|S|`) **not** a legal θ.
@@ -167,10 +149,10 @@ Scoring is **post-hoc over the trace**, deliberately: the reward belongs to a θ
 trajectory belongs to the physics, and one trajectory is legitimately scored under several θ
 to fill a matrix row. So an N×N matrix costs **N rollouts, not N²**.
 
-⚠️ This is the **truth-model** return (~10 s per 30-day rollout, real CR3BP dynamics), not
-the discrete-model one from `POMDPs.simulate` with a `RolloutSimulator` (milliseconds,
-states sampled from `T`). Both are valid; they are **not** interchangeable, and a regret
-matrix must use one or the other throughout.
+**Note:** this is the **truth-model** return (~10 s per 30-day rollout, real CR3BP
+dynamics), not the discrete-model one from `POMDPs.simulate` with a `RolloutSimulator`
+(milliseconds, states sampled from `T`). Both are valid, they are not interchangeable, and
+a regret matrix must use one or the other throughout.
 
 ---
 
@@ -202,15 +184,13 @@ and loses the vehicle):
 | `R_CRITICAL` | ≥ 25 km | 647 | 0.062 |
 
 The hard zero on `R_OK` is the load-bearing property: it is what lets the policy tell a safe
-excursion from a dangerous one. Before this dimension existed the kernel reported
-`P(loss) = 0.0` for the transition that actually kills the vehicle — correct for a *fresh*
-excursion, but the danger is conditional on damage the state could not see. Neither more
-calibration (which averages fresh and degraded together) nor larger loss penalties (which
-multiply `P(loss)`, and anything × 0.0 is 0.0) can fix that.
+excursion from a dangerous one. Without it the kernel reports `P(loss) = 0.0` for the
+transition that actually kills the vehicle — correct for a *fresh* excursion, but the danger
+is conditional on damage the state could not see. Neither more calibration nor larger loss
+penalties fix that.
 
-**It is observed exactly**, unlike altitude. The residual is computed by the onboard solver
-from the onboard model, not measured by a sensor, so the spacecraft knows it to machine
-precision; modelling it as noisy would invent uncertainty that does not exist.
+**It is observed exactly**, unlike altitude: the onboard solver computes it rather than a
+sensor measuring it, so modelling it as noisy would invent uncertainty that does not exist.
 
 What the measured kernels say about recovery (tree depth 9):
 
@@ -224,24 +204,17 @@ CORRECT  A20_27   R_CRITICAL                        0.179             0.821   n=
 Correcting reliably repairs a degraded orbit **everywhere except low**, where it mostly
 fails and the vehicle is usually lost. That is the "LOW is special" result, measured.
 
-Four things worth knowing about the formulation:
+Three properties of the formulation worth knowing:
 
-**Actions encode intent, not a burn vector.** A fixed menu of burn directions was measured
-and shown to fail; the burn direction is solved live by the planner against the onboard
-model, so the POMDP only chooses *what to attempt*.
-
-**Science is banked on the OBSERVED altitude, not the commanded one.** A band pays when
-the pass actually lands in its bin, so a missed excursion earns nothing and `CORRECT` banks
-its own bin passively. Coverage therefore carries the observation model's ~15–20%
-edge-driven misbin rate; report the science product with that attached.
-
-**Science is banked only on survival.** A pass banks its band only if it did not go
-terminal. That coupling is what forces the policy to sequence excursions rather than
-attempt everything at once.
-
-**The altitude bins bracket the controller's limit cycle.** `CORRECT` settles at 37.17 km,
-which sits in `A34_44` — deliberately **not** a science band. Without that, two of three
-bands were banked by doing nothing and the science/safety tradeoff was vacuous.
+- **Actions encode intent, not a burn vector.** The direction is solved live by the planner
+  against the onboard model; the POMDP only chooses *what to attempt*.
+- **Science is banked on the OBSERVED altitude, and only on survival.** A band pays when the
+  pass lands in its bin and did not go terminal, so a missed excursion earns nothing and
+  `CORRECT` banks its own bin passively. Coverage carries the observation model's ~15–20%
+  edge-driven misbin rate — report the science product with that attached.
+- **The altitude bins bracket the controller's limit cycle.** `CORRECT` settles at 37.17 km
+  in `A34_44`, deliberately not a science band. Otherwise bands are banked by doing nothing
+  and the tradeoff is vacuous.
 
 ### Editing the scenario
 
@@ -284,24 +257,22 @@ Exported policies are **not** committed — they are large and derived, and `.gi
 excludes `artifacts/policy.json` and the θ-keyed `artifacts/policy_*` a sweep writes.
 
 **One kernel per action, conditioned on orbit damage.** Rows are keyed
-`[action][(alt_bin, residual_bin)]` and their columns are the joint successor
-`(alt, residual)` — artifact `format: 3`. Both halves matter: pooling the kernels across
-bands made `EXCURSE_LOW/MID/HIGH` identical in `T`, and keying on altitude alone averaged
-fresh and degraded departures into one row that reported `P(loss) = 0.0` for the transition
-that actually loses the vehicle. `load_tables` **rejects** older formats rather than
-remapping them, since neither distinction is recoverable from the file.
+`[action][(alt_bin, residual_bin)]`, columns are the joint successor `(alt, residual)`.
+Both halves matter: pooling across bands makes the excursions identical in `T`, and keying
+on altitude alone averages fresh and degraded departures into a row that reports
+`P(loss) = 0.0` for the transition that loses the vehicle. `load_tables` rejects older
+artifact formats rather than remapping them.
 
 > ### Read `meta.trials` before quoting a policy behaviour
 > Of the 60 rows in the committed artifact, **44 clear `MIN_TRIALS_TRUSTED = 20`, 4 are thin
-> (`0 < n < 20`), and 12 are unmeasured (`n = 0`) and filled**. The filled rows are
-> `BELOW_20` at degraded or critical damage, plus `A34_44/R_CRITICAL` — combinations the
-> vehicle does not reach. A filled row is not evidence, and the policy's behaviour there
-> means nothing; `meta.unmeasured_rows` names them, and `_fill_unmeasured_row` inherits the
-> same action's measured behaviour at the nearest less-degraded damage bin rather than
-> inventing a risk-free self-transition.
+> (`0 < n < 20`), and 12 are unmeasured (`n = 0`) and filled** — `BELOW_20` at degraded or
+> critical damage, plus `A34_44/R_CRITICAL`, combinations the vehicle does not reach. A
+> filled row is not evidence; `meta.unmeasured_rows` names them, and `_fill_unmeasured_row`
+> inherits the nearest less-degraded measured row rather than inventing a risk-free
+> self-transition.
 >
-> Also: kernels are noise-free unless calibrated with `noisy_thruster = true`, so any
-> survival number derived from them is an **upper bound**, not feasibility.
+> Kernels are noise-free unless calibrated with `noisy_thruster = true`, so any survival
+> number derived from them is an **upper bound**, not feasibility.
 
 ---
 
@@ -313,7 +284,7 @@ Manifest.toml           committed — reproducible environment
 src/
   SherpaOrbital.jl      module + exports
   StationkeepingPOMDP.jl  the @kwdef config struct — holds ALL of θ
-  states.jl             (alt, visits, intensity) space, altitude binning
+  states.jl             (alt, visits, intensity, residual) space, altitude binning
   actions.jl            action set, excursion -> band mapping
   observations.jl       O[s,o] — analytic Gaussian nav model
   plume.jl              P_θ(intensity | band) — the plume altitude gradient
@@ -334,7 +305,7 @@ experiments/            own Project.toml — isolates the solver dependency
   calibrate.jl          regenerates artifacts/tables.json
 artifacts/              tables.json committed; exported policies gitignored
 test/                   runtests.jl
-legacy/                 frozen Python, NOT part of the pipeline (see below)
+legacy/                 frozen Python, deliberately not ported
   russell-lara/         Russell & Lara (2009) Hill-problem study, frozen
   figures-reference/    matplotlib originals kept as Makie-port specs
 ```
@@ -367,45 +338,22 @@ unless told otherwise (0–20% underburn, mean 10% short, never over), which is 
 MacKenzie Exhibit B-24's symmetric 0.7–2.0% and therefore a worst case rather than a
 realistic thruster.
 
-⚠️ **A regret matrix built on noisy rollouts would be mostly noise.** At sd ≈ 68, resolving a
-plausible ~20-point θ effect needs on the order of 50 seeds per cell; noise-free at sd ≈ 10
-needs a handful. Either sweep noise-free, or calibrate *and* fly noisy with the cited
-`(model = :gaussian_pct, sigma_pct = 2.0)` law.
+**A regret matrix built on noisy rollouts would be mostly noise.** At sd ≈ 68, resolving a
+plausible ~20-point θ effect needs ~50 seeds per cell; noise-free at sd ≈ 10 needs a
+handful. Either sweep noise-free, or calibrate *and* fly noisy with
+`(model = :gaussian_pct, sigma_pct = 2.0)`.
 
-Before the residual dimension and the reward fix this policy **escaped at 3.8 d** having
-chosen `CORRECT` once in six passes.
-
-Two behaviours worth noting, neither of which was engineered:
+Two behaviours worth noting, neither engineered:
 
 - **It corrects heavily** — roughly half of all passes — and interleaves excursions between
   corrections rather than chaining them.
-- **It runs LOW as a bounded campaign.** `EXCURSE_LOW` fires at passes 11, 14, 17, 20 —
-  four times, spaced three apart — and then never again in the remaining 40 passes. The
-  3-pass spacing is "excurse, then correct twice", which is exactly the pattern the measured
-  kernels say is required; the policy found it from the kernel, not from being told.
+- **It runs LOW as a bounded campaign.** `EXCURSE_LOW` fires four times, spaced three passes
+  apart, then never again. That spacing is "excurse, then correct twice", the pattern the
+  measured kernels say is required — found from the kernel, not from being told.
 
-⚠️ `outcome = :idle` means the horizon was reached with no crash and no escape, but the
-controller stopped triggering before the end — survival, not a claim of active hold to the
-last second. And every number here is one policy at one θ; at θ = 8 one noisy seed crashes
-at 11.2 d, in a run where `CORRECT` was chosen only 2 of 23 times.
-
----
-
-## Status: port complete — the pipeline is 100% Julia
-
-`python-legacy/` was **deleted** in Session 5. Every module in the live pipeline (CR3BP
-dynamics, the halo-orbit differential corrector, the planner, the MPC baseline, the
-spacecraft models, the unified rollout harness, calibration, the POMDP model and solver
-pipeline) is Julia.
-
-The Python reference is preserved as **frozen JSON dumps** in `scratch/compare/ref_*.json`
-(gitignored, local). The `compare_*.jl` scripts diff Julia against those dumps and read
-nothing else; the `ref_*.py` dumpers are retained as provenance and no longer run. See
-`scratch/compare/README.md` for the pre-deletion audit and the list of retired rows.
-
-What remains in `legacy/` is deliberately NOT ported: the Russell & Lara Hill-problem
-study (a separate dynamical model, frozen, numpy-only) and the matplotlib figure scripts,
-kept as specifications for a Makie port.
+**Note:** `outcome = :idle` means the horizon was reached with no crash and no escape but
+the controller stopped triggering before the end — survival, not a claim of active hold to
+the last second.
 
 ---
 
@@ -422,11 +370,9 @@ slow for an edit loop on the model layer. Pass substrings to run only matching t
 julia --project=. -e 'using Pkg; Pkg.test(test_args=["plume","rewards"])'   # ~8 s
 ```
 
-The suite covers the **POMDP model layer** (state space, altitude binning, actions, measured
-tables, transition/observation matrices, rewards, the plume gradient, config plumbing) plus
-orbit geometry and the controller. The physics layer is additionally cross-checked by
-`scratch/compare/*.jl` against frozen Python dumps — see the Session-5 log for why that
-split is deliberate.
+The suite covers the POMDP model layer (state space, binning, actions, measured tables,
+transition/observation matrices, rewards, the plume gradient, config plumbing) plus orbit
+geometry and the controller.
 
 ---
 

@@ -1,50 +1,41 @@
 """
 common/simulate.jl — ONE rollout harness for every stationkeeping baseline.
 
-WHY THIS FILE EXISTS
-The Python reference had two independently-written rollout loops: `baselines/mpc.py`'s
-`run_mpc` and `baselines/pomdp_rollout.py`'s `run_pomdp_rollout`. They shared a control
-concept (one decision per periapsis approach, triggered at the 600-km descending shell) and
-the same crash/escape definitions, but they implemented it twice. Any drift between them —
-a different escape shell, a different min-periapsis bookkeeping, a burn counted in one and
-not the other — would show up as a POMDP-vs-MPC performance difference that is really a
-harness difference. Here the WORLD is written once and only the CONTROLLER is swapped, so
-the comparison is apples-to-apples by construction rather than by careful maintenance.
+The world is written once and only the CONTROLLER is swapped, so a POMDP-vs-MPC comparison
+cannot pick up a harness difference — a different escape shell or min-periapsis bookkeeping
+would otherwise read as a performance difference.
 
-    result = simulate(MPCController(ref_ic = ic), ic, cr3bp_j2_eom!, ONE_REV_S, horizon_s)
-    result = simulate(SARSOPController(policy, ref_ic = ic), ic, cr3bp_j2_eom!, …; rng)
+    result = run_rollout(MPCController(ref_ic = ic), ic, cr3bp_j2_eom!, period_s, horizon_s)
+    result = run_rollout(SARSOPController(policy, ref_ic = ic), ic, cr3bp_j2_eom!, …; rng)
 
-⚠️ TRUTH/ONBOARD SPLIT (CLAUDE.md rule). `truth_eom!` is a positional ARGUMENT and is
-integrated ONLY inside this file's coast helpers. Every controller plans exclusively with
-the onboard model (`cr3bp_eom!`, via `solve_burn`) and never sees `truth_eom!`. That is what
-lets one controller run unchanged against CR3BP+EncJ2, +Saturn J2, and later SPICE.
+Control concept (MacKenzie §B.2.3 Strategy 3), one decision per periapsis approach:
 
-CONTROL CONCEPT (identical for both baselines, from MacKenzie §B.2.3 Strategy 3)
-Each control step:
   1. Coast under TRUTH to the next descending crossing of the `CONTROL_ALT_KM` = 600 km
      shell, watching for a crash (`PERIAPSIS_CRASH_ALT`) or escape (`ESCAPE_ALT_KM`).
   2. Ask the controller for a commanded ΔV at that shell state.
   3. Execute it (optionally through the noisy thruster model) and coast under TRUTH past
      the shell to the next periapsis, so the descending shell event re-arms rather than
-     re-firing in place. That sets the cadence to one burn per periapsis approach.
+     re-firing in place.
   4. Hand the controller the achieved periapsis state so it can update its own internal
-     state (a belief, for SARSOP; nothing, for MPC).
+     state — a belief for SARSOP, nothing for MPC.
 
-RELATIONSHIP TO `run_mpc`
-`run_mpc` in `baselines/mpc.jl` is retained UNCHANGED as the validated reference
-— it is what reproduces the documented "escape @ 77.96 hr, 5 burns, 37.579 m/s" signature.
-`simulate` with an `MPCController` is the harness-unified path; the two are cross-checked
-numerically in `scratch/compare/compare_simulate.jl`. They are not expected to agree
-bit-for-bit: `run_mpc` records every periapsis it passes en route to the shell for its
-min-periapsis metric, whereas `simulate` records the periapsis it actually stops at, and
-`simulate` routes the ΔV through `apply_dv` (identity when `noisy_thruster = false`).
+NOTE: truth/onboard split. `truth_eom!` is a positional argument, integrated only inside
+this file's coast helpers. Controllers plan exclusively with `cr3bp_eom!` via `solve_burn`
+and never see it, which is what lets one controller run unchanged against CR3BP+EncJ2,
++Saturn J2, and later SPICE.
+
+[`run_mpc`](@ref) in `baselines/mpc.jl` is a separately-validated implementation of the
+same concept. The two are not expected to agree bit-for-bit: `run_mpc` records every
+periapsis it passes en route to the shell for its min-periapsis metric, while this records
+the one it stops at.
 """
 
 # ── Controllers ───────────────────────────────────────────────────────────────
 """
     AbstractController
 
-A stationkeeping controller. Implement three methods to plug a baseline into `simulate`:
+A stationkeeping controller. Implement three methods to plug a baseline into
+[`run_rollout`](@ref):
 
   - `controller_setup!(c, state0, period_s)` — one-time initialization (e.g. computing the
     nominal apse targets). Called before the first control step.
@@ -65,116 +56,70 @@ controller_observe!(::AbstractController, ::AbstractVector, ::Real, ::Symbol,
 """
     controller_type(c) -> String
 
-The baseline's name for reporting: `"MPC"` or `"SARSOP"`. This is the `type` the brief
-asks the harness to switch on; it is a method on the controller rather than a string
-compared inside the loop, so adding a baseline cannot silently fall through to a default.
+The baseline's name for reporting: `"MPC"` or `"SARSOP"`. A method on the controller rather
+than a string compared inside the loop, so adding a baseline cannot silently fall through
+to a default.
 """
 controller_type(::AbstractController) = "UNKNOWN"
 
 # ── MPC baseline ──────────────────────────────────────────────────────────────
 """
-    MPCController(; ref_ic, mode, peri_target_km, apo_target_km)
+    MPCController(; ref_ic, mode, peri_target_km, apo_target_km, target_alt_km,
+                  family_table)
 
 The deterministic Strategy-3 MPC baseline as a controller: at every shell crossing, solve
 for the ΔV that re-targets the next apses. Stateless apart from the nominal targets it
 caches in `controller_setup!`.
 
-  - `ref_ic` — reference orbit for the `:position`-mode nominal apse targets. `nothing`
-    uses the rollout's own initial state.
-  - `mode` — `:position` (Strategy 3 proper, apse POSITION-vector bounding; MacKenzie's
-    working strategy) or `:altitude` (Strategy 1/2, which MacKenzie says fails).
-  - `target_alt_km` — commanded periapsis altitude (km), or `nothing` (DEFAULT) to hold
-    whatever orbit `ref_ic` is. **This is the retargeting toggle** — see below.
-  - `family_table` — a prebuilt [`halo_family_table`](@ref) / [`halo_family_span`](@ref) to
-    retarget against. `nothing` uses [`halo_family_table_cached`](@ref), which spans roughly
-    **19–63 km** and costs ~80 s to continue cold (cached after the first call). Pass a table
-    explicitly for a different altitude range — e.g. a band above 63 km, which the default
-    span does NOT contain and which therefore throws rather than silently missing.
+  - `ref_ic` — reference orbit for the `:position`-mode nominal apse targets; `nothing`
+    uses the rollout's own initial state
+  - `mode` — `:position` (Strategy 3 proper, apse position-vector bounding) or `:altitude`
+    (Strategy 1/2, which MacKenzie reports as failing)
+  - `peri_target_km`, `apo_target_km` — apse altitude targets (km) for `:altitude`
+  - `target_alt_km` — commanded periapsis altitude (km), or `nothing` to hold whatever
+    orbit `ref_ic` is. This is the retargeting toggle
+  - `family_table` — prebuilt family to retarget against; `nothing` uses
+    [`halo_family_table_cached`](@ref), which spans roughly 19-63 km and costs ~80 s to
+    continue cold. Pass one explicitly for a band outside that span, which otherwise throws
 
-## Commanding an off-nominal periapsis altitude (`target_alt_km`)
+With `target_alt_km` set, `controller_setup!` looks up a genuine L1-halo family member at
+that altitude ([`retarget_to_altitude`](@ref)) and takes the nominal apse targets from it,
+so `CORRECT` defends the commanded orbit rather than pulling back to `ref_ic`. Left
+`nothing`, the targets are computed once from `ref_ic` and never updated.
 
-`nothing` (the default) is the PINNED reference: the nominal apse targets are computed once
-from `ref_ic` and never updated. Every measurement taken before 2026-08-29 used this path, and
-it is left as the default so those numbers reproduce bit-for-bit.
+NOTE: achieved periapsis settles ~6 km ABOVE the commanded altitude. That is the
+single-impulse `:position` residual floor, not the truth/onboard model gap — the truth
+model tracks the onboard prediction to ~0.2 km. At a drifted operating point the six
+position constraints are not simultaneously satisfiable by one impulse, so least squares
+splits the error and much of it lands on periapsis radius. The bias is stable and
+invariant under gain and horizon.
 
-Set `target_alt_km` and `controller_setup!` instead looks up a GENUINE L1-halo family member at
-that altitude ([`retarget_to_altitude`](@ref)) and takes the nominal apse targets from it, so
-`CORRECT` defends the commanded orbit rather than pulling back to `ref_ic`. Measured noise-free
-over 30 days from the 31 km IC (`Xoshiro(0)`, `cr3bp_j2_eom!` truth):
+NOTE: that residual is LOAD-BEARING — do not add control authority to null it. Two-impulse
+and solve-two-execute-one variants both deliver the commanded altitude far more accurately
+and then lose the vehicle within days. Crushing six constraints into three controls is what
+pins the orbit's orientation and buys a stable limit cycle.
 
-| commanded | pinned (`nothing`) | retargeted (`target_alt_km`) |
-|---|---|---|
-| 50 km | 37.17 km, 75.73 m/s | **56.01 km**, 80.66 m/s |
-| 70 km | 37.17 km, 75.73 m/s | **75.86 km**, 88.02 m/s |
+NOTE: do not pre-shift the commanded altitude to compensate either. It converges
+numerically, but it fights any controller that also reasons about altitude and pushes the
+commanded value below the range the family contains, manufacturing a fake altitude floor.
+The productive direction is a supervisor that knows about the bias and commands
+accordingly.
 
-The pinned column is bit-identical whatever is commanded — it ignores the command entirely.
-
-⚠️ **THE ACHIEVED ALTITUDE RUNS ~6 km HIGH.** Command 40 km and the loop settles at ~46.1 km.
-The bias is +6.19 km at the nominal 31 km and decreases slowly to +5.75 km at 120 km.
-
-**It is the ~8 km single-impulse `:position` residual floor** — the same one `docs/todo.md`
-records, and NOT the truth/onboard model gap. Measured per pass, settled (target 40.000 km):
-
-| quantity | value |
-|---|---|
-| onboard PREDICTED next periapsis | 46.2552 km |
-| truth ACHIEVED next periapsis | **46.0977 km** |
-| prediction error | **0.16 km** |
-| `solve_burn` residual, converged | **7.99 km** |
-
-The truth model tracks the onboard prediction to 0.16 km, so J2 is not doing this. The
-controller is **deliberately and stably aiming 6.26 km high**: at the drifted operating point
-the six `:position` constraints are not simultaneously satisfiable by one impulse, so
-least-squares splits ~8 km of unavoidable error and ~6.2 km of it lands on periapsis radius.
-
-Invariant under gain and horizon, which is the signature of a converged optimum rather than
-under-correction: bias is **6.098 km for every `damp` in 0.4–1.0** (identical to three
-decimals, same ΔV, same pass count).
-
-⚠️ **A measurement trap to avoid.** At the reference IC the residual is 0.000000 km and
-`cond(J) = 31`, which looks like "an exact solution exists, so the constraint count is not the
-problem". That is measured where the spacecraft is already perfectly on the orbit and says
-nothing about the drifted case. Measure at a drifted shell state instead.
-
-⚠️ **AND IT SHOULD NOT BE "FIXED" BY ADDING CONTROL AUTHORITY — measured 2026-08-29.** Two
-impulses (6 controls vs 6 constraints) reduce the single-pass periapsis error from +6.255 km to
-**+0.014 km**, and then LOSE THE VEHICLE closed-loop: executing both impulses escapes at 17.8 d
-(263 m/s), and MacKenzie's Nm-joint variant (solve two, execute only the first) escapes at
-**2.3 d** having burned 5.31 m/s with the solver CONVERGED. With Session 6's six formulations
-("every one that aims accurately loses the vehicle; the only survivor aims badly"), that is four
-independent measurements that **the ~8 km residual is LOAD-BEARING** — crushing six constraints
-into three controls is what pins the orbit's ORIENTATION, and it buys a stable limit cycle at
-~1.32 m/s per pass indefinitely.
-
-So treat the +6 km as a characterised property, not a bug: it is stable, predictable, and the
-vehicle survives 30 days on it. The productive direction is a SUPERVISOR that knows the
-controller lands ~6 km high and commands accordingly (altitude in the POMDP state/observation),
-which works WITH the holding mechanism rather than against it. See `docs/todo.md`.
-
-⚠️ Do NOT "fix" this by pre-shifting the commanded altitude (command 24 to get 30). It works
-numerically — a two-iteration fixed point converges to <=0.007 km — but it fights any
-controller that also reasons about altitude, and it pushes the COMMANDED value ~6 km below the
-wanted one, so a 20 km target demands a ~14 km reference the family does not contain, which
-manufactures a fake altitude floor.
-
-⚠️ **A transfer ceiling exists near 148 km commanded from the 31 km IC**, and it is a limit on
-TRANSFER authority, not on the orbit: 150 km escapes at 2.84 d when transferred from 31 km but
-holds the full 30 days when started on its own IC (113.62 m/s). Above ~200 km the onboard
-prediction loses an apse, `solve_burn` returns ΔV = 0, and the run is an uncontrolled coast —
-check `n_failed_solves` before reading any outcome there.
-
-⚠️ Every number above is NOISE-FREE and therefore an UPPER BOUND, not a feasibility claim.
+NOTE: a transfer ceiling exists well above the science range — an altitude holdable when
+started on its own IC can still escape when transferred to from the nominal orbit. Far
+above it the onboard prediction loses an apse, `solve_burn` returns ΔV = 0, and the run is
+an uncontrolled coast; check `n_failed_solves` before reading any outcome there.
 """
 Base.@kwdef mutable struct MPCController <: AbstractController
     ref_ic::Union{Nothing,Vector{Float64}} = nothing
     mode::Symbol                           = :position
     peri_target_km::Float64                = PERIAPSIS_ALT_TARGET
     apo_target_km::Float64                 = APOAPSIS_ALT_TARGET
-    # Retargeting toggle: nothing = pinned reference (pre-2026-08-29 behaviour, the default).
+    # Retargeting toggle: nothing = pinned reference.
     target_alt_km::Union{Nothing,Float64}  = nothing
     # Prebuilt family table to retarget against. `nothing` uses `halo_family_table_cached()`.
-    # Pass one to control the span/resolution, or to keep a test fast — continuing the default
-    # 181-member family costs ~2 min on a cold cache.
+    # Pass one to control the span/resolution, or to keep a test fast — a cold continuation
+    # of the default family costs minutes.
     family_table::Union{Nothing,Vector{NamedTuple}} = nothing
     # Filled by controller_setup!.
     r_peri_nom::Union{Nothing,Vector{Float64}} = nothing
@@ -219,9 +164,9 @@ function controller_setup!(c::MPCController, state0::AbstractVector, period_s::R
             ref = member.ic
         end
 
-        # `period_s` is the CONTROL cadence (T/3), not a valid apse-search window: the
-        # period-3 orbit has 3 periapses but only 2 apoapses, so T/3 falls short of the
-        # first apoapsis. Hence the count-based search here.
+        # `period_s` is the control cadence, not a valid apse-search window: it contains
+        # one periapsis and NO apoapsis, so a window search returns empty. Hence the
+        # count-based `next_apse_positions`.
         c.r_peri_nom, c.r_apo_nom = next_apse_positions(ref; eom! = cr3bp_eom!)
     end
     return nothing
@@ -254,8 +199,8 @@ that band's COMMANDED ALTITUDE via `mode = :altitude_position`), then fold a noi
 observation into the belief. Every action burns — there is no `OBSERVE` (removed
 2026-08-30; see [`actions`](@ref)).
 
-⚠️ The ONBOARD model here is twofold and both halves are onboard-only: the discrete belief
-filter over dev bins, and `solve_burn`'s CR3BP prediction. Neither sees `truth_eom!`.
+NOTE: both onboard halves — the discrete belief filter and `solve_burn`'s CR3BP
+prediction — are onboard-only. Neither sees `truth_eom!`.
 
 ## `retarget_bands` — aim an excursion at a REAL ORBIT rather than a scaled waypoint
 
@@ -274,11 +219,11 @@ altitude ([`retarget_to_altitude`](@ref)). Measured, aim improves substantially 
 
 An excursion is still a ONE-PASS visit: the next `CORRECT` returns to the nominal orbit by
 design. Holding a band for multiple passes would need the policy to keep choosing that band,
-which is a reward/state question, not a targeting one (`docs/todo.md`).
+which is a reward/state question, not a targeting one.
 
-⚠️ **The solved policy was calibrated against the WAYPOINT dynamics.** Rolling it out with
-`retarget_bands = true` tests the targeting mechanism, not a matched policy — the transition
-kernels in `artifacts/tables.json` describe the old behaviour. Re-solving is a separate step.
+NOTE: a policy solved against waypoint dynamics and rolled out with `retarget_bands = true`
+tests the targeting mechanism, not a matched policy — the kernels describe the behaviour the
+policy was solved against. Re-solve rather than mixing them.
 
 Coverage is banked from the OBSERVED periapsis altitude (2026-08-30), not from which action
 was commanded — so `CORRECT` banks its own band passively and a missed excursion banks
@@ -398,10 +343,15 @@ end
 
 Bin a live onboard `solve_burn` residual (km) using the EXPORTED edges.
 
-⚠️ Must stay identical to [`residual_bin`](@ref) in `states.jl`. It reads the edges out of
+  - `c` — the controller, supplying the exported edges
+  - `residual_km` — the live `solve_burn` residual (km)
+
+Returns one of the residual bin labels.
+
+NOTE: must stay identical to [`residual_bin`](@ref) in `states.jl`. It reads the edges from
 the policy artifact rather than the live config, so a policy solved against one damage
 discretization cannot be silently rolled out against another. A non-finite residual is the
-lost-apse-pair case and bins as the most degraded live bin — see `residual_bin`.
+lost-apse-pair case and bins as the most degraded live bin.
 """
 function policy_residual_bin(c::SARSOPController, residual_km::Real)
     e = c.residual_edges
@@ -441,9 +391,14 @@ end
 
 Bin an achieved periapsis altitude (km) using the EXPORTED edges, half-open [lo, hi).
 
-⚠️ This must stay identical to [`alt_bin`](@ref) in `states.jl`. It deliberately reads the
-edges out of the policy artifact rather than the live config, so a policy solved against
-one discretization cannot be silently rolled out against another.
+  - `c` — the controller, supplying the exported edges
+  - `alt_km` — achieved periapsis altitude (km)
+
+Returns an altitude bin label, or `"LOST"` for a non-finite altitude.
+
+NOTE: must stay identical to [`alt_bin`](@ref) in `states.jl`. It reads the edges from the
+policy artifact rather than the live config, so a policy solved against one discretization
+cannot be silently rolled out against another.
 """
 function policy_alt_bin(c::SARSOPController, alt_km::Real)
     e = c.alt_edges
@@ -484,18 +439,16 @@ The visit counts are a DETERMINISTIC function of the observed altitude bin, so t
 controller always knows them exactly and belief mass on any other visit tuple is spurious.
 Terminal states are always kept. A no-op if masking would zero everything.
 
-⚠️ THE RESIDUAL IS PROJECTED THE SAME WAY, AND FOR A STRONGER REASON (2026-08-31). The
-visit counts are exactly known because they are derived from the observation; the residual
-is exactly known because the ONBOARD SOLVER COMPUTED IT — it is not measured through a
-sensor at all, so there is no noise to carry a belief over. Leaving mass on the other
-damage bins would model uncertainty the spacecraft does not have.
+The residual is projected the same way and for a stronger reason: the visit counts are
+exactly known because they derive from the observation, while the residual is exactly known
+because the onboard solver computed it. Leaving mass on the other damage bins would model
+uncertainty the spacecraft does not have.
 
-⚠️ WHY THIS IS STILL LICENSED after coverage moved onto achieved altitude. Gating on the
-TRUE altitude would make coverage stochastic and partially observed, breaking the exact
--observation assumption this projection rests on. Gating on the OBSERVED altitude keeps it
-exact — the controller and the filter condition on the same measured bin. The cost is not
-soundness but accuracy: a true 32 km pass read as 27 km banks LOW, and the belief then
-confidently carries that wrong count. See `alt_bin` for the misbin rate.
+NOTE: this stays licensed only because coverage gates on the OBSERVED altitude. Gating on
+the true altitude would make coverage stochastic and partially observed, breaking the
+exact-observation assumption the projection rests on. The cost is accuracy, not soundness —
+a misbinned pass banks the wrong band and the belief then confidently carries that wrong
+count.
 """
 function policy_reconcentrate_cov!(c::SARSOPController)
     keep = [(c.state_alt[i] in ("LOST", "CRASHED") ||
@@ -541,15 +494,14 @@ function _sarsop_band_targets(c::SARSOPController, band_name::AbstractString)
     # PHASE-MATCHED retarget. The family member supplies the periapsis RADIUS; the
     # DIRECTION comes from our own nominal periapsis, and apoapsis stays pinned to nominal.
     #
-    # ⚠️ DO NOT import the member's apse POSITIONS. `next_apse_positions(member.ic)` gives
-    # where THAT member's periapsis sits at ITS OWN epoch, which is unrelated to our phase.
-    # Measured 2026-08-30 from the 31 km limit cycle vs the 30 km member: altitudes differ
-    # by ~22 km but POSITIONS are 585 km (peri) and 2319 km (apo) apart, so the `:position`
-    # residual at ΔV = 0 is 2392 km and the solver burns 78–180 m/s across the orbit and
-    # loses the vehicle. Phase-matching drops that to 0.6–2.4 m/s with no escape.
+    # NOTE: do not import the member's apse POSITIONS. `next_apse_positions(member.ic)`
+    # gives where THAT member's periapsis sits at ITS OWN epoch, which is unrelated to our
+    # phase — two orbits ~20 km apart in altitude can be hundreds of km apart in position,
+    # so the solver burns enormously and loses the vehicle. Take the RADIUS from the member
+    # and the DIRECTION from our own nominal.
     #
-    # (`MPCController.target_alt_km` avoids this by resolving the member at SETUP from the
-    # IC, where vehicle and reference are phase-aligned. The bug only appears mid-flight.)
+    # `MPCController.target_alt_km` avoids this by resolving the member at setup from the
+    # IC, where vehicle and reference are phase-aligned; the bug only appears mid-flight.
     key = String(band_name)
     return get!(c.band_targets, key) do
         table = c.family_table === nothing ? halo_family_table_cached() : c.family_table
@@ -581,25 +533,15 @@ function controller_command(c::SARSOPController, shell_state::AbstractVector, pe
 
     # EXCURSE_<BAND>: SET the active reference to that band and aim at it.
     #
-    # ⚠️ THIS IS A PERSISTENT COMMAND, NOT A ONE-PASS DIP (changed 2026-08-30). Previously
-    # each EXCURSE burned once at a scaled waypoint and the next CORRECT pulled the vehicle
-    # straight back, so repeating the action accumulated NOTHING — every pass restarted from
-    # the nominal orbit and "spend another cycle getting there" was structurally impossible.
-    # Now the band's family member stays the reference until CORRECT clears it, so choosing
-    # EXCURSE_LOW again on the next pass CONTINUES the approach.
+    # A PERSISTENT command, not a one-pass dip: the band stays the reference until CORRECT
+    # clears it, so choosing the same EXCURSE again continues the approach. Single-impulse
+    # authority is poor, so settling over several passes is what actually reaches a
+    # commanded altitude.
     #
-    # This matters because single-impulse authority is poor (~25%: commanding 20 km from the
-    # 31 km limit cycle achieves ~38 km on one pass). Settling over several passes is the
-    # mechanism that actually reaches a commanded altitude — the same one measured working
-    # in `MPCController.target_alt_km` (50 -> 56.01 km, 70 -> 75.86 km, held 30 days).
-    #
-    # ⚠️ AND IT TARGETS THE COMMANDED ALTITUDE DIRECTLY (`:altitude_position`, added
-    # 2026-08-30). The previous `:position` aim could not deliver a band: with the periapsis
-    # constrained as a POSITION vector, commanding 20/30/40 km settled at 35.80/37.05/38.32 km
-    # — 2.5 km of achieved spread on 20 km of command, all three landing in the SAME `A30_40`
-    # bin, which is why three of five EXCURSE rows in `artifacts/tables.json` had zero trials.
-    # `:altitude_position` constrains the periapsis by altitude (the quantity actually
-    # commanded) and keeps the 3 apoapsis-position constraints that pin the orientation.
+    # `:altitude_position` constrains the periapsis by ALTITUDE — the quantity actually
+    # commanded — while keeping the apoapsis-position constraints that pin the orientation.
+    # A pure `:position` aim cannot deliver a band: every commanded altitude lands in
+    # roughly the same bin, leaving the other EXCURSE rows unmeasured.
     band_name = replace(action, "EXCURSE_" => "")
     band_idx  = findfirst(==(band_name), c.band_names)
     c.active_band = band_name
@@ -626,10 +568,9 @@ function controller_observe!(c::SARSOPController, peri_state::AbstractVector,
     bi = findfirst(==(obs_bin), c.band_bins)
     bi === nothing || (c.visits[bi] = min(c.visits[bi] + 1, c.visit_cap))
 
-    # ⚠️ UPDATE THE DAMAGE BIN BEFORE RE-CONCENTRATING (2026-08-31). The residual is what
-    # the onboard solver reported for the burn THIS pass just flew, so it is known exactly
-    # and becomes the conditioning the next decision is made under. `extra.residual_km`
-    # comes straight from `controller_command`'s `solve_burn` result.
+    # Update the damage bin BEFORE re-concentrating: the residual is what the onboard
+    # solver reported for the burn this pass just flew, so it is known exactly and becomes
+    # the conditioning the next decision is made under.
     c.residual = policy_residual_bin(c, get(extra, :residual_km, NaN))
 
     policy_update_belief!(c, String(label), obs_bin)
@@ -655,15 +596,16 @@ Scale a nominal apse POSITION vector radially about Enceladus to altitude `alt_k
 returning a barycentre-frame position. Used to place an excursion's periapsis target
 without changing the orbit's geometry, only its radius.
 
-⚠️ **A SCALED VECTOR IS NOT A REFERENCE ORBIT — do not use this to build one.** The result is
-not a solution of the dynamics, so nothing can settle onto it: measured 2026-08-26, every
-scaled-apoapsis reference escaped, two with NEGATIVE periapsis. It works here only because an
-`EXCURSE_*` target is a one-pass waypoint that the next `CORRECT` immediately abandons.
+  - `r_nom` — nominal apse position vector (km, barycentre frame)
+  - `alt_km` — target altitude above the surface (km)
 
-To hold a commanded altitude, use [`retarget_to_altitude`](@ref), which returns a genuine
-L1-halo family member (closing to ~3e-05 km) — or `MPCController`'s `target_alt_km` toggle,
-which wraps it. Retained for the SARSOP `EXCURSE_*` path, which still targets waypoints;
-rewiring that to family members is a separate step (`docs/todo.md`).
+Returns the scaled position (km, barycentre frame).
+
+NOTE: a scaled vector is NOT a reference orbit — do not use this to build one. It is not a
+solution of the dynamics, so nothing can settle onto it; scaled-apoapsis references escape.
+It works here only because an `EXCURSE_*` target is a waypoint the next `CORRECT` abandons.
+To hold a commanded altitude use [`retarget_to_altitude`](@ref), which returns a genuine
+family member, or `MPCController`'s `target_alt_km` toggle, which wraps it.
 """
 function _scale_to_altitude(r_nom::AbstractVector{<:Real}, alt_km::Real)
     rr  = _enc_relative(r_nom)
@@ -679,52 +621,28 @@ end
 Roll `controller` out against a TRUTH model over `horizon_s` seconds. One decision per
 periapsis approach, triggered at the descending `CONTROL_ALT_KM` shell.
 
-⚠️ RENAMED FROM `simulate` (2026-08-31). `POMDPs.simulate` exists, and a consumer doing
-`using POMDPs` alongside `using SherpaOrbital` got an ambiguity error on every call — which
-is exactly how this package is consumed (ClusterPolicyGen). The two are different things and
-should not share a name: this flies the CR3BP TRUTH model with real burns (~10 s per 30-day
-rollout), while `POMDPs.simulate` rolls the abstract discrete POMDP. `simulate` is kept as a
-deprecated alias so the exploratory scripts in `scratch/` keep running.
-
   - `controller` — an [`AbstractController`](@ref): [`MPCController`](@ref) or
-    [`SARSOPController`](@ref). This is the `type` switch: the world below is identical.
-  - `state0` — initial barycentre-frame state (km, km/s), typically the period-3 IC.
+    [`SARSOPController`](@ref). This is the `type` switch; the world is identical.
+  - `state0` — initial barycentre-frame state (km, km/s), typically the halo IC.
   - `truth_eom!` — world dynamics ([`cr3bp_j2_eom!`](@ref),
     [`cr3bp_saturn_enc_j2_eom!`](@ref), later SPICE). An argument, never closed over.
-  - `period_s` — the inter-periapsis interval (for the period-3 orbit, `T/3`).
+  - `period_s` — the inter-periapsis interval (s).
   - `rng` — random stream for the thruster and nav noise. Required whenever
     `noisy_thruster = true` or the controller draws observations; defaults to a fresh
     `Xoshiro(0)` so a caller cannot accidentally consume global RNG state.
   - `noisy_thruster` — execute ΔV through [`apply_dv_noisy`](@ref) rather than
     [`apply_dv`](@ref). **Default `false`** — see below.
 
-    ⚠️ THE DEFAULT FLIPPED true → false ON 2026-08-31, TO MATCH THE KERNELS. The measured
-    kernels in `artifacts/tables.json` are calibrated with `noisy_thruster = false`
-    (`meta.theta.noisy_thruster`), so a noisy rollout of a policy solved against them is
-    MISMATCHED: the policy is acting on a transition model that understates execution
-    error. A default that silently produces the mismatched experiment is the wrong default.
+    NOTE: the default is `false` to MATCH THE KERNELS. The committed kernels are
+    calibrated noise-free (`meta.theta.noisy_thruster`), so a noisy rollout of a policy
+    solved against them is mismatched — the policy acts on a transition model that
+    understates execution error. The effect is not cosmetic: noisy runs miss their science
+    bands badly and sit deep in `R_CRITICAL`. Set this `true` deliberately, ideally against
+    kernels calibrated the same way.
 
-    Measured over 5 seeds, the same policy, 30-day horizon — the mismatch is not cosmetic:
-
-    | thruster   | outcome  | return mean | return sd | spread as % of mean |
-    |------------|----------|-------------|-----------|---------------------|
-    | noise-free | 5/5 hold |      152.14 |      9.58 |                 15% |
-    | noisy      | 4/5 hold |      115.38 |     67.74 |                145% |
-
-    The noisy runs also miss their science bands badly (an `EXCURSE_LOW` commanded at
-    23.5 km lands at 14.65–16.94 km, i.e. in `BELOW_20`) and run at residual 45–60 km,
-    deep in `R_CRITICAL`.
-
-    ⚠️ AND THE NOISY PATH CURRENTLY USES AN UNPHYSICAL ERROR LAW unless told otherwise. With
-    empty `thruster_kwargs`, `apply_dv_noisy` takes the legacy `:uniform` law — 0–20%
-    underburn, mean 10% short and NEVER over. That is ~10× MacKenzie Exhibit B-24's Cassini
-    figure (a SYMMETRIC 1σ of 0.7–2.0%) plus a one-directional bias, so it is a worst case
-    rather than a realistic thruster. For a quoted noisy result pass
-    `(model = :gaussian_pct, sigma_pct = 2.0)`.
-
-    So: set `noisy_thruster = true` deliberately, ideally against kernels calibrated the
-    same way (`calibrate_tables` with `noisy_thruster = true`, a ~7-minute re-measurement —
-    see `needs_recalibration`).
+    NOTE: the noisy path uses an unphysical error law unless told otherwise. With empty
+    `thruster_kwargs`, `apply_dv_noisy` takes the `:uniform` law — see `thruster.jl`. For a
+    quoted noisy result pass `(model = :gaussian_pct, sigma_pct = 2.0)`.
   - `max_steps` — hard cap on control steps (safety guard; outcome `:max_steps`).
 
 Returns a NamedTuple with the SAME fields for every baseline, so a comparison table needs
@@ -734,22 +652,18 @@ no per-baseline special-casing:
   - `survived`, `outcome` — `:held`, `:idle`, `:crash`, `:escape`, `:max_steps`
   - `survival_time_s`, `n_steps`, `n_burns`, `total_dv_ms`
   - `n_solves`, `n_failed_solves` — how many control steps ran a burn solve, and how many of
-    those did not converge. ⚠️ ALWAYS CHECK THESE before reading any other number. A failed
-    solve returns ΔV = 0, so a run in which every solve failed is a run with no control at
-    all, yet it reports a plausible `n_steps` and a `survived = true` outcome. This is not
-    hypothetical: it is how the `T/3` NaN-apoapsis defect produced a full calibration table
-    of quietly uncontrolled rollouts. `n_failed_solves == n_solves > 0` means the result
-    describes an uncontrolled coast, whatever the outcome field says.
+    those did not converge. CHECK THESE before reading any other number: a failed solve
+    returns ΔV = 0, so a run in which every solve failed had no control at all, yet reports
+    a plausible `n_steps` and `survived = true`. `n_failed_solves == n_solves > 0` means the
+    result describes an uncontrolled coast whatever the outcome field says.
   - `min_peri_alt_km` — smallest periapsis altitude visited (km)
   - `science_visits`, `n_bands`, `n_samples` — per-band visit counts, how many distinct
     bands were sampled at least once, and the total sample count. Empty / 0 for MPC.
-    ⚠️ BANKED ON THE OBSERVED ALTITUDE (2026-08-30), which is an improvement on the old
-    commanded-altitude bitmask but still not ground truth. A band is credited when the
-    OBSERVED periapsis altitude lands in its bin, so nav noise misbins passes near a bin
-    edge — roughly 15–20% per pass at `sigma_nav_km = 2` on 10 km bins, symmetric. Use
-    `peri_alts_km` for where the passes truly went. Gating on the TRUE altitude was
-    rejected deliberately: it makes coverage stochastic and partially observed, which
-    breaks the exact-observation assumption behind `policy_reconcentrate_cov!`.
+    Banked on the OBSERVED altitude, not ground truth: a band is credited when the observed
+    periapsis lands in its bin, so nav noise misbins passes near an edge. Use
+    `peri_alts_km` for where the passes truly went. Gating on the true altitude was
+    rejected deliberately — it makes coverage stochastic and partially observed, breaking
+    the exact-observation assumption behind `policy_reconcentrate_cov!`.
   - `peri_alts_km`, `peri_lats_deg` — achieved periapsis altitude (km) and latitude (deg)
     per control step. Latitude is what the south-polar science case turns on and is
     invisible in an altitude or a deviation norm.
@@ -768,9 +682,8 @@ function run_rollout(
     period_s::Real,
     horizon_s::Real;
     rng::AbstractRNG = Xoshiro(0),
-    # ⚠️ DEFAULT false SO THE ROLLOUT MATCHES THE KERNELS — see the docstring. The committed
-    # kernels are measured noise-free, so a noisy rollout of a policy solved against them
-    # tests a model mismatch rather than the policy.
+    # Default false so the rollout matches the kernels, which are measured noise-free — a
+    # noisy rollout of a policy solved against them tests a mismatch, not the policy.
     noisy_thruster::Bool = false,
     rtol_truth::Real = RTOL_TRUTH,
     atol_truth::Real = ATOL_TRUTH,
@@ -801,21 +714,15 @@ function run_rollout(
     # apse-POSITION deviation from the nominal periapsis. Computed here (not in the
     # controller) so both baselines report the identical quantity.
     #
-    # ⚠️ KNOWN GAP, measured 2026-08-29 — this is the ORIGINAL reference, always. A
-    # controller deliberately holding a DIFFERENT orbit (`MPCController.target_alt_km`)
-    # therefore reports a large deviation even when the hold is perfect: measured, a
-    # rock-steady 75.86 km hold reports `true_dev_km = 48.10 km` and bins as DRIFT on every
-    # pass, so a belief filter fed this signal is permanently convinced it is off-course
-    # while the vehicle does exactly what it was commanded. (Distinct from the ~6 km
-    # periapsis bias, which is the single-impulse `:position` residual floor — see
-    # `MPCController`. These are two different problems and were conflated once already.)
+    # NOTE: this is the ORIGINAL reference, always. A controller deliberately holding a
+    # DIFFERENT orbit (`MPCController.target_alt_km`) therefore reports a large deviation
+    # even when its hold is perfect, so anything reading this signal will think the vehicle
+    # is off-course while it does exactly what it was commanded. Distinct from the ~6 km
+    # periapsis bias, which is the single-impulse residual floor — the two were conflated
+    # once already.
     #
-    # Deliberately NOT fixed here. `dev_of` is defined once, outside the controllers, so the
-    # POMDP and MPC report the identical quantity and the comparison stays apples-to-apples;
-    # and the dev bins in `artifacts/tables.json` are calibrated against THIS definition, so
-    # redefining it invalidates every transition kernel. The fix (measure against whichever
-    # reference is currently being held) has to land together with re-measured kernels.
-    # See `docs/todo.md`.
+    # Not fixed here on purpose: `dev_of` is defined once, outside the controllers, so both
+    # baselines report the identical quantity and the comparison stays apples-to-apples.
     r_peri_nom, _ = next_apse_positions(
         controller isa MPCController && controller.ref_ic !== nothing ? controller.ref_ic :
         controller isa SARSOPController && controller.ref_ic !== nothing ? controller.ref_ic :
@@ -1003,11 +910,16 @@ _terminal_periapsis_callback_arg(rec::_EventRecord) = _terminal_periapsis_callba
 """
     summarize_rollouts(results) -> NamedTuple
 
-Aggregate repeated stochastic rollouts into survival rate + medians, mirroring the Python
-reference's `summarize`. `survived` counts `:held` and `:idle` (no crash, no escape).
+Aggregate repeated stochastic rollouts into a survival rate and medians.
+
+  - `results` — a vector of [`run_rollout`](@ref) results
+
+Returns a NamedTuple of `n`, `survival_rate`, medians of min-periapsis, ΔV, survival time
+and band count, plus the solve counters. `survived` counts `:held` and `:idle` — no crash,
+no escape.
 
 `failed_solve_rate` is the fraction of all attempted burn solves across all rollouts that did
-not converge. ⚠️ Read it FIRST: a survival rate computed over rollouts whose burns all failed
+not converge. Read it FIRST: a survival rate computed over rollouts whose burns all failed
 is measuring an uncontrolled coast, not a controller. A value near 1.0 invalidates every
 other field here rather than qualifying it.
 """
@@ -1051,18 +963,15 @@ trajectory is legitimately scored under several `θ` when filling a regret matri
 reward into the rollout would tie one trajectory to one reward and make the off-diagonal
 entries impossible without re-flying.
 
-⚠️ THIS IS THE TRUTH-MODEL RETURN, NOT THE DISCRETE-MODEL ONE. `POMDPs.simulate` with a
-`RolloutSimulator` samples states from `T` and is milliseconds; this scores states the CR3BP
-dynamics actually produced (~10 s per 30-day rollout). Both are valid, they are NOT
-interchangeable, and a regret matrix must be built from one or the other throughout.
+NOTE: this is the TRUTH-MODEL return, not the discrete-model one. `POMDPs.simulate` with a
+`RolloutSimulator` samples states from `T` and takes milliseconds; this scores states the
+CR3BP dynamics actually produced and takes seconds. Both are valid, they are not
+interchangeable, and a regret matrix must use one or the other throughout.
 
-⚠️ INTENSITY IS DRAWN FROM `T`, NOT MEASURED. The state is
-`(altitude bin, visit counts, plume intensity)`, and the physics produces the first two but
-has no notion of plume intensity — that is the environment parameter `plume_gradient` acts
-on. So the intensity term enters exactly as it does in the model: through the reward's
-expectation over `T`, which `reward_function` already computes. The reward is therefore
-evaluated at `(alt_bin, visits)` with intensity marginalised, and NOT sampled separately.
-Sampling it here AND using the `T`-expectation reward would count science twice.
+NOTE: intensity is drawn from `T`, not measured. The physics produces the altitude bin and
+visit counts but has no notion of plume intensity, so that term enters through the reward's
+expectation over `T`, exactly as it does in the model. Sampling it here as well would count
+science twice.
 
 `r(s,a)` is charged at the state the decision was made FROM, matching the `r(sₜ, aₜ)`
 convention and the kernel's own accounting (`calibrate.jl` charges a lost apse pair to the
@@ -1125,8 +1034,7 @@ end
 
 Deprecated alias for [`run_rollout`](@ref). Renamed 2026-08-31 because `POMDPs.simulate`
 exists and the collision breaks any consumer doing `using POMDPs` alongside
-`using SherpaOrbital`. NOT exported — kept so the exploratory scripts in `scratch/` still
-run. Use `run_rollout` in new code.
+`using SherpaOrbital`. Not exported; use [`run_rollout`](@ref) in new code.
 """
 simulate(args...; kwargs...) = run_rollout(args...; kwargs...)
 

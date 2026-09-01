@@ -1,10 +1,9 @@
 """
 Deterministic MPC stationkeeping baseline (Strategy 3, MacKenzie et al. 2020 §B.2.3).
 
-The feasibility controller for the Enceladus Orbilander period-3 L1 halo orbit. It answers
-"can we even stationkeep this orbit?" before further investment in propagator fidelity
-(external review 2026-06-22, Decision D3), and it is re-run at each fidelity rung to find
-the rung where a deterministic controller fails and the POMDP earns its keep.
+The feasibility controller: it answers "can we even stationkeep this orbit?", and is re-run
+at each truth-model fidelity rung to find the rung where a deterministic controller fails
+and the POMDP earns its keep.
 
 Control concept
 ---------------
@@ -14,17 +13,14 @@ for an impulsive ΔV re-targeting the next periapsis and apoapsis. The burn is p
 [`solve_burn`](@ref), which targets the next apse pair under the ONBOARD model; the world then propagates the post-burn state forward under the truth model
 until the next trigger.
 
-⚠️ TRUTH/ONBOARD SPLIT (CLAUDE.md rule). [`run_mpc`](@ref) is the ONLY place `truth_eom!` is
-integrated. All burn planning happens inside `solve_burn`, which sees the onboard CR3BP
-model exclusively. `truth_eom!` is a positional ARGUMENT, deliberately: the same controller
-must run unchanged against CR3BP+EncJ2, +Saturn J2, and later the SPICE inertial truth. Do
-not close over a specific truth model here.
+NOTE: truth/onboard split. [`run_mpc`](@ref) is the only place `truth_eom!` is integrated;
+all burn planning happens inside `solve_burn`, which sees the onboard CR3BP model
+exclusively. `truth_eom!` is a positional argument so the same controller runs unchanged
+against CR3BP+EncJ2, +Saturn J2, and later an inertial SPICE truth — do not close over a
+specific truth model here.
 
-Fuel metric
------------
-Reported as ΔV (m/s). `ISP_MR106E` and `M_SPACECRAFT_WET` are in `constants.jl` but are not
-yet wired: the ΔV → propellant-mass conversion via the rocket equation is still a TODO,
-carried over from the original formulation.
+Fuel is reported as ΔV (m/s). `ISP_MR106E` and `M_SPACECRAFT_WET` exist in `constants.jl`
+but are not wired up; the ΔV to propellant-mass conversion is not implemented.
 
 References
   MacKenzie, S. M. et al. (2020). Enceladus Orbilander: A Flagship Mission Concept for
@@ -47,7 +43,7 @@ periapsis approach, as Strategy 3 specifies.
 The loop ends when the horizon is reached, the spacecraft crashes
 (`PERIAPSIS_CRASH_ALT` = 5 km), or it escapes ([`ESCAPE_ALT_KM`](@ref)).
 
-  - `state0` — initial barycentre-frame state (km, km/s), typically the period-3 IC
+  - `state0` — initial barycentre-frame state (km, km/s), typically the halo IC
   - `truth_eom!` — world dynamics: [`cr3bp_j2_eom!`](@ref),
     [`cr3bp_saturn_enc_j2_eom!`](@ref), or later the SPICE inertial model. Passed in so the
     SAME controller runs at every fidelity rung.
@@ -103,9 +99,9 @@ function run_mpc(
     r_apo_nom = nothing
     if mode === :position
         ref = ref_ic === nothing ? state0 : ref_ic
-        # `period_s` is the CONTROL cadence (T/3), not a valid apse-search window: the
-        # period-3 orbit has 3 periapses but only 2 apoapses, so T/3 falls short of the
-        # first apoapsis. Hence the count-based search here.
+        # `period_s` is the control cadence, not a valid apse-search window: it contains
+        # one periapsis and NO apoapsis, so a window search returns empty. Hence the
+        # count-based `next_apse_positions`, which asks for an apse pair by count.
         r_peri_nom, r_apo_nom = next_apse_positions(ref; eom! = cr3bp_eom!)
     end
 
@@ -240,12 +236,10 @@ function run_mpc(
 end
 
 # ── Event bookkeeping ─────────────────────────────────────────────────────────
-# scipy reports every event through `sol.t_events` / `sol.y_events` after the fact, so the
-# Python reference could pass four events to one `solve_ivp` call and inspect which fired.
-# `ContinuousCallback` has no equivalent, so each condition writes into its own record and
-# the caller reads the flags — reproducing the same "which of these four ended the leg?"
-# dispatch. Recording (t, u) explicitly also avoids having to infer the cause from
-# `sol.t[end]`, which is ambiguous when two conditions are close together.
+# A leg can end four ways (control shell, crash, escape, periapsis) and the caller needs to
+# know which. Each condition writes into its own record and the caller reads the flags,
+# rather than inferring the cause from `sol.t[end]` — which is ambiguous when two
+# conditions fire close together.
 
 mutable struct _EventRecord
     fired::Bool
@@ -255,7 +249,7 @@ end
 _EventRecord() = _EventRecord(false, NaN, Float64[])
 
 function _record!(rec::_EventRecord, integrator)
-    # First crossing wins, matching scipy's `t_events[i][0]` indexing.
+    # First crossing wins.
     if !rec.fired
         rec.fired = true
         rec.t = integrator.t
@@ -264,8 +258,7 @@ function _record!(rec::_EventRecord, integrator)
     return nothing
 end
 
-# Descending through an altitude shell (scipy direction −1): the control trigger and the
-# crash test. Terminal.
+# Descending through an altitude shell: the control trigger and the crash test. Terminal.
 function _terminal_shell_callback(altitude_km::Real, rec::_EventRecord)
     target_r = R_ENCELADUS + altitude_km
     g(u, t, integrator) = r_enceladus(u) - target_r
@@ -274,7 +267,7 @@ function _terminal_shell_callback(altitude_km::Real, rec::_EventRecord)
                               abstol = EVENT_TOL, reltol = 0.0)
 end
 
-# Ascending through the escape shell (scipy direction +1). Terminal.
+# Ascending through the escape shell. Terminal.
 function _terminal_escape_callback(altitude_km::Real, rec::_EventRecord)
     target_r = R_ENCELADUS + altitude_km
     g(u, t, integrator) = r_enceladus(u) - target_r
@@ -283,7 +276,7 @@ function _terminal_escape_callback(altitude_km::Real, rec::_EventRecord)
                               nothing; abstol = EVENT_TOL, reltol = 0.0)
 end
 
-# Periapsis: ṙ_enc upcrossing (scipy direction +1).
+# Periapsis: ṙ_enc upcrossing. Terminal.
 function _terminal_periapsis_callback(rec::_EventRecord)
     g(u, t, integrator) = rdot_enceladus(u)
     return ContinuousCallback(g,

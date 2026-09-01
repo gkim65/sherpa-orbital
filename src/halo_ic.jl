@@ -1,10 +1,9 @@
 """
 Differential corrector for the L1 halo orbit initial condition.
 
-Finds a closed halo orbit in the Saturn-Enceladus CR3BP matching the Enceladus Orbilander
-science orbit (MacKenzie et al. 2020, §B.2.3): periapsis altitude 19.8–64.3 km, apoapsis
-altitude 1000–1110 km. The operational orbit is the period-3 member of the family
-(`n_crossings = 3`), whose full period is ~36 hr with three periapsis passes.
+Finds a closed halo orbit in the Saturn-Enceladus CR3BP inside the Enceladus Orbilander
+science orbit's altitude range (MacKenzie et al. 2020, §B.2.3): periapsis 19.8–64.3 km,
+apoapsis 1000–1110 km.
 
 Algorithm
 ---------
@@ -18,57 +17,37 @@ Algorithm
 3. [`characterise_orbit`](@ref) — propagate one full period in physical units and report
    periapsis/apoapsis altitude, period, Jacobi constant and closure.
 
-⚠️ UNITS. Unlike `src/dynamics/`, this module works internally in NON-DIMENSIONAL CR3BP
+NOTE: units. Unlike `src/dynamics/`, this module works internally in NON-DIMENSIONAL CR3BP
 units (`L_STAR`, `T_STAR`, `V_STAR`; `MU` as the mass ratio, frame rate 1). Only
-[`characterise_orbit`](@ref) and the `ic` / `period_s` fields of the corrector result are
+[`characterise_orbit`](@ref) and the `ic` / `period_s` fields of a corrector result are
 physical.
 
-⚠️ EVENT SEMANTICS. The half-period propagator does NOT rely on the library's apse events;
-it detects `y = 0` crossings with its own callback, and brackets each one with an explicit
-`t_min` coast. That coast is what steps over the degenerate `y = 0` at `t = 0` (the IC lies
-in the symmetry plane by construction) and over each crossing just found, so the port does
-not inherit the scipy-vs-`ContinuousCallback` "event at `t0`" difference documented in
-`dynamics/integrator.jl`. Do not "simplify" the coasts away — they are the crossing-counting
-logic.
+NOTE: the half-period propagator does not use the library's apse events. It detects
+`y = 0` crossings with its own callback and brackets each with an explicit `t_min` coast,
+which steps over the degenerate `y = 0` at `t = 0` (the IC lies in the symmetry plane by
+construction) and over each crossing just found. Do not "simplify" those coasts away —
+they are the crossing-counting logic.
 
-⚠️ KNOWN DEFECT — THE ORBIT IS NOT PERIOD-3 (measured 2026-08-29, session log §5a).
-`PERIOD1_NORTH_IC_ND` is a **period-1** L1 halo of true period **11.996 hr**, not a period-3
-orbit of 35.988 hr. Three independent measurements:
+NOTE: this is a PERIOD-1 halo, true period 11.996 hr, one periapsis per revolution. It is
+not MacKenzie's period-3 science orbit, which has three geometrically distinct periapses
+over the south pole for ground-track diversity. The 11.996 hr orbit reproduces their ~12 hr
+periapsis spacing coincidentally. `PERIOD1_TRIPLE_PERIOD_S` is 3x the true period, kept
+because controller measurements use it as a rollout horizon; see README.md.
 
-  * it closes at `T/3 = 11.996 hr` to 0.009 km — better than at the nominal 35.988 hr,
-    and the residual grows LINEARLY with time (0.0094 / 0.0187 / 0.0281 km at T/3, 2T/3,
-    T), which is accumulated integrator drift, not three distinct loops;
-  * its three "periapsis passes" are the SAME point revisited — all three at
-    altitude 30.9753 km, latitude +87.033°, longitude −180.000°, to 3+ decimals;
-  * the row matches the JPL Three-Body Periodic Orbit Catalog (Saturn-Enceladus, halo,
-    L1) to ~10 significant figures at period 11.99604 hr. The catalog's L1 halo periods
-    span 7.80–16.14 hr, so **35.988 hr is not in the family at all**.
+Finding a genuine period-3 orbit is a BRANCH-SWITCHING problem, not a corrector one: locate
+a period-tripling bifurcation along the family (trace-convention stability index reaching
+−1), step off along the critical eigenvector, then continue. No such crossing has been
+shown to exist in this family at these altitudes.
 
-The `n_crossings = 3` target cannot detect this: a period-1 halo satisfies `vx = vz = 0`
-IDENTICALLY at every `y = 0` crossing (measured residual ~1e-14 at n = 1, 2, 3 and 4), so
-the period-1 branch is an exact root of the n = 3 residual and Newton converges to it.
-Raising `n_crossings` relabels revolutions; it does not impose period-3.
+NOTE: `n_crossings = 3` cannot impose period-3. A period-1 halo satisfies `vx = vz = 0`
+identically at every `y = 0` crossing, so the period-1 branch is an exact root of the n = 3
+residual and Newton converges straight to it. Raising `n_crossings` relabels revolutions.
 
-⚠️ AND THE ORBIT IS NOT UNSTABLE. All six Floquet multipliers lie on the unit circle
-(`stability_index` = 1.000000 over the true period), and uncontrolled propagation under
-the ONBOARD CR3BP holds 30.975 km for ten revolutions with no drift. The 31 → 52 → 113 →
-950 → 43,819 km runaway recorded across earlier sessions is reproduced only under the
-TRUTH model — it is the **J2 model gap**, not orbital instability. Any claim resting on
-"the halo is unstable" needs re-deriving from this distinction.
-
-What MacKenzie et al. (2020) actually specify (§3.12 p.20, §B.2.3 p.B-25): a period-3
-orbit whose "three passages of periapsis" are "each roughly 12 hours apart" and "grouped
-in three distinct regions" over the SOUTH pole — i.e. a ~36 hr orbit with three
-GEOMETRICALLY DISTINCT periapses. Our 11.996 hr single-periapsis orbit reproduces their
-12 hr spacing by coincidence, which is why the mislabelling survived. They also state the
-period-3 family is preferred over period-1 precisely because period-1 gives repeat
-ground-tracks, whereas reconnaissance needs ground-track diversity.
-
-Finding a genuine period-3 orbit is a BRANCH-SWITCHING problem, not a corrector-formulation
-problem: locate a period-tripling bifurcation along the family (where the trace-convention
-stability index reaches −1, i.e. multipliers at the primitive cube roots of unity), step
-off along the critical eigenvector, then continue. No such crossing has been shown to exist
-in this family at these altitudes. See `docs/todo.md` blocking item 2.
+NOTE: the orbit is marginally stable, not hyperbolically unstable — all six Floquet
+multipliers lie on the unit circle, and uncontrolled propagation under the ONBOARD CR3BP
+holds its altitude for ten revolutions. Stationkeeping is still required: under the TRUTH
+model the orbit runs away within a few passes. That divergence is the J2 model gap, so a
+claim resting on hyperbolic instability as the mechanism is wrong.
 
 References
   Richardson, D. L. (1980). "Analytic Construction of Periodic Orbits about the Collinear
@@ -84,15 +63,11 @@ References
 # Source: JPL Three-Body Periodic Orbits Catalog (Saturn-Enceladus, halo, L1), matched to
 # ~10 significant figures. Periapsis ~31 km altitude, apoapsis ~1065 km.
 #
-# PERIOD-1: true period 11.996 hr (`HALO_PERIOD_S`), ONE periapsis per revolution. This is
-# NOT the MacKenzie period-3 science orbit, which has three GEOMETRICALLY DISTINCT periapses
-# over the south pole; finding that is a branch-switching problem (module docstring).
+# Period-1: true period 11.996 hr (`HALO_PERIOD_S`), one periapsis per revolution.
+# Physical: x0 = 237911.1 km, |z0| = 1162.8 km, |vy0| = 0.06895 km/s.
 #
-# Prefer `PERIOD1_SOUTH_IC_ND` — it is the hemisphere the science case wants. The north
-# variant is kept because every pre-2026-08-29 measurement was taken on it, so it is the
-# reference for reproducing those numbers.
-#
-# Physical: x0 = 237911.1 km, |z0| = 1162.8 km, |vy0| = 0.06895 km/s, true T = 11.996 hr.
+# Prefer `PERIOD1_SOUTH_IC_ND`, the hemisphere the science case wants. This north variant
+# is the reference for reproducing older measurements taken on it.
 const PERIOD1_NORTH_IC_ND = [
      9.974083488926582e-01,   # x0  (nondim)
      0.0,                     # y0
@@ -102,9 +77,9 @@ const PERIOD1_NORTH_IC_ND = [
      0.0,                     # vz0
 ]
 
-# ⚠️ 3 × the true 11.996 hr period — three traversals of ONE loop, not a period-3 orbit.
-# Retained because every controller measurement to date used it as the horizon; use
-# `HALO_PERIOD_S` for the actual period.
+# NOTE: 3x the true period — three traversals of ONE loop, not a period-3 orbit. Retained
+# because controller measurements use it as a rollout horizon; `HALO_PERIOD_S` is the
+# actual period.
 const PERIOD1_TRIPLE_PERIOD_S = 35.988 * 3600.0                       # s
 const PERIOD1_PERIOD_ND = PERIOD1_TRIPLE_PERIOD_S / 18913.2798604104   # nondim (TU)
 
@@ -113,14 +88,15 @@ const PERIOD1_PERIOD_ND = PERIOD1_TRIPLE_PERIOD_S / 18913.2798604104   # nondim 
 
 Reflect a CR3BP state through the `z = 0` plane: `(z, vz) -> (-z, -vz)`.
 
-The CR3BP is invariant under this map (both primaries lie in `z = 0`, and the potential
-depends on `z` only through `z²`), so the image of a periodic orbit is another periodic
-orbit with the SAME period, Jacobi constant, altitude profile and stability — reflected in
-latitude. Works on non-dimensional or physical states alike; the map is unit-free.
+  - `state` — a 6-element state, non-dimensional or physical; the map is unit-free
 
-Enceladus J2 is likewise z-symmetric, so the reflection is exact under the truth model as
-well (verified: altitudes agree to the digit over six uncontrolled revolutions, only the
-sign of the latitude changes).
+Returns the reflected state.
+
+The CR3BP is invariant under this map — both primaries lie in `z = 0` and the potential
+depends on `z` only through `z²` — so the image of a periodic orbit is another periodic
+orbit with the same period, Jacobi constant, altitude profile and stability, reflected in
+latitude. Enceladus J2 is z-symmetric too, so the reflection is exact under the truth model
+as well.
 """
 mirror_z(state::AbstractVector{<:Real}) =
     [state[1], state[2], -state[3], state[4], state[5], -state[6]]
@@ -128,21 +104,16 @@ mirror_z(state::AbstractVector{<:Real}) =
 # ── South-polar science orbit ─────────────────────────────────────────────────
 # The z-mirror of `PERIOD1_NORTH_IC_ND`, and the IC the science case actually calls for.
 #
-# ⚠️ COUNTERINTUITIVE, AND THIS IS WHAT WENT WRONG BEFORE. The sign of the out-of-plane
-# amplitude `z0` is OPPOSITE to the hemisphere of the periapsis. `PERIOD1_NORTH_IC_ND` has
-# `z0 < 0` and was documented as the "southern (south-polar)" member, but its closest
-# approach is at +87.033° — the NORTH pole. This IC has `z0 > 0` and puts periapsis at
-# −87.033°, over the south-polar terrain and the plumes.
+# NOTE: the sign of the out-of-plane amplitude `z0` is OPPOSITE to the hemisphere the
+# periapsis lands in. `z0 < 0` gives a NORTH-pole periapsis; this IC has `z0 > 0` and puts
+# periapsis at −87.03°, over the south-polar terrain and the plumes. Check
+# `periapsis_lat_deg`, not the sign of `z0`.
 #
-# Measured, identical to the north-polar member in every respect but latitude sign:
-# periapsis 30.9753 km at −87.033°, apoapsis 1064.806 km, true period 11.996 hr,
-# closure 0.00935 km, Jacobi 477.173298 km²/s², max |λ| = 1.00000000.
-#
-# Because the two orbits are exact reflections, every controller result measured on the
-# north-polar IC transfers to this one unchanged.
+# Identical to the north-polar member in every respect but latitude sign, so every
+# controller result measured on that one transfers here unchanged.
 const PERIOD1_SOUTH_IC_ND = mirror_z(PERIOD1_NORTH_IC_ND)
 
-# The true period of the halo — ONE periapsis pass. `PERIOD1_TRIPLE_PERIOD_S` is 3× this.
+# The true period of the halo, one periapsis pass.
 const HALO_PERIOD_S = PERIOD1_TRIPLE_PERIOD_S / 3
 
 # Non-dimensional positions of the primaries
@@ -238,8 +209,8 @@ end
 Propagate `[x0, 0, z0, 0, vy0, 0]` (non-dimensional) to the `n_crossings`-th `y = 0`
 crossing, accumulating the STM from `t = 0` all the way to that crossing.
 
-For a period-1 halo, `n_crossings = 1` gives the half-period `T/2`. For the period-3 orbit,
-`n_crossings = 3` gives half of the full three-revolution period.
+For a period-1 halo, `n_crossings = 1` gives the half-period `T/2`; higher counts reach
+later crossings of the same loop.
 
 Only crossings in ONE direction are counted: `y` descending for `vy0 > 0`, ascending
 otherwise. That is the direction of the symmetry-plane half-period for a `z0 < 0`,
@@ -476,18 +447,16 @@ end
 Single-shooting differential corrector for CR3BP halo orbits (Howell 1984).
 
 Free variables `x0` and `vy0` (non-dimensional); `z0` is fixed as the family parameter.
-Targets `vx_f = 0` and `vz_f = 0` at the `n_crossings`-th `y = 0` crossing: `n_crossings = 1`
-is a simple halo, `n_crossings = 3` the period-3 orbit of MacKenzie §B.2.3.
+Targets `vx_f = 0` and `vz_f = 0` at the `n_crossings`-th `y = 0` crossing.
 
 !!! warning "period_nd / period_s are NaN when n_crossings > 1"
     The full period is `2 × t_half` only for a single crossing. For more crossings
     `t_half` also contains the intermediate `t_min` coasts inserted by
     [`propagate_half_period_nd`](@ref), so doubling it overshoots — at `n_crossings = 3`
-    by exactly 5/3. Rather than return that plausible-but-wrong number (as the Python
-    reference does), both period fields are `NaN` for `n_crossings > 1`, so a caller gets
-    a loud failure instead of silently propagating 1.67 revolutions as one orbit. Use
-    `PERIOD1_TRIPLE_PERIOD_S` for the period-3 science orbit, or `n × 2 × t_cross(n_crossings = 1)`.
-    `t_half_nd` is always returned if you need to compute it yourself.
+    by exactly 5/3. Rather than return that plausible-but-wrong number, both period fields
+    are `NaN` for `n_crossings > 1`, so a caller gets a loud failure instead of silently
+    propagating 1.67 revolutions as one orbit. Use `n × 2 × t_cross(n_crossings = 1)`, or
+    `t_half_nd`, which is always returned.
 
 The Newton step uses the 2×2 STM sub-block (rows `vx = 4`, `vz = 6`; columns `x = 1`,
 `vy = 5`) and is scaled by `damp ∈ (0, 1]` to prevent overshoot. Iteration stops when
@@ -539,12 +508,10 @@ function differential_corrector(
             # crossings, t_half includes the (n_crossings - 1) intermediate `t_min`
             # coasts that `propagate_half_period_nd` inserts to avoid re-detecting the
             # crossing it starts on, so `2 × t_half` overshoots (measured: exactly 5/3
-            # too large at n_crossings = 3). The Python reference returns that inflated
-            # value; we return NaN instead so a caller cannot silently propagate 1.67
-            # revolutions and call it one orbit. Deliberate divergence from the
-            # reference — see the 2026-08-24 halo-IC session log §5.
-            # Use PERIOD1_TRIPLE_PERIOD_S, or n × 2 × t_cross(n_crossings = 1), until the
-            # general relation is derived and regression-tested.
+            # too large at n_crossings = 3). Return NaN rather than that inflated value,
+            # so a caller cannot silently propagate 1.67 revolutions and call it one orbit.
+            # Use n × 2 × t_cross(n_crossings = 1) until the general relation is derived
+            # and regression-tested.
             multi = n_crossings > 1
             return (
                 ic_nd       = ic_nd,
@@ -586,21 +553,15 @@ end
 
 # ── Family continuation: x0 as the family parameter ──────────────────────────
 #
-# ⚠️ WHY A SECOND CORRECTOR EXISTS, RATHER THAN A KEYWORD ON THE FIRST.
-# [`differential_corrector`](@ref) frees `(x0, vy0)` and holds `z0` as the family parameter.
-# That parameterisation CANNOT CONTINUE THIS FAMILY: measured 2026-08-29, stepping `z0` away
-# from the shipped member leaves `vz_f` pinned at ~-2.7e-04, and it will not null at any
-# damping (0.7 / 0.9 / 1.0), any tolerance (1e-09 / 1e-11), or 200 iterations. The 2x2 Newton
-# has no root off the shipped `z0`, so every continuation step reports a corrector failure
-# and the family looks empty when it is not.
+# A second corrector exists because the variable split matters.
+# [`differential_corrector`](@ref) frees `(x0, vy0)` and holds `z0` as the family parameter,
+# and that parameterisation CANNOT continue this family: stepping `z0` off the shipped
+# member leaves `vz_f` pinned and it will not null at any damping, tolerance or iteration
+# count, so every continuation step reports a failure and the family looks empty when it is
+# not. Freeing `(z0, vy0)` and stepping `x0` traces it cleanly.
 #
-# Swapping which variable is held fixed — free `(z0, vy0)`, step `x0` — traces the family
-# cleanly: 181 members from periapsis 30.975 km to 248.255 km, latitude -87.03 deg to
-# -66.40 deg, every one closing to ~3e-05 km.
-#
-# `differential_corrector` is left EXACTLY as it is because it is what every pre-2026-08-29
-# measurement was taken with, and it remains the right tool for refining a single member at a
-# known `z0`. This is added capability, not a replacement.
+# `differential_corrector` remains the right tool for refining a single member at a known
+# `z0`. This is added capability, not a replacement.
 
 """
     corrector_free_z0(x0_nd, z0_seed_nd, vy0_seed_nd; tol, max_iter, damp, t_half_max_nd,
@@ -703,20 +664,20 @@ Continue the L1 halo family from `ic_nd`, stepping the family parameter `x0` by 
 seeding each member from its PREDECESSOR. Returns the converged members in order, stopping at
 the first failure.
 
-Chained seeding is what makes this converge: measured 2026-08-29, a cold-seeded scan at fixed
-`vy0` does not, and neither does stepping `z0` (see `corrector_free_z0`). Steps must also stay
-small — periapsis altitude moves ~2 km per `1e-05` of `x0` near the nominal orbit, so a `1e-04`
-step jumps 31 km to 170 km and skips the entire science range.
+Chained seeding is what makes this converge — a cold-seeded scan at fixed `vy0` does not,
+and neither does stepping `z0` (see `corrector_free_z0`). Steps must stay small: periapsis
+altitude moves ~2 km per `1e-05` of `x0` near the nominal orbit, so a `1e-04` step skips the
+entire science range.
 
 Defaults trace periapsis ~31 km to ~248 km (latitude -87.03 deg to -66.40 deg) from
 `PERIOD1_SOUTH_IC_ND` in 181 members.
 
-⚠️ **`dx < 0` RAISES periapsis and `dx > 0` LOWERS it, so a one-directional table is
-one-sided about the seed.** With the default `dx`, this table starts AT the seed's ~31 km and
-only goes up — so [`retarget_to_altitude`](@ref) returns `nothing` for anything below the
-nominal, which reads as "the family has no member there" when it does. Stepping `dx > 0`
-reaches ~26.8 km. Use [`halo_family_span`](@ref) for a table that brackets the seed on both
-sides, which is what a band set spanning the nominal altitude needs.
+NOTE: `dx < 0` RAISES periapsis and `dx > 0` lowers it, so a one-directional table is
+one-sided about its seed. With the default `dx` the table starts at the seed's altitude and
+only goes up, so [`retarget_to_altitude`](@ref) returns `nothing` for anything below it —
+which reads as "the family has no member there" when it does. Use
+[`halo_family_span`](@ref) for a table bracketing the seed on both sides, which is what a
+band set spanning the nominal altitude needs.
 """
 function halo_family_table(;
     ic_nd::AbstractVector{<:Real} = PERIOD1_SOUTH_IC_ND,
@@ -751,11 +712,10 @@ Defaults cover roughly **19–60 km** from `PERIOD1_SOUTH_IC_ND` (nominal periap
 the science-relevant range, not the whole family. The family continues well past 240 km, but
 each member costs a corrector solve, so covering ground nobody targets is pure cost.
 
-⚠️ **STEP SIZE IS LOAD-BEARING AT THE LOW END.** `dx = 5e-6` stalls the downward branch around
-26.8 km: the Newton seed from the previous member drifts too far and the corrector lands just
-outside `tol` (measured residuals 1.4e-10 to 3.1e-10 against a 1e-10 tolerance). At
-`dx = 1e-6` it continues monotonically to 18.59 km with no fold — so a stall near 26.8 km is a
-STEP-SIZE artifact and must not be read as the family ending there.
+NOTE: step size is load-bearing at the low end. Too large a `dx` stalls the downward branch
+around 27 km — the Newton seed from the previous member drifts too far and the corrector
+lands just outside `tol` — while a smaller one continues monotonically to ~18.6 km with no
+fold. A stall there is a step-size artifact, not the family ending.
 """
 function halo_family_span(;
     ic_nd::AbstractVector{<:Real} = PERIOD1_SOUTH_IC_ND,
@@ -811,18 +771,15 @@ The halo-family member whose PERIAPSIS ALTITUDE is `target_alt_km`, refined off 
 `target_alt_km` lies outside the table's altitude span — which is a real answer, not an error:
 it means the continued family contains no member at that altitude.
 
-⚠️ **This is the ONLY correct way to build a reference orbit at a commanded altitude.** Do NOT
-radially scale an apse position vector (`_scale_to_altitude`): a scaled vector is not a
-solution of the dynamics, and measured 2026-08-26 every scaled-apoapsis reference escaped, two
-with negative periapsis. A member returned here is a genuine periodic orbit, closing to
-~3e-05 km, so a controller can actually settle onto it.
+NOTE: this is the only correct way to build a reference orbit at a commanded altitude. Do
+not radially scale an apse position vector (`_scale_to_altitude`) — a scaled vector is not a
+solution of the dynamics and does not produce a holdable orbit. A member returned here is a
+genuine periodic orbit, so a controller can settle onto it, and the commanded altitude is
+met to better than 0.001 km.
 
-Measured accuracy (2026-08-29, from `PERIOD1_SOUTH_IC_ND`): commanded 31 / 50 / 70 / 120 /
-200 km are met to **better than 0.0002 km**, all south-polar.
-
-⚠️ Periapsis latitude degrades as altitude rises — -87.03 deg at 31 km, -85.73 deg at 50 km,
--84.25 deg at 70 km, -77.29 deg at 150 km. Altitude and south-polar latitude TRADE OFF, so a
-band choice is also a latitude choice.
+NOTE: periapsis latitude degrades as altitude rises — about -87 deg at 31 km against -77 deg
+at 150 km. Altitude and south-polar latitude trade off, so a band choice is also a latitude
+choice.
 
 Secant rather than bisection on purpose: a bisection midpoint far from the previous member
 breaks the continuation chain and the corrector converges to a DIFFERENT member, which reads
@@ -888,10 +845,9 @@ end
 The 6×6 state transition matrix accumulated over one full period, `Φ(T, 0)`, for the
 non-dimensional initial condition `ic_nd`. Its eigenvalues are the Floquet multipliers.
 
-⚠️ `period_nd` must be the TRUE period of the orbit. Passing an integer multiple returns
-the corresponding power of the true monodromy, whose eigenvalues are the true multipliers
-raised to that power — the |λ| = 1 / |λ| ≠ 1 verdict is unchanged, but the stability
-index is not.
+NOTE: `period_nd` must be the TRUE period. Passing an integer multiple returns the
+corresponding power of the true monodromy, whose eigenvalues are the true multipliers raised
+to that power — the |λ| = 1 verdict survives, the stability index does not.
 """
 function monodromy_matrix(
     ic_nd::AbstractVector{<:Real},
@@ -920,10 +876,9 @@ A Hamiltonian monodromy always carries a trivial `λ = 1` pair from the time-tra
 and energy directions, so this quantity is exactly 1 for a marginally stable orbit rather
 than 0.
 
-⚠️ This measures stability of the DYNAMICAL MODEL used to propagate the STM. An orbit that
-is marginally stable in the onboard CR3BP can still diverge under the truth model; that
-divergence is a model gap, not orbital instability, and this number will not show it. See
-[`e_folding_time_s`](@ref) for the timescale when the orbit genuinely is unstable.
+NOTE: this measures stability of the DYNAMICAL MODEL the STM was propagated in. An orbit
+marginally stable in the onboard CR3BP can still diverge under the truth model; that is a
+model gap, not orbital instability, and this number will not show it.
 
 References
   Koon, Lo, Marsden & Ross (2011), "Dynamical Systems, the Three-Body Problem and Space
@@ -983,8 +938,8 @@ hemispheres, which is how a north-polar IC went unnoticed for several sessions.
 function characterise_orbit(ic::AbstractVector{<:Real}, period_s::Real; verbose::Bool = true)
     ic = collect(float.(ic))
     # Sample densely enough that the min/max radius over the orbit is resolved; the
-    # Python reference read the solver's own step sequence, which is equivalent in the
-    # limit and differs here only at the tolerance level.
+    # solver's own step sequence would be equivalent in the limit, differing only at the
+    # tolerance level.
     ts = range(0.0, float(period_s); length = 20_001)
     sol = propagate(cr3bp_eom!, ic, (0.0, float(period_s));
                     rtol = RTOL_ONBOARD, atol = ATOL_ONBOARD, saveat = ts)
@@ -1046,9 +1001,8 @@ end
 
 Full pipeline: seed scan → [`differential_corrector`](@ref) → [`characterise_orbit`](@ref).
 
-Targets the period-3 L1 halo orbit for the Enceladus Orbilander (MacKenzie et al. 2020
-§B.2.3): with `n_crossings = 3` the corrector propagates to the third `y = 0` crossing,
-i.e. half of the ~36-hr period-3 orbit.
+Finds an L1 halo in the Enceladus Orbilander's altitude range (MacKenzie et al. 2020
+§B.2.3). `n_crossings` selects which `y = 0` crossing the corrector targets.
 
   - `x0_km` — IC x-coordinate (km from the barycentre). `nothing` → `x_L1 − 100 km`.
   - `z0_km` — IC z-amplitude (km). The family parameter. Its SIGN IS IGNORED; the hemisphere
@@ -1059,12 +1013,10 @@ i.e. half of the ~36-hr period-3 orbit.
   - `vy0_km_s` — IC y-velocity (km/s). `nothing` → found by [`seed_scan`](@ref).
   - `t_half_max_hr` — propagation ceiling in hours.
 
-⚠️ SIGN CONVENTION. `z0 > 0` gives SOUTH-pole periapsis and `z0 < 0` gives NORTH-pole — the
-out-of-plane amplitude sign is opposite to the periapsis hemisphere. The old `northern`
-keyword had this inverted (`northern = false` forced `z0 < 0`, which yields a NORTH-pole
-periapsis while printing "southern"), so it is removed rather than fixed: a bare boolean is
-what made the error invisible. Ask for the hemisphere you want and this function picks the
-sign. Verified against `periapsis_lat_deg`, which is the observable that finally caught it.
+NOTE: sign convention. `z0 > 0` gives a SOUTH-pole periapsis and `z0 < 0` a NORTH-pole one —
+the out-of-plane amplitude sign is opposite to the hemisphere. Ask for the hemisphere via
+`periapsis_hemisphere` and this function picks the sign; a bare `northern` boolean is what
+made the error invisible before. Verify with `periapsis_lat_deg`, the observable.
 
 Returns the corrector NamedTuple, merged with the characterisation fields when it converged.
 """

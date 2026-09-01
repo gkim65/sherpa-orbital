@@ -5,15 +5,14 @@ This is the ONBOARD half of MacKenzie et al. 2020 §B.2.3 "Strategy 3". Given a 
 control point, it solves for the impulsive ΔV that re-targets the next periapsis and
 apoapsis, predicting by propagating the onboard model to the next apse pair.
 
-⚠️ TRUTH/ONBOARD SPLIT (CLAUDE.md rule — do NOT collapse). Everything in this file plans
-with the ONBOARD model, [`cr3bp_eom!`](@ref) (CR3BP only, no perturbations), at the loose
-onboard tolerances. No function here may reach for a truth EOM. The gap between what the
-planner believes and what the world does is the model uncertainty the POMDP absorbs; a
-truth EOM appearing in this file would silently erase the project's central quantity.
+NOTE: truth/onboard split — do not collapse it. Everything here plans with the onboard
+model, [`cr3bp_eom!`](@ref) (CR3BP only, no perturbations), at the loose onboard
+tolerances. The gap between what the planner believes and what the world does is the model
+uncertainty the POMDP absorbs, so a truth EOM appearing in this file would silently erase
+the project's central quantity.
 
-The `eom` keyword exists ONLY so an ablation study can deliberately hand the planner a
-perfect model and measure what that is worth. Measured: a perfect onboard model does not
-extend survival — the failure is instability-dominated. It defaults to the onboard model.
+The `eom!` keyword exists only so an ablation can hand the planner a perfect model and
+measure what that is worth; it defaults to the onboard model.
 
 Burn solver
 -----------
@@ -43,19 +42,16 @@ const TARGET_TOL_KM = 1.0      # apse-targeting tolerance (MacKenzie ≤ 1 km)
 # Apse-search horizon, as a multiple of the single-revolution period estimate. Beyond this
 # the prediction returns NaN and solve_burn stops.
 #
-# ⚠️ NOT AN INERT PARAMETER, and not a physically-derived one. This is the surviving numeric
-# content of the deleted `n_revs = 3`: on-orbit the value provably does not matter (1/2/3/5
-# all predict periapsis 40.407873 km, identical to six decimals), which is why `n_revs` was
-# removed. But NEAR ESCAPE it matters a great deal, and that regime was never measured until
-# 2026-08-29. An escaping spacecraft stays bound to SATURN, so its apses still exist tens of
-# thousands of km out; an unbounded search finds them and solve_burn chases them. Measured on
-# the run_mpc :altitude parity row (CR3BP + Enceladus J2, 120 hr): unbounded turns the final
-# burn from 21.9 m/s into ~182 m/s and moves escape from 77.96 hr to 79.52 hr.
+# NOTE: not an inert parameter. On-orbit the value does not matter — 1, 2, 3 and 5 all
+# predict the same periapsis to six decimals — but NEAR ESCAPE it matters a great deal. An
+# escaping spacecraft stays bound to SATURN, so its apses still exist tens of thousands of
+# km out; an unbounded search finds them and `solve_burn` chases them, turning a ~22 m/s
+# final burn into ~180 m/s.
 #
-# Pinned at 3 to hold every existing baseline bit-for-bit (user decision, 2026-08-29). The
-# value itself is UNJUSTIFIED — it was inherited from a parameter chosen to match MacKenzie's
-# Nm = 3, which is a maneuver count, not a horizon. Treat it as an open controller parameter
-# needing a measured choice, not as a settled constant. See docs/todo.md.
+# NOTE: the value 3 is unjustified. It was inherited from a parameter chosen to match
+# MacKenzie's Nm = 3, which is a maneuver count rather than a search horizon, and is pinned
+# here only to hold existing baselines bit-for-bit. Treat it as an open controller
+# parameter needing a measured choice.
 const APSE_SEARCH_REVS = 3
 
 # Escape threshold: above this altitude the spacecraft has left the ~1065-km-apoapsis
@@ -66,11 +62,12 @@ const ESCAPE_ALT_KM = 5.0 * APOAPSIS_ALT_MAX   # 5550 km
 """
     escape_callback(altitude_km = ESCAPE_ALT_KM) -> ContinuousCallback
 
-Terminal event fired when the spacecraft ASCENDS through `altitude_km` above the Enceladus
-surface — it has left the science orbit and is escaping.
+Terminal event for escape: the spacecraft ascending through a shell above the surface.
 
-Direction `+1` (ascending) so it does not fire on the normal inbound leg of the apoapsis
-arc. This complements [`crash_callback`](@ref), the other terminal outcome.
+  - `altitude_km` — escape shell altitude (km)
+
+Returns a `ContinuousCallback`. Ascending only, so it does not fire on the normal outbound
+leg of the apoapsis arc. Complements [`crash_callback`](@ref), the other terminal outcome.
 """
 function escape_callback(altitude_km::Real = ESCAPE_ALT_KM)
     target_r = R_ENCELADUS + altitude_km
@@ -89,13 +86,21 @@ Barycentre frame, km / km/s.
 Using the FIRST apse of each type — rather than the min/max over the span — keeps the
 residual a smooth function of ΔV, which the Gauss-Newton Jacobian needs.
 
-The search asks [`next_apses`](@ref) for the apse pair BY COUNT rather than taking whatever
-apses fall inside a window, so the two apse-prediction paths in this file now search the same
-way and a missing apse is a named failure rather than a silent empty result.
+  - `state0` — barycentre-frame state at the control point (km, km/s)
+  - `period_s` — single-revolution period estimate (s)
+  - `eom!` — onboard model
+  - `rtol`, `atol` — integration tolerances
+  - `max_horizon_s` — search bound; beyond it both states come back `NaN`
 
-⚠️ THE SEARCH IS DELIBERATELY BOUNDED at `max_horizon_s` — see [`APSE_SEARCH_REVS`](@ref) for
-why, and why the bound is an open parameter rather than a settled one. Beyond the bound this
-returns `NaN`, the sentinel `solve_burn` stops on, which is what keeps a near-escape burn
+Returns `(peri_state, apo_state)`, both 6-element (km, km/s), or `NaN`-filled if no apse
+pair was found.
+
+The search asks [`next_apses`](@ref) for the pair BY COUNT rather than taking whatever
+apses fall inside a window, so a missing apse is a named failure rather than a silent empty
+result.
+
+NOTE: the search is bounded on purpose — see [`APSE_SEARCH_REVS`](@ref). The `NaN` beyond
+the bound is the sentinel `solve_burn` stops on, and is what keeps a near-escape burn
 finite.
 """
 function predict_apse_states(
@@ -119,10 +124,14 @@ end
 """
     predict_apses(state0, period_s; eom!, rtol, atol) -> (peri_alt_km, apo_alt_km)
 
-Predict the ALTITUDE (km) of the next periapsis and next apoapsis under the onboard model.
-`NaN` for an apse the trajectory never reaches.
+Predict the altitude of the next periapsis and next apoapsis under the onboard model.
 
-The altitude-only counterpart of [`predict_apse_states`](@ref), used by `mode = :altitude`.
+  - `state0` — barycentre-frame state (km, km/s)
+  - `period_s` — single-revolution period estimate (s)
+  - `eom!`, `rtol`, `atol` — forwarded to [`predict_apse_states`](@ref)
+
+Returns `(peri_alt_km, apo_alt_km)`, `NaN` for an apse the trajectory never reaches. The
+altitude-only counterpart of [`predict_apse_states`](@ref), used by `mode = :altitude`.
 """
 function predict_apses(
     state0::AbstractVector{<:Real},
@@ -143,24 +152,22 @@ end
     next_apses(state0, n_peri, n_apo; eom!, rtol, atol, t_guess, max_expansions)
         -> (peri, apo)
 
-Collect the next `n_peri` periapsis and `n_apo` apoapsis passages ahead of `state0` under
-the onboard model, as two vectors of `(t, state)` pairs. Barycentre frame, km / km/s.
+Collect the next apse passages ahead of `state0` under the onboard model.
 
-Asks for a COUNT, not a time window: it propagates in expanding chunks until it has the
-apses requested, and throws if they cannot be found within the safety horizon. There is no
-empty-return path to mistake for a valid answer.
+  - `state0` — barycentre-frame state (km, km/s)
+  - `n_peri`, `n_apo` — how many of each to collect
+  - `eom!` — onboard model
+  - `rtol`, `atol` — integration tolerances
+  - `t_guess` — first chunk length (s); a hint, not a bound, since later chunks double
+  - `max_expansions` — doubling limit before erroring; the horizon searched is
+    `t_guess * (2^max_expansions - 1)`
 
-A window-based search (ask for a time span, take whatever apses fall inside) is the trap this
-replaces: on this orbit the period-3 halo has 3 periapses but only 2 apoapses, so the `T/3`
-control interval falls 0.136 s short of the first apoapsis and a window search comes back
-empty.
+Returns `(peri, apo)`, each a vector of `(t, state)` pairs in seconds and (km, km/s).
+Throws if the requested apses are not found — escape is the expected failure, since a
+departing spacecraft has no next apoapsis, and the error names the horizon searched.
 
-  - `t_guess` — first chunk length (s); a hint, not a bound. Later chunks double.
-  - `max_expansions` — doubling limit before erroring. Horizon searched is
-    `t_guess × (2^max_expansions − 1)`.
-
-Escape is the expected failure: a departing spacecraft has no next apoapsis, and the error
-names the horizon searched.
+NOTE: asks for a COUNT, not a time window. A window search finds no apoapsis inside the
+control interval and silently returns empty.
 """
 function next_apses(
     state0::AbstractVector{<:Real},
@@ -196,14 +203,17 @@ function next_apses(
 end
 
 """
-    next_apse_positions(state0, n_peri, n_apo; kwargs...) -> (r_peri, r_apo)
+    next_apse_positions(state0; kwargs...) -> (r_peri, r_apo)
 
-POSITION vectors (3-vectors, km, barycentre frame) of the next periapsis and next apoapsis
-ahead of `state0`, via [`next_apses`](@ref).
+Position vectors of the next periapsis and next apoapsis ahead of `state0`, via
+[`next_apses`](@ref).
 
-Count-based: it takes no time
-window, so it cannot return a `NaN` target from a too-short horizon. Both returned vectors
-are guaranteed finite — `next_apses` throws rather than reporting a missing apse.
+  - `state0` — barycentre-frame state (km, km/s)
+  - `eom!`, `rtol`, `atol`, `t_guess`, `max_expansions` — forwarded to [`next_apses`](@ref)
+
+Returns two 3-vectors in km, barycentre frame. Both are guaranteed finite: the search is
+count-based, so it cannot return a `NaN` target from a too-short horizon — `next_apses`
+throws rather than reporting a missing apse.
 """
 function next_apse_positions(
     state0::AbstractVector{<:Real};
@@ -226,46 +236,44 @@ end
 Throw if the `mode = :position` nominal apse targets are not a usable pair of targets.
 Returns `nothing` on success. Called by [`solve_burn`](@ref) BEFORE any solving.
 
-⚠️ WHY A BAD TARGET MUST THROW RATHER THAN BE SOLVED. A `:position` solve against a bad
-target does not fail visibly — it returns ΔV = 0, which is indistinguishable from a
-deliberate decision not to burn, so a CORRECT action silently degrades into an OBSERVE. A
-whole calibration run can come back with every burn quietly disabled and still look like
-data. Bad targets are a SETUP error, so they are raised where they are introduced.
+  - `state0` — barycentre-frame state at the control point (km, km/s)
+  - `r_peri_nom`, `r_apo_nom` — nominal apse position targets (km); `r_peri_nom` is unused
+    in `:altitude_position`
+  - `max_alt_km` — reject a target above this altitude (km)
+  - `phantom_tol_km` — how close to `state0` counts as a phantom target (km)
+  - `mode` — `:position` or `:altitude_position`
+  - `peri_target_km` — commanded periapsis altitude (km), required in `:altitude_position`
 
-Three rejections, one per way a target has actually gone wrong in this project:
+Returns `nothing`, or throws naming the offending target.
 
- 1. **Non-finite** — a window-based apse search returns `NaN` when
-    its window is too short to contain an apse (the `T/3` defect). `NaN` poisons its half of
-    the residual and `solve_burn` cannot converge.
+NOTE: a bad target must throw rather than be solved. A `:position` solve against one does
+not fail visibly — it returns ΔV = 0, indistinguishable from a deliberate decision not to
+burn, so a whole calibration run can come back with every burn quietly disabled and still
+look like data.
 
- 2. **Equal to `state0`'s own position** (within `phantom_tol_km`) — the signature of the
-    Python reference's phantom `t = 0` root. scipy reports an apse at `t = 0` for a state
-    that starts at an apse, so the "target" is the current position: the residual compares a
-    phantom target against a phantom prediction, scores exactly 0.0, and reports
-    `converged = true` having planned nothing. A `converged` flag alone does NOT catch this,
-    which is why this check exists as well as the flag.
+Three rejections, one per way a target has gone wrong here:
 
- 3. **Implausibly high altitude** (above `max_alt_km`) — a count-based apse search
-    ([`next_apses`](@ref)) always finds *an* apse, because a spacecraft that has left the
-    science orbit is still bound to Saturn and its Enceladus-relative radius keeps
-    oscillating. Those apses are real apses of the trajectory but not of the orbit we are
-    holding: a 1 km/s kick yields an "apoapsis" at ~420,000 km altitude, ~7500× nominal.
-    Guaranteeing a finite target is not the same as guaranteeing a meaningful one, so the
-    count-based fix needs this bound to avoid trading a loud `NaN` for a quiet absurdity.
+ 1. **Non-finite** — a window-based apse search returns `NaN` when its window is too short
+    to contain an apse. `NaN` poisons its half of the residual and the solve cannot
+    converge.
 
-`phantom_tol_km` defaults to `EVENT_TOL`-scale rather than 0: a correctly-found apse very
-near the current state (the period-3 apoapses are near-degenerate in radius) sits ~1e-06 km
-away, whereas a true phantom is at *exactly* 0.0. The default separates those by orders of
-magnitude while staying far below `TARGET_TOL_KM`.
+ 2. **Equal to `state0`'s own position**, within `phantom_tol_km` — a phantom `t = 0` apse.
+    The residual then compares a phantom target against a phantom prediction, scores
+    exactly 0.0, and reports `converged = true` having planned nothing, so the `converged`
+    flag alone does not catch it. The tolerance is `EVENT_TOL`-scale rather than 0 because
+    a correctly-found apse very near the current state sits ~1e-06 km away while a true
+    phantom is at exactly 0.0.
 
-## `mode = :altitude_position`
+ 3. **Implausibly high altitude** — a count-based search always finds *an* apse, because a
+    spacecraft that has left the science orbit is still bound to Saturn. Those are real
+    apses of the trajectory but not of the orbit being held: a 1 km/s kick yields an
+    "apoapsis" thousands of times the nominal altitude. A finite target is not the same as
+    a meaningful one.
 
-There the periapsis target is a SCALAR altitude, not a position vector, so only two of the
-three rejections above can apply to it (a scalar has no position to coincide with `state0`'s,
-so the phantom check is meaningless) and `r_peri_nom` is not required at all. Pass
-`peri_target_km` instead of `r_peri_nom` and the periapsis half is checked as an altitude:
-finite, and below `max_alt_km`. Also required to be above the crash shell — a commanded
-periapsis inside Enceladus is a setup error the solver would happily converge on.
+In `:altitude_position` the periapsis target is a scalar altitude, so the phantom check
+does not apply to it and `r_peri_nom` is not required. It is checked instead for being
+finite, below `max_alt_km`, and above the crash shell — a commanded periapsis inside
+Enceladus is a setup error the solver would happily converge on.
 """
 function validate_apse_targets(
     state0::AbstractVector{<:Real},
@@ -301,8 +309,18 @@ function validate_apse_targets(
 end
 
 """
-Check one apse POSITION target against the three rejections documented in
-[`validate_apse_targets`](@ref). Throws on failure, returns `nothing` on success.
+    _validate_apse_position(state0, name, r, max_alt_km, phantom_tol_km) -> Nothing
+
+Check one apse POSITION target against the three rejections in
+[`validate_apse_targets`](@ref).
+
+  - `state0` — barycentre-frame state at the control point (km, km/s)
+  - `name` — the target's name, for the error message
+  - `r` — the apse position target (km)
+  - `max_alt_km` — reject above this altitude (km)
+  - `phantom_tol_km` — how close to `state0` counts as a phantom (km)
+
+Returns `nothing`, or throws naming the target and which check failed.
 """
 function _validate_apse_position(state0::AbstractVector{<:Real}, name::AbstractString,
                                  r::AbstractVector{<:Real}, max_alt_km::Real,
@@ -343,29 +361,33 @@ end
 """
     apse_residual(state0, dv, period_s, eom!; ...) -> Vector{Float64}
 
-The residual `r(ΔV)` driven to zero by [`solve_burn`](@ref). `dv` (km/s) is added to the
-velocity of `state0` and the apses are predicted with the ONBOARD model.
+The residual `r(ΔV)` driven to zero by [`solve_burn`](@ref).
 
-Two targeting modes:
+  - `state0` — barycentre-frame state at the control point, pre-burn (km, km/s)
+  - `dv` — candidate ΔV (km/s), added to `state0`'s velocity
+  - `period_s` — single-revolution period estimate (s)
+  - `eom!` — onboard model used to predict the apses
+  - `peri_target_km`, `apo_target_km` — commanded apse altitudes (km)
+  - `mode` — which residual to build, below
+  - `r_peri_nom`, `r_apo_nom` — nominal apse position targets (km)
 
-  - `mode = :altitude` (default; MacKenzie-like Strategy 1/2) — the 2-vector
-    `[peri_alt − peri_target_km, apo_alt − apo_target_km]` (km). The targets default to
-    the centre of the MacKenzie period-3 bands; pass an orbit's own apse altitudes to hold
-    that orbit instead.
-  - `mode = :position` (Strategy 3 proper) — the 6-vector
-    `[r_peri − r_peri_nom, r_apo − r_apo_nom]` (km), bounding the full apse position
-    vectors against the nominal orbit. `r_peri_nom` and `r_apo_nom` are required
-  - `mode = :altitude_position` — the 4-vector
-    `[peri_alt − peri_target_km, r_apo − r_apo_nom]` (km): periapsis by ALTITUDE only (the
-    quantity actually commanded) and apoapsis by full POSITION (which is what pins the
-    orbit's orientation). `r_apo_nom` is required; `r_peri_nom` is unused.
+Returns the residual vector in km. Three modes:
 
-    The inverse of `:position_altitude` (tried and rejected 2026-08-26, which constrained
-    apoapsis *altitude* and let its position drift 2.5 → 106.4 km and escaped at 3.3 d).
-    Frees the periapsis DIRECTION, which is where most of the unsatisfiable `:position`
-    residual lands as a ~6 km radial bias, while keeping the 3 apoapsis-position
-    constraints. 4 residuals on 3 controls — still over-determined, so the orientation
-    pinning that `:position` buys is not given up wholesale.
+  - `:altitude` — the 2-vector `[peri_alt - peri_target_km, apo_alt - apo_target_km]`.
+    Targets default to the centre of the MacKenzie bands; pass an orbit's own apse
+    altitudes to hold that orbit instead.
+  - `:position` — the 6-vector `[r_peri - r_peri_nom, r_apo - r_apo_nom]`, bounding the
+    full apse position vectors against a nominal orbit. Both nominals required.
+  - `:altitude_position` — the 4-vector `[peri_alt - peri_target_km, r_apo - r_apo_nom]`:
+    periapsis by ALTITUDE, the quantity actually commanded, and apoapsis by full POSITION,
+    which is what pins the orbit's orientation. `r_apo_nom` required, `r_peri_nom` unused.
+
+NOTE: do not invert `:altitude_position` into constraining apoapsis altitude and periapsis
+position. That was tried: apoapsis position drifts and the vehicle escapes within days.
+Freeing the periapsis DIRECTION is what absorbs the unsatisfiable part of the `:position`
+residual, as a radial bias, while the three apoapsis-position constraints keep the
+orientation pinned. 4 residuals on 3 controls is still over-determined, so that pinning is
+not given up wholesale.
 """
 function apse_residual(
     state0::AbstractVector{<:Real},
@@ -408,26 +430,24 @@ end
     _residual_weights(mode, J) -> Diagonal
 
 Row weights `W` for the Gauss-Newton step, so `solve_burn` minimizes `‖W r‖` rather than
-`‖r‖`. IDENTITY for every mode except `:altitude_position` — the existing baselines are
-unweighted and must stay bit-for-bit reproducible.
+`‖r‖`.
 
-⚠️ WHY `:altitude_position` NEEDS THIS, measured 2026-08-30. Its 4 residuals are one
-periapsis ALTITUDE (km) and three apoapsis POSITION components (km). Same units, but wildly
-different SENSITIVITY to ΔV: at the drifted operating point `‖J_peri‖ = 8441` km per km/s
-against `‖J_apo‖ = 164880`, a factor of 19.5. Least squares weights by the SQUARE of that,
-so an unweighted solve spends all 3 controls nulling apoapsis position and abandons the
-periapsis altitude with ~15.6 km of error. That is the whole reason the unweighted 4-on-3
-walk delivers only 14% of a commanded altitude change (35.5 km achieved for 20 km commanded,
-39.8 km for 50 km) — the constraint it was added to enforce is numerically invisible.
+  - `mode` — targeting mode; only `:altitude_position` is weighted
+  - `J` — the current Jacobian, `∂r/∂ΔV`
 
-Equilibrating by the block Jacobian norms makes the two PHYSICAL requirements — "be at the
-commanded altitude" and "keep the apoapsis where it belongs" — carry equal weight, instead of
-weighting them by an accident of how strongly each responds to a velocity kick. This is
-standard row equilibration; there is no tuned constant. A hand-tuned `w = 20` gives the same
-answer to ~0.15 km, which is what identifies 19.5 as the number that matters.
+Returns a `Diagonal`; identity for every mode except `:altitude_position`, so the other
+baselines stay bit-for-bit reproducible.
 
-Recomputed each iteration from the current `J`, so it tracks the operating point rather than
-freezing a scaling measured at the first step.
+`:altitude_position` needs it because its 4 residuals are one periapsis ALTITUDE and three
+apoapsis POSITION components: same units, but their sensitivity to ΔV differs by more than
+an order of magnitude. Least squares weights by the square of that, so an unweighted solve
+spends all 3 controls nulling apoapsis position and abandons the commanded altitude —
+delivering a fraction of the commanded change. Equilibrating by the block Jacobian norms
+makes the two physical requirements carry equal weight instead of weighting them by how
+strongly each responds to a velocity kick. Standard row equilibration, no tuned constant.
+
+Recomputed each iteration from the current `J`, so it tracks the operating point rather
+than freezing a scaling measured at the first step.
 """
 function _residual_weights(mode::Symbol, J::AbstractMatrix)
     mode === :altitude_position || return Diagonal(ones(size(J, 1)))
@@ -443,32 +463,36 @@ end
 
 Solve for the impulsive ΔV that re-targets the next periapsis/apoapsis.
 
-Minimum-norm Gauss-Newton on a 3-control problem (ΔV ∈ ℝ³). The residual is 2-D in
-`mode = :altitude`, 6-D in `mode = :position`, or 4-D in `mode = :altitude_position`
-(see [`apse_residual`](@ref)). The Jacobian
-`J = ∂r/∂ΔV` (m×3) is built by forward finite differences with step `fd_step`, and the
-pseudo-inverse step `ΔV ← ΔV − damp · J⁺ r` selects the minimum-norm correction — so the
-solver prefers cheap burns and stays well posed whichever way the system is determined.
-
-Iteration stops on `‖r‖ < tol_km`, on a non-finite residual (the prediction lost an apse
-over the horizon), or at `max_iter`.
-
-⚠️ Planning uses the ONBOARD model. `eom!` defaults to [`cr3bp_eom!`](@ref) and exists as a
-keyword only for the deliberate perfect-model ablation; the caller is responsible for never
-passing a truth EOM in normal operation.
+Minimum-norm Gauss-Newton on a 3-control problem (ΔV ∈ ℝ³).
 
   - `state0` — barycentre-frame state at the control point, PRE-burn (km, km/s)
   - `period_s` — single-revolution period estimate (s), the first chunk of the count-based
-    apse search. The planner targets the NEXT apse pair; it has no multi-revolution horizon.
+    apse search. The planner targets the NEXT apse pair; it has no multi-revolution horizon
+  - `eom!` — onboard model
+  - `max_iter` — iteration cap
+  - `fd_step` — forward-difference step for the Jacobian (km/s)
+  - `damp` — step scaling in `ΔV ← ΔV − damp · J⁺ r`
+  - `tol_km` — convergence threshold on `‖r‖`
+  - `peri_target_km`, `apo_target_km`, `mode`, `r_peri_nom`, `r_apo_nom` — forwarded to
+    [`apse_residual`](@ref)
+  - `validate_targets` — run [`validate_apse_targets`](@ref) before solving
 
-Returns `(dv, dv_mag_ms, converged, residual_km, peri_err_km, iterations)`, where `dv` is
-the ΔV in km/s and `dv_mag_ms` its magnitude in m/s.
+Returns `(dv, dv_mag_ms, converged, residual_km, peri_err_km, iterations)`: the ΔV in km/s,
+its magnitude in m/s, and the diagnostics.
 
-⚠️ IN `:altitude_position`, READ `peri_err_km`, NOT `converged`. The total residual there is
-dominated by the apoapsis POSITION block, which is held against a nominal orbit and is not
-driven to zero from a drifted state — so `converged` reads `false` on passes that hit the
-commanded altitude to well under a km. `peri_err_km` is the periapsis-altitude error alone
-and is the number that says whether the command was delivered (`NaN` in the other modes).
+The Jacobian is built by forward finite differences and the pseudo-inverse step selects the
+minimum-norm correction, so the solver prefers cheap burns and stays well posed whichever
+way the system is determined. Iteration stops on `‖r‖ < tol_km`, on a non-finite residual
+(the prediction lost an apse over the horizon), or at `max_iter`.
+
+NOTE: in `:altitude_position`, read `peri_err_km`, not `converged`. The total residual
+there is dominated by the apoapsis-position block, which is held against a nominal orbit
+and is not driven to zero from a drifted state, so `converged` reads false on passes that
+hit the commanded altitude to well under a km. `peri_err_km` is the periapsis-altitude
+error alone and is `NaN` in the other modes.
+
+NOTE: planning uses the ONBOARD model. `eom!` is a keyword only for the perfect-model
+ablation; never pass a truth EOM in normal operation.
 """
 function solve_burn(
     state0::AbstractVector{<:Real},
