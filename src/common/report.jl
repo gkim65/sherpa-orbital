@@ -26,7 +26,7 @@ function print_model_summary(config::StationkeepingPOMDP = StationkeepingPOMDP()
                 "  targets(km)=",
                 [config.band_target_km[b] for b in config.band_names])
     println(io, "  visit cap      : ", config.visit_cap,
-                "   (CORRECT holds ", config.correct_bin, ", so it has no EXCURSE)")
+                "   (CORRECT holds ", config.correct_bin, ", which is not a science band)")
     println(io, "  actions        : ", actions(config))
     println(io, "  nav sigma (km) : ", config.sigma_nav_km)
     @printf(io, "  |S|=%d  |A|=%d  |O|=%d  discount=%.3f\n",
@@ -40,19 +40,19 @@ end
 """
     print_policy_table(policy, config = StationkeepingPOMDP(); io = stdout)
 
-Print the greedy action a*(altitude, visits) for a belief concentrated on each state, with
-ONE TABLE PER ORBIT-DAMAGE BIN, so the science-vs-safety tradeoff reads across a row and
-the damage response reads DOWN the tables.
+Print the greedy action a*(altitude, visits) for a belief concentrated on each state, one
+table per orbit-damage bin.
 
-⚠️ THE PER-RESIDUAL SPLIT IS THE POINT (2026-08-31). The residual dimension was added
-because the policy could not express "this orbit is too degraded to excurse from". Whether
-it learned that is exactly the question "does the action at a given (alt, visits) change as
-the damage bin worsens?", and a table marginalised over the residual cannot answer it. Read
-the three tables together: the wanted pattern is excursions at `R_OK` giving way to
-`CORRECT` at `R_DEGRADED`/`R_CRITICAL`.
+  - `policy` — a solved policy supporting `action(policy, belief)`
+  - `config` — the configuration the policy was solved against
+  - `io` — output stream
+  - `intensity` — which intensity level to tabulate, `1:plume_levels`
 
-A concentrated belief is a diagnostic, not how the policy runs — but it is the clearest
-way to see what the policy would do if it knew exactly where it was.
+The tradeoff reads across a row; the damage response reads down the tables. The pattern to
+look for is excursions at `R_OK` giving way to `CORRECT` at `R_DEGRADED`/`R_CRITICAL`.
+
+NOTE: a concentrated belief is a diagnostic, not how the policy runs — it shows what the
+policy would do knowing exactly where it was.
 """
 function print_policy_table(policy, config::StationkeepingPOMDP = StationkeepingPOMDP();
                             io::IO = stdout, intensity::Int = 1)

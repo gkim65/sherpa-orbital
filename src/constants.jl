@@ -41,9 +41,9 @@ const J2_ENCELADUS = 5.435e-3   # dimensionless    (Iess et al. 2014)
 
 # ── Saturn physical properties ────────────────────────────────────────────────
 # Used by the high-fidelity truth model only (dynamics/cr3bp_saturn_j2.jl). Saturn's
-# oblateness is the dominant non-point-mass perturbation in this system (external
-# review 2026-06-22); at Enceladus' orbital distance its J2 acceleration exceeds
-# Enceladus' own J2 across most of the science orbit. J2 is referenced to R_SATURN.
+# oblateness is the dominant non-point-mass perturbation in this system: at Enceladus'
+# orbital distance its J2 acceleration exceeds Enceladus' own J2 across most of the
+# science orbit. J2 is referenced to R_SATURN.
 const R_SATURN  = 60_268.0      # km  equatorial radius (1 bar)  (Jacobson et al. 2006)
 const J2_SATURN = 1.629071e-2   # dimensionless, normalized to R_SATURN (Jacobson et al. 2006)
 
@@ -82,16 +82,11 @@ const PERIAPSIS_CRASH_ALT = 5.0    # km  below this → terminal state
 
 # Optical navigation noise (1σ, km).
 #
-# ⚠️ THIS IS ~20× MacKenzie'S PREDICTED PERFORMANCE, deliberately. Exhibit C-8 (p. 152)
-# reports a steady-state OD error of "on the order of 300 m in position and several
-# centimeters per second in velocity" at 3σ — so 1σ ≈ 0.1 km, not 2.0 km. Ours is a
-# conservative stand-in chosen before that figure was located in the source (2026-08-30);
-# earlier docstrings in this repo cited "~0.3–1 km", which was an estimate, not the paper.
-#
-# Kept at 2.0 so existing measurements reproduce, but it is the pessimistic end of a range,
-# NOT a mission spec. For anything quoted, sweep it — and note 0.1 km is the sourced value,
-# which makes the altitude bins (10 km wide at the time of writing) essentially exactly
-# observed rather than noisy.
+# NOTE: this is ~20x MacKenzie's predicted performance. Exhibit C-8 (p. 152) reports a
+# steady-state OD error "on the order of 300 m in position and several centimeters per
+# second in velocity" at 3σ, i.e. 1σ ≈ 0.1 km. 2.0 km is a deliberately conservative
+# stand-in, not a mission spec — sweep it for anything quoted. At the sourced 0.1 km the
+# 10 km altitude bins are essentially exactly observed rather than noisy.
 #
 # Reference: MacKenzie, S. M. et al. (2020), Enceladus Orbilander, Exhibit C-8 §C.1.
 const SIGMA_NAV_POS = 2.0          # km

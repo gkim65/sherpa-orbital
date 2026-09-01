@@ -274,23 +274,27 @@ Regenerate them with:
 julia --project=experiments experiments/calibrate.jl     # ~7 min
 ```
 
-`artifacts/` is committed on purpose. These are a scientific provenance record — being
-able to see a probability change in a diff is how a re-measurement gets noticed.
+`artifacts/tables.json` is committed on purpose: it is a scientific provenance record, and
+being able to see a probability change in a diff is how a re-measurement gets noticed.
+Exported policies are **not** committed — they are large and derived, and `.gitignore`
+excludes `artifacts/policy.json` and the θ-keyed `artifacts/policy_*` a sweep writes.
 
-**One kernel per action.** `excurse` is keyed `[action][from_bin]` (artifact `format: 2`).
-This matters: the kernels were previously pooled across bands, which made
-`EXCURSE_LOW/MID/HIGH` mathematically identical in `T` and left nothing in the model able
-to steer altitude. `load_tables` **rejects** format-1 artifacts rather than silently
-rebuilding that degeneracy.
+**One kernel per action, conditioned on orbit damage.** Rows are keyed
+`[action][(alt_bin, residual_bin)]` and their columns are the joint successor
+`(alt, residual)` — artifact `format: 3`. Both halves matter: pooling the kernels across
+bands made `EXCURSE_LOW/MID/HIGH` identical in `T`, and keying on altitude alone averaged
+fresh and degraded departures into one row that reported `P(loss) = 0.0` for the transition
+that actually loses the vehicle. `load_tables` **rejects** older formats rather than
+remapping them, since neither distinction is recoverable from the file.
 
-> ### ⚠️ Read `meta.trials` before quoting a policy behaviour
-> **16 of 20 rows currently sit below `MIN_TRIALS_TRUSTED = 20`, most at n = 1** — including
-> the rows the policy leans on most (`EXCURSE_*` from the limit-cycle bin `A34_44`). Those
-> read as 100% success with zero measured failure probability off a single sample.
->
-> More trials will not fix it: an accurate excursion walk *settles*, so a longer walk feeds
-> the destination row (n = 139) while the origin row it departed stays at n = 1. Fixing it
-> needs more **restarts**, not longer walks. Tracked in `docs/todo.md`.
+> ### Read `meta.trials` before quoting a policy behaviour
+> Of the 60 rows in the committed artifact, **44 clear `MIN_TRIALS_TRUSTED = 20`, 4 are thin
+> (`0 < n < 20`), and 12 are unmeasured (`n = 0`) and filled**. The filled rows are
+> `BELOW_20` at degraded or critical damage, plus `A34_44/R_CRITICAL` — combinations the
+> vehicle does not reach. A filled row is not evidence, and the policy's behaviour there
+> means nothing; `meta.unmeasured_rows` names them, and `_fill_unmeasured_row` inherits the
+> same action's measured behaviour at the nearest less-degraded damage bin rather than
+> inventing a risk-free self-transition.
 >
 > Also: kernels are noise-free unless calibrated with `noisy_thruster = true`, so any
 > survival number derived from them is an **upper bound**, not feasibility.
@@ -324,7 +328,7 @@ src/
 experiments/            own Project.toml — isolates the solver dependency
   example.jl            worked end-to-end example
   calibrate.jl          regenerates artifacts/tables.json
-artifacts/              measured tables + exported policy (committed)
+artifacts/              tables.json committed; exported policies gitignored
 test/                   runtests.jl
 legacy/                 frozen Python, NOT part of the pipeline (see below)
   russell-lara/         Russell & Lara (2009) Hill-problem study, frozen

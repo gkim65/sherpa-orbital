@@ -15,17 +15,20 @@ Note the z-component has a different coefficient (−3 vs −1). This is the sta
 zonal-harmonic form for an oblate body whose symmetry axis is aligned with z
 (Enceladus spin axis ≈ orbit normal).
 
-This model is kept strictly separate from the onboard model in `cr3bp.jl`; the gap
-between them is the model uncertainty under study (CLAUDE.md rule).
+NOTE: kept strictly separate from the onboard model in `cr3bp.jl`. The gap between them is
+the model uncertainty under study, so the two must not be collapsed.
 
 Reference: Balmino (1994), eq. 4; Schaub & Junkins (2018) §9.2.
 """
 
 """
-    j2_acceleration(u) -> SVector-like 3-vector
+    j2_acceleration(u) -> NTuple{3,Float64}
 
-J2 perturbation acceleration from Enceladus' oblateness (km/s²), for state `u`
-(`[x, y, z, ...]` in km, barycentre frame).
+J2 perturbation acceleration from Enceladus' oblateness.
+
+  - `u` — barycentre-frame state (km, km/s); only the position is read
+
+Returns `(ax, ay, az)` in km/s².
 """
 function j2_acceleration(u::AbstractVector{<:Real})
     x, y, z = u[1], u[2], u[3]
@@ -49,9 +52,14 @@ end
 """
     cr3bp_j2_eom!(du, u, p, t)
 
-CR3BP + Enceladus J2 equations of motion (truth model), in place. Same state and
-derivative units as [`cr3bp_eom!`](@ref). Use the truth tolerances
-`rtol = 1e-10`, `atol = 1e-12`.
+CR3BP + Enceladus J2 equations of motion, in place.
+
+  - `du` — derivative vector, written in place
+  - `u` — barycentre-frame state (km, km/s)
+  - `p`, `t` — unused; present for the `ODEProblem` signature
+
+Same units as [`cr3bp_eom!`](@ref). Integrate at the truth tolerances `RTOL_TRUTH` /
+`ATOL_TRUTH`.
 """
 function cr3bp_j2_eom!(du, u, p, t)
     cr3bp_eom!(du, u, p, t)
@@ -66,7 +74,11 @@ end
 """
     cr3bp_j2_eom(u) -> Vector{Float64}
 
-Allocating convenience form of [`cr3bp_j2_eom!`](@ref).
+Allocating form of [`cr3bp_j2_eom!`](@ref).
+
+  - `u` — barycentre-frame state (km, km/s)
+
+Returns the 6-element derivative.
 """
 function cr3bp_j2_eom(u::AbstractVector{<:Real})
     du = similar(u, 6)

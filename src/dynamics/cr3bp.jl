@@ -24,9 +24,9 @@ const X_ENCELADUS = (1.0 - MU) * L_STAR   # Enceladus is at positive x
 
 CR3BP equations of motion (onboard model, no J2), in place.
 
-`u` is `[x, y, z, vx, vy, vz]` in km and km/s (barycentre frame); `du` receives
-`[vx, vy, vz, ax, ay, az]` in km/s and km/s². `t` (s) and `p` are unused, and are
-present for the `OrdinaryDiffEq` signature.
+  - `du` — receives `[vx, vy, vz, ax, ay, az]` (km/s, km/s²)
+  - `u` — barycentre-frame state `[x, y, z, vx, vy, vz]` (km, km/s)
+  - `p`, `t` — unused; present for the `OrdinaryDiffEq` signature
 """
 function cr3bp_eom!(du, u, p, t)
     x, y, z, vx, vy, vz = u
@@ -56,8 +56,11 @@ end
 """
     cr3bp_eom(u) -> Vector{Float64}
 
-Allocating convenience form of [`cr3bp_eom!`](@ref): returns the 6-vector derivative
-of state `u`. Units as in `cr3bp_eom!`.
+Allocating form of [`cr3bp_eom!`](@ref).
+
+  - `u` — barycentre-frame state (km, km/s)
+
+Returns the 6-element derivative (km/s, km/s²).
 """
 function cr3bp_eom(u::AbstractVector{<:Real})
     du = similar(u, 6)
@@ -68,8 +71,12 @@ end
 """
     jacobi_constant(u) -> Float64
 
-Jacobi constant (energy integral, km²/s²) of state `u`; conserved along a CR3BP
-trajectory.
+Jacobi constant, the CR3BP energy integral.
+
+  - `u` — barycentre-frame state (km, km/s)
+
+Returns the constant in km²/s². Conserved along a CR3BP trajectory, so drift in it
+measures integration error.
 
     C = 2*Omega(x,y,z) - v²,   Omega = (omega²/2)*(x²+y²) + GM_S/r1 + GM_E/r2
 """
@@ -88,10 +95,13 @@ end
 """
     libration_points_x() -> (x_L1, x_L2, x_L3)
 
-Approximate x-coordinates of the L1, L2, L3 collinear libration points (km,
-barycentre frame), from the quintic polynomial formulation in the rotating frame
-(Murray & Dermott 1999). Only L1 (between the primaries) and L2 (beyond Enceladus)
-are physically relevant for halo orbit design; L3 uses the low-order series estimate.
+x-coordinates of the L1, L2, L3 collinear libration points, from the quintic polynomial
+formulation in the rotating frame (Murray & Dermott 1999).
+
+Returns `(x_L1, x_L2, x_L3)` in km, barycentre frame.
+
+NOTE: L1 and L2 are solved to tolerance; L3 is a low-order series estimate. Halo orbit
+design here uses L1 only.
 """
 function libration_points_x()
     mu = MU
@@ -100,7 +110,7 @@ function libration_points_x()
     # L1: gamma^5 - (3-mu)gamma^4 + (3-2mu)gamma^3 - mu*gamma^2 + 2mu*gamma - mu = 0
     # L2: gamma^5 + (3-mu)gamma^4 + (3-2mu)gamma^3 - mu*gamma^2 - 2mu*gamma - mu = 0
     # Both have a single small positive root; Newton from the Hill-radius estimate
-    # converges to it (matching numpy.roots' smallest positive real root).
+    # converges to it.
     p_L1(g) = g^5 - (3 - mu) * g^4 + (3 - 2mu) * g^3 - mu * g^2 + 2mu * g - mu
     d_L1(g) = 5g^4 - 4 * (3 - mu) * g^3 + 3 * (3 - 2mu) * g^2 - 2mu * g + 2mu
     p_L2(g) = g^5 + (3 - mu) * g^4 + (3 - 2mu) * g^3 - mu * g^2 - 2mu * g - mu

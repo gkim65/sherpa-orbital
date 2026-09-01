@@ -1,21 +1,28 @@
 """
 model.jl — assemble the config + measured tables into a solvable POMDP.
 
-This is the seam between "the scenario" (a `StationkeepingPOMDP` config plus a measured
-`AltTables`) and "a thing a solver can consume" (a QuickPOMDP). Keeping the solver out of
-this file is deliberate: the library declares no solver dependency, so the choice of
-solver belongs to the caller in `experiments/`.
+The seam between a scenario (a `StationkeepingPOMDP` config plus measured `AltTables`) and
+something a solver can consume (a QuickPOMDP). The library declares no solver dependency,
+so the choice of solver belongs to the caller in `experiments/`.
 """
 
 """
     build_pomdp(config = StationkeepingPOMDP(); tables = nothing) -> QuickPOMDP
 
-Assemble the science/safety stationkeeping POMDP. `tables` defaults to the measured
-artifact at `config.tables_path` (or the packaged default).
+Assemble the science/safety stationkeeping POMDP.
+
+  - `config` — the scenario; every hyperparameter is a field with a literal default
+  - `tables` — measured kernels; `nothing` loads the artifact at `config.tables_path`, or
+    the packaged default
+
+Returns a `QuickPOMDP` over `SKState`.
 
     using SherpaOrbital, NativeSARSOP
     pomdp  = build_pomdp(StationkeepingPOMDP(; r_science = 40.0))
-    policy = solve(SARSOPSolver(; precision = 1e-3), pomdp)
+    policy = solve(SARSOPSolver(; precision = 1e-3, use_binning = false), pomdp)
+
+NOTE: `use_binning = false` is required for NativeSARSOP on this model — see `visit_cap`
+in `StationkeepingPOMDP.jl`.
 """
 function build_pomdp(config::StationkeepingPOMDP = StationkeepingPOMDP();
                      tables::Union{Nothing,AltTables} = nothing)
@@ -40,14 +47,10 @@ function build_pomdp(config::StationkeepingPOMDP = StationkeepingPOMDP();
         discount      = config.discount,
         isterminal    = s -> isterminal_state(s),
 
-        # Start on the nominal orbit, no science banked yet. Nominal periapsis is
-        # 30.98 km, so the initial altitude bin is `correct_bin` (A34_44) — NOT a
-        # separate "on target" state, since altitude is now the state variable.
-        #
-        # Residual starts at `:R_OK`: the vehicle begins ON the reference orbit, where the
-        # onboard solve is clean (measured 0.53 km on pass 1 of the sustained CORRECT loop,
-        # settling to the healthy ~8 km floor). Starting anywhere else would presume damage
-        # the mission has not yet accumulated.
+        # Start on the nominal orbit: the `correct_bin` altitude, nothing banked, and an
+        # undamaged residual. There is no separate "on target" state — altitude is the
+        # state variable, and starting anywhere but `:R_OK` would presume damage the
+        # mission has not yet accumulated.
         initialstate  = Deterministic(
             SKState(config.correct_bin, _zero_visits(config), 1, :R_OK)),
 
@@ -63,8 +66,13 @@ end
 """
     model_tables(config = StationkeepingPOMDP(); tables = nothing) -> (T, O)
 
-The raw T[s,a,s'] and O[s,o] arrays for a config, without building a POMDP. Useful for
-exporting the model, or for checking a hand-edited artifact.
+The raw transition and observation arrays for a config, without building a POMDP.
+
+  - `config` — the scenario
+  - `tables` — measured kernels; `nothing` loads the artifact at `config.tables_path`
+
+Returns `(T, O)`, sized `|S| x |A| x |S|` and `|S| x |O|`. Useful for exporting the model
+or checking a hand-edited artifact.
 """
 function model_tables(config::StationkeepingPOMDP = StationkeepingPOMDP();
                       tables::Union{Nothing,AltTables} = nothing)

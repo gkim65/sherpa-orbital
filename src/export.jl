@@ -2,12 +2,12 @@
 export.jl — serialize a solved policy so a rollout harness can consume it.
 
 The exported JSON is self-describing: it carries the state/action/observation labels, the
-discretization, the alpha vectors, AND the T/O tables. A consumer can therefore reproduce
-both the greedy policy query and the discrete belief filter without re-deriving the model
-or knowing the enumeration order.
+discretization, the alpha vectors and the T/O tables, so a consumer can reproduce both the
+greedy policy query and the discrete belief filter without re-deriving the model or
+knowing the enumeration order. [`SARSOPController`](@ref) is the in-tree consumer.
 
-While the rollout still lives in Python this file is the language seam. Once the rollout
-is Julia-native it stays useful as a way to freeze a solved policy for reuse.
+NOTE: exported policies are gitignored — they are large and derived. Only
+`artifacts/tables.json`, the measured input, is committed.
 """
 
 const DEFAULT_POLICY_PATH =
@@ -16,13 +16,16 @@ const DEFAULT_POLICY_PATH =
 """
     theta_slug(θ) -> String
 
-A filesystem-safe slug for a θ NamedTuple, e.g.
-`(sigma_nav_km = 2.0, plume_gradient = 4.0)` → `"sigma_nav_km=2.0_plume_gradient=4.0"`.
+A filesystem-safe slug for a θ NamedTuple.
 
-⚠️ WHY THIS EXISTS. `DEFAULT_TABLES_PATH` and `DEFAULT_POLICY_PATH` are SINGLE-SLOT, so a
-sweep that does not key its output by θ silently overwrites itself and leaves one artifact
-that claims to describe the whole family. Field order is preserved from the NamedTuple, so
-the same θ always yields the same slug.
+  - `θ` — the environment parameters, e.g. `(sigma_nav_km = 2.0, plume_gradient = 4.0)`
+
+Returns e.g. `"sigma_nav_km=2.0_plume_gradient=4.0"`. Field order follows the NamedTuple,
+so the same θ always yields the same slug.
+
+NOTE: `DEFAULT_TABLES_PATH` and `DEFAULT_POLICY_PATH` are single-slot. A sweep that does
+not key its output by θ overwrites itself and leaves one artifact claiming to describe the
+whole family.
 """
 theta_slug(θ::NamedTuple) =
     join(["$(k)=$(v)" for (k, v) in pairs(θ)], "_")
@@ -30,8 +33,14 @@ theta_slug(θ::NamedTuple) =
 """
     theta_path(base, θ; ext = ".json") -> String
 
-θ-keyed artifact path: `artifacts/<base>_<slug>.json`. Use for both tables and policies so a
-sweep's outputs sit beside each other and are self-identifying.
+θ-keyed artifact path, `artifacts/<base>_<slug>.<ext>`.
+
+  - `base` — filename stem, conventionally `"tables"` or `"policy"`
+  - `θ` — the environment parameters, slugged by [`theta_slug`](@ref)
+  - `ext` — file extension including the dot
+
+Returns the absolute path. Use for both tables and policies so a sweep's outputs sit
+beside each other and are self-identifying.
 
     write_tables(tbl; path = theta_path("tables", (plume_gradient = 4.0,)))
     export_policy(pol, cfg; path = theta_path("policy", (plume_gradient = 4.0,)))
@@ -44,8 +53,14 @@ end
 """
     alpha_vectors(policy, action_list) -> (alphas, alpha_actions)
 
-Pull the alpha vectors and their 1-based action indices out of a solved
-`AlphaVectorPolicy`. Kept separate from `export_policy` so a caller can inspect them.
+Pull the alpha vectors and their action indices out of a solved `AlphaVectorPolicy`.
+
+  - `policy` — the solved policy
+  - `action_list` — actions in model order, from [`actions`](@ref)
+
+Returns `(alphas, alpha_actions)`: a vector of |S|-length alpha vectors, and the 1-based
+index into `action_list` each one votes for. Kept separate from `export_policy` so a
+caller can inspect them.
 """
 function alpha_vectors(policy, action_list::Vector{Symbol})
     aidx = Dict(a => i for (i, a) in enumerate(action_list))
@@ -58,10 +73,18 @@ end
     export_policy(policy, config = StationkeepingPOMDP();
                   path = DEFAULT_POLICY_PATH, tables = nothing, meta = Dict())
 
-Write a solved policy plus the model tables it was solved against to JSON. Returns the
-path written.
+Write a solved policy plus the model tables it was solved against to JSON.
 
-    policy = solve(SARSOPSolver(), build_pomdp(cfg))
+  - `policy` — the solved policy
+  - `config` — the scenario it was solved against
+  - `path` — destination; defaults to the single-slot `DEFAULT_POLICY_PATH`, so use
+    [`theta_path`](@ref) for a sweep
+  - `tables` — measured kernels; `nothing` loads the artifact at `config.tables_path`
+  - `meta` — extra provenance merged into the payload's `meta` block
+
+Returns the path written.
+
+    policy = solve(SARSOPSolver(; use_binning = false), build_pomdp(cfg))
     export_policy(policy, cfg)
 """
 function export_policy(policy, config::StationkeepingPOMDP = StationkeepingPOMDP();
@@ -88,10 +111,9 @@ function export_policy(policy, config::StationkeepingPOMDP = StationkeepingPOMDP
         "states"          => state_label.(S),
         "state_alt"       => [string(s.alt) for s in S],
         "state_visits"    => [collect(s.visits) for s in S],
-        # The ORBIT-DAMAGE bin per state, and the edges that define it. A consumer needs
-        # both: the labels to project its belief onto the known-residual block (the
-        # residual is exactly observed — see `states.jl`), and the edges to bin its own
-        # live `solve_burn` residual the same way the model was calibrated.
+        # Orbit-damage bin per state, plus the edges defining it. A consumer needs the
+        # labels to project its belief onto the known-residual block, and the edges to bin
+        # its own live `solve_burn` residual the way the model was calibrated.
         "state_residual"  => [string(s.residual) for s in S],
         "residual_bins"   => string.(collect(RESIDUAL_BINS)),
         "residual_edges"  => collect(RESIDUAL_EDGES),

@@ -1,9 +1,10 @@
 """
 SherpaOrbital — offline POMDP stationkeeping for the Enceladus Orbilander.
 
-SHERPA-RPA Direction 3. The spacecraft holds a period-3 L1 halo orbit around Enceladus
-and must stationkeep without ground contact, trading SCIENCE (sampling a range of
-periapsis altitudes) against SAFETY (not crashing or escaping an unstable orbit).
+The spacecraft holds a period-1 L1 halo orbit (true period 11.996 hr, one periapsis per
+revolution) and stationkeeps without ground contact, trading science (sampling a range of
+periapsis altitudes) against safety (not crashing or escaping an orbit that must be
+actively held). See README.md for how this relates to MacKenzie's period-3 science orbit.
 
     using SherpaOrbital, NativeSARSOP
 
@@ -71,7 +72,7 @@ include("export.jl")
 include("common/report.jl")
 
 # The unified rollout harness. Last, because a SARSOP controller consumes the exported
-# policy artifact and the (dev, cov) state helpers above.
+# policy artifact and the state helpers above.
 include("common/simulate.jl")
 
 # Calibration: MEASURE the transition kernels from the truth model. Depends on the coast
@@ -184,8 +185,8 @@ export
     isterminal_state,
     alt_bin,
     band_of_alt,
-    # residual / orbit-damage dimension — the measured conditioning that makes the
-    # killing transition visible (added 2026-08-31)
+    # residual / orbit-damage dimension — conditioning which makes the terminal
+    # transition visible
     RESIDUAL_BINS,
     RESIDUAL_EDGES,
     residual_bin,

@@ -1,34 +1,18 @@
 """
 tables.jl — the measured transition kernels, as a versioned artifact.
 
-WHY THIS IS A FILE AND NOT A CONSTANT
-The dev-transition kernels are MEASURED from CR3BP+J2 experiments, not derived
-analytically. Previously they lived as literal constants hand-transcribed from
-experiment output, which meant re-running an experiment could silently leave the model
-stale with nothing to detect it. They are now a generated artifact carrying its own
-provenance: `artifacts/tables.json` records the numbers AND which experiment produced
-them, so a re-measurement shows up as a reviewable diff.
+Rows are `P(next alt, next residual | alt, residual, action)` — a joint distribution over
+`ALT_ALL × RESIDUAL_BINS`, flattened with the residual varying fastest (see
+[`kernel_entry_index`](@ref)). They live in `artifacts/tables.json` alongside the θ and
+effort they were measured under, so a re-measurement is a reviewable diff.
 
-Format is JSON rather than TOML/binary deliberately: these are a scientific artifact
-committed to git, so being able to eyeball a changed probability in review matters more
-than compactness. Swapping to JLD2 later is a drop-in behind `load_tables`/`write_tables`.
+JSON rather than a binary format on purpose: the artifact is committed, and eyeballing a
+changed probability in review matters more than compactness. Swapping to JLD2 is a drop-in
+behind `load_tables` / `write_tables`.
 
-Rows are P(next alt, next residual | alt, residual, action) — a JOINT distribution over
-ALT_ALL × RESIDUAL_BINS, flattened with the residual varying FASTEST (see
-[`kernel_entry_index`](@ref)).
-
-⚠️ REKEYED 2026-08-30 from dev bins to ALTITUDE bins. The committed `artifacts/tables.json`
-was measured against the old (dev, cov) state space and does NOT describe this model;
-`load_tables` rejects it rather than silently misaligning the kernel columns. Re-measure
-with `calibrate_tables` before quoting any result.
-
-⚠️ REKEYED AGAIN 2026-08-31 to carry the RESIDUAL (orbit-damage) dimension. Rows are now
-keyed `[action][(alt_bin, residual_bin)]` and their columns are the JOINT successor
-`(alt, residual)`, because the whole point of the dimension is that the transition depends
-on accumulated damage — a kernel keyed on altitude alone averages "fresh" and "degraded"
-into one number and reports P(loss) = 0.0 for the transition that actually kills the
-vehicle. Format marker goes 2 → 3; `load_tables` rejects format 2 rather than remapping,
-since the residual conditioning was never recorded in it and cannot be recovered.
+NOTE: `load_tables` rejects older artifact formats rather than remapping them. Neither the
+per-action keying (format 2) nor the residual conditioning (format 3) is recoverable from
+a file that never recorded it.
 """
 
 const DEFAULT_TABLES_PATH =
@@ -38,12 +22,14 @@ const DEFAULT_TABLES_PATH =
     KernelKey
 
 The conditioning of one measured row: which altitude bin the pass departed from, and how
-DEGRADED the orbit was when it did (`residual ∈ RESIDUAL_BINS`).
+degraded the orbit was when it did.
 
-⚠️ THE RESIDUAL HALF IS THE 2026-08-31 ADDITION and it is the entire point of the change.
-Keyed on `alt` alone, the row for "excurse from the limit cycle" pools a fresh departure
-(which is safe) with a departure from an orbit already 30 km out of trim (which is not),
-and reports their average — P(loss) = 0.0, because fresh departures dominate the sample.
+  - `alt` — departure altitude bin, a member of `ALT_BINS`
+  - `residual` — departure orbit-damage bin, a member of `RESIDUAL_BINS`
+
+NOTE: keyed on `alt` alone, a row pools a fresh departure with one from an orbit already
+far out of trim and reports their average — which is P(loss) = 0.0, because fresh
+departures dominate the sample.
 """
 struct KernelKey
     alt::Symbol
@@ -55,8 +41,10 @@ Base.show(io::IO, k::KernelKey) = print(io, k.alt, "/", k.residual)
 """
     kernel_keys_all() -> Vector{KernelKey}
 
-Every (live altitude bin × residual bin) conditioning, in the canonical order rows are
-enumerated and reported in. Altitude varies slowest.
+Every (live altitude bin x residual bin) conditioning, altitude varying slowest.
+
+Returns `length(ALT_BINS) * length(RESIDUAL_BINS)` keys in the canonical order rows are
+enumerated and reported in.
 """
 kernel_keys_all() = [KernelKey(a, r) for a in ALT_BINS for r in RESIDUAL_BINS]
 
@@ -64,14 +52,14 @@ kernel_keys_all() = [KernelKey(a, r) for a in ALT_BINS for r in RESIDUAL_BINS]
     kernel_entry_index(alt, residual) -> Int
     kernel_columns() -> Vector{Tuple{Symbol,Symbol}}
 
-The flattening convention for a kernel ROW: the successor is a JOINT `(alt, residual)`, and
-the columns run over `ALT_ALL × RESIDUAL_BINS` with the RESIDUAL varying FASTEST.
+The flattening convention for a kernel row. The successor is a joint `(alt, residual)` and
+the columns run over `ALT_BINS × RESIDUAL_BINS` with the residual varying fastest, then the
+two terminal altitudes last.
 
-The two absorbing altitudes are carried once each rather than once per residual bin — a
-lost orbit ran no onboard solve, so it has no residual — which keeps the terminal columns
-from splitting into unreachable duplicates. They are placed LAST, after the live block.
+Row length is `|ALT_BINS| * |RESIDUAL_BINS| + |TERMINAL_ALT|` = 17.
 
-Row length is therefore `|ALT_BINS| * |RESIDUAL_BINS| + |TERMINAL_ALT|` = 5*3 + 2 = 17.
+NOTE: the terminal altitudes are carried once each, not once per residual bin — a lost
+orbit ran no onboard solve, so it has no residual.
 """
 function kernel_columns()
     cols = Tuple{Symbol,Symbol}[]
@@ -107,9 +95,8 @@ Each row is a distribution over the JOINT successor `(alt, residual)` — see
 """
 struct AltTables
     correct::Dict{KernelKey,Vector{Float64}}
-    # ⚠️ TWO-LEVEL AS OF 2026-08-30: excurse[ACTION][key], one kernel PER EXCURSE
-    # ACTION. It was previously `excurse[from_bin]` — a single kernel shared by every band.
-    # See `alt_kernel` for why that was wrong and what it cost.
+    # Two-level: excurse[ACTION][key], one kernel per EXCURSE action. A single pooled
+    # kernel would make the excursions identical in T — see `alt_kernel`.
     excurse::Dict{Symbol,Dict{KernelKey,Vector{Float64}}}
     meta::Dict{String,Any}
 end
@@ -118,29 +105,20 @@ end
     alt_kernel(tables, action, key) -> Vector{Float64}
     alt_kernel(tables, action, alt, residual) -> Vector{Float64}
 
-The measured joint successor distribution for `action` from `(alt, residual)`, over the
-columns of [`kernel_columns`](@ref).
+The measured joint successor distribution for `action` departing `(alt, residual)`.
 
-⚠️ ONE KERNEL PER EXCURSE ACTION (changed 2026-08-30). This previously returned a SINGLE
-pooled `excurse[alt]` row for every band, on the exp-12 finding that excursion RISK does not
-differ meaningfully by band — only ΔV cost does. That is true for the SAFETY question and
-wrong for the SCIENCE question, because a kernel also encodes WHERE YOU LAND, and where you
-land is the entire point of aiming at a band.
+  - `tables` — the loaded kernels
+  - `action` — `:CORRECT` or an `:EXCURSE_<BAND>`
+  - `key` / `alt`, `residual` — the departure conditioning
 
-What the pooling cost, measured: the old `A34_44` EXCURSE row (from the limit cycle) read
-1/3 `A20_27`, 1/3 `A27_34`, 1/3 `ABOVE_44` over n = 3 — which is not "an excursion lands
-randomly" but the LOW walk landing in LOW, the MID walk in MID and the HIGH walk in HIGH,
-one trial each, averaged together. So the model was told `EXCURSE_HIGH` and `EXCURSE_LOW`
-have IDENTICAL successor distributions.
+Returns a probability vector over [`kernel_columns`](@ref).
 
-Why it went unnoticed: `action_dv_cost` gave the three actions different prices, so the
-policy appeared to choose among three excursions while actually choosing among three
-prices. At `fuel_weight = 0` the reward spread across `EXCURSE_{LOW,MID,HIGH}` is exactly
-0.0, the action set is degenerate, and no action raises P(landing in a deep band) — which
-makes a plume-gradient θ unable to change behaviour at all.
+NOTE: one kernel per EXCURSE action, because a kernel encodes where you LAND and that is
+the point of aiming at a band. Pooling them across bands makes the excursions identical in
+T, so no action raises P(landing in a deep band) and a plume-gradient θ cannot change
+behaviour at all. At `fuel_weight = 0` the reward spread across them is then exactly 0.0.
 
-Falls back to a pooled row if `action` has no measured kernel, so a legacy artifact still
-loads (`load_tables` handles the format bump).
+Falls back to any available EXCURSE kernel if `action` has none of its own.
 """
 function alt_kernel(tables::AltTables, action::Symbol, key::KernelKey)
     action === :CORRECT && return tables.correct[key]
@@ -161,9 +139,9 @@ _key_to_json(k::KernelKey) = string(k.alt, "|", k.residual)
 function _key_from_json(s::AbstractString)
     parts = split(s, "|")
     length(parts) == 2 || error(
-        "kernel row key \"$s\" is not \"ALT|RESIDUAL\". A single-part key is the " *
-        "PRE-2026-08-31 format, whose rows are not conditioned on the residual " *
-        "(orbit-damage) bin — re-measure with `experiments/calibrate.jl`.")
+        "kernel row key \"$s\" is not \"ALT|RESIDUAL\". A single-part key is an older " *
+        "format whose rows carry no residual (orbit-damage) conditioning — re-measure " *
+        "with `experiments/calibrate.jl`.")
     return KernelKey(Symbol(parts[1]), Symbol(parts[2]))
 end
 
@@ -213,9 +191,13 @@ end
 """
     load_tables(path = DEFAULT_TABLES_PATH) -> AltTables
 
-Read measured kernels from JSON and validate them. Throws if the file's altitude ordering
-disagrees with `ALT_ALL` (a silent reordering would corrupt every transition) or if any
-row is not a normalized distribution.
+Read measured kernels from JSON and validate them.
+
+  - `path` — artifact to read; defaults to the packaged one
+
+Returns an [`AltTables`](@ref). Throws if the artifact predates the current format, if its
+altitude ordering, column convention or residual edges disagree with the model, or if any
+row is not a normalized distribution — a silent mismatch would corrupt every transition.
 """
 function load_tables(path::AbstractString = DEFAULT_TABLES_PATH)
     isfile(path) || error("measured tables not found at $path — run the calibration " *
@@ -223,20 +205,17 @@ function load_tables(path::AbstractString = DEFAULT_TABLES_PATH)
     raw = JSON.parsefile(path)
 
     haskey(raw, "alt_next") || error(
-        "$path has no \"alt_next\" key. This is the PRE-2026-08-30 artifact, measured " *
-        "against the old (dev, cov) state space, and it does not describe the current " *
-        "(alt, visits) model. Re-measure with calibrate_tables rather than remapping it.")
+        "$path has no \"alt_next\" key, so it predates altitude-keyed kernels and does " *
+        "not describe this model. Re-measure with calibrate_tables rather than remapping.")
     got = Symbol.(raw["alt_next"])
     got == collect(ALT_ALL) || error(
         "tables.json alt_next = $got disagrees with ALT_ALL = $(collect(ALT_ALL)); " *
         "the kernel columns would be misaligned")
 
-    # ⚠️ FORMAT 2 IS REQUIRED (2026-08-30). Format 1 stored a SINGLE pooled `excurse[bin]`
-    # row shared by every band, which makes EXCURSE_{LOW,MID,HIGH} mathematically identical
-    # in T — a degenerate action set that silently defeats any science/altitude objective
-    # (see `alt_kernel`). Detect it by shape (format 1's values are arrays of numbers,
-    # format 2's are dicts keyed by action) and REJECT rather than remap: the per-band
-    # aiming was never recorded in format 1, so it cannot be recovered from the file.
+    # Format 1 stored a single pooled `excurse[bin]` shared by every band, making the
+    # excursions identical in T. Detected by shape — format 1's values are arrays, later
+    # formats' are dicts keyed by action — and rejected, since the per-band aiming it never
+    # recorded cannot be recovered.
     fmt = get(raw, "format", 1)
     exc_raw = raw["excurse"]
     looks_pooled = !isempty(exc_raw) && first(values(exc_raw)) isa AbstractVector
@@ -247,12 +226,9 @@ function load_tables(path::AbstractString = DEFAULT_TABLES_PATH)
               "this file — re-measure with `experiments/calibrate.jl`.")
     end
 
-    # ⚠️ FORMAT 3 IS REQUIRED (2026-08-31). Format 2's rows are keyed on the altitude bin
-    # ALONE and its columns are marginal over altitude, so it carries no information about
-    # the orbit's DAMAGE — the conditioning that makes the killing transition visible at
-    # all. A format-2 row is the AVERAGE of a fresh departure and a degraded one, which is
-    # exactly the average that reports P(loss) = 0.0 for the transition that loses the
-    # vehicle. The conditioning was never recorded, so it cannot be recovered by remapping.
+    # Format 2's rows are keyed on the altitude bin alone, so they carry no orbit-damage
+    # conditioning: each row averages a fresh departure with a degraded one and reports
+    # P(loss) = 0.0 for the transition that loses the vehicle. Not recoverable by remapping.
     if fmt < 3
         error("$path is a FORMAT $fmt artifact: its rows are keyed on the altitude bin " *
               "alone, with no RESIDUAL (orbit-damage) conditioning, so every row pools " *
@@ -300,8 +276,12 @@ end
 """
     validate_tables(tables)
 
-Check every kernel row covers the live altitude bins and sums to 1. Cheap, and it catches
-a hand-edited artifact before the error reaches the solver as a subtly wrong policy.
+Check every kernel row is present, correctly sized, non-negative and sums to 1.
+
+  - `tables` — the kernels to check
+
+Returns `true`, or throws naming the offending row. Cheap, and it catches a hand-edited
+artifact before the error reaches the solver as a subtly wrong policy.
 """
 function validate_tables(tables::AltTables)
     # Flatten the two-level excurse kernel into ("excurse/ACTION", rows) pairs so every

@@ -24,8 +24,11 @@ Problem and Space Mission Design", Ch. 2.
 """
     cr3bp_to_nondim(state_phys) -> Vector{Float64}
 
-Convert a physical CR3BP state `[x, y, z, vx, vy, vz]` (km, km/s) to non-dimensional
-units (position / `L_STAR`, velocity / `V_STAR`). Does not mutate the input.
+Convert a physical CR3BP state to non-dimensional units.
+
+  - `state_phys` — `[x, y, z, vx, vy, vz]` (km, km/s)
+
+Returns a fresh non-dimensional state: position / `L_STAR`, velocity / `V_STAR`.
 """
 function cr3bp_to_nondim(state_phys::AbstractVector{<:Real})
     s = collect(float.(state_phys))
@@ -37,8 +40,11 @@ end
 """
     nondim_to_cr3bp(state_nd) -> Vector{Float64}
 
-Convert a non-dimensional CR3BP state to physical units (km, km/s). Inverse of
-[`cr3bp_to_nondim`](@ref). Does not mutate the input.
+Convert a non-dimensional CR3BP state to physical units.
+
+  - `state_nd` — `[x, y, z, vx, vy, vz]`, non-dimensional
+
+Returns a fresh physical state (km, km/s). Inverse of [`cr3bp_to_nondim`](@ref).
 """
 function nondim_to_cr3bp(state_nd::AbstractVector{<:Real})
     s = collect(float.(state_nd))
@@ -50,24 +56,30 @@ end
 """
     ic_nondim_to_physical(x_nd, y_nd, z_nd, vx_nd, vy_nd, vz_nd) -> Vector{Float64}
 
-Convert literature-reported non-dimensional CR3BP initial conditions to km / km/s.
+Convert literature-reported non-dimensional CR3BP initial conditions to physical units.
 
-In the standard non-dimensional convention the barycentre is at the origin, Saturn sits at
-`x = -MU` and Enceladus at `x = 1 - MU`.
+  - `x_nd, y_nd, z_nd` — non-dimensional position
+  - `vx_nd, vy_nd, vz_nd` — non-dimensional velocity
+
+Returns the physical state (km, km/s). In the standard non-dimensional convention the
+barycentre is at the origin, Saturn at `x = -MU` and Enceladus at `x = 1 - MU`.
 """
 ic_nondim_to_physical(x_nd::Real, y_nd::Real, z_nd::Real,
                       vx_nd::Real, vy_nd::Real, vz_nd::Real) =
     nondim_to_cr3bp([x_nd, y_nd, z_nd, vx_nd, vy_nd, vz_nd])
 
 # ── Distance helpers in the CR3BP frame ──────────────────────────────────────
-# These duplicate `r_enceladus`/`altitude` from dynamics/integrator.jl under the names
-# the conventional ordering, so call sites read the same.
+# Same quantities as `r_enceladus`/`altitude` in dynamics/integrator.jl, under the names
+# used by the orbit-generation layer.
 
 """
     r_from_enceladus(state) -> Float64
 
-Distance from the spacecraft to the Enceladus centre (km), for a physical
-barycentre-frame state.
+Distance from the spacecraft to the Enceladus centre.
+
+  - `state` — physical barycentre-frame state (km, km/s)
+
+Returns the distance in km.
 """
 r_from_enceladus(state::AbstractVector{<:Real}) =
     sqrt((state[1] - X_ENCELADUS)^2 + state[2]^2 + state[3]^2)
@@ -75,7 +87,11 @@ r_from_enceladus(state::AbstractVector{<:Real}) =
 """
     altitude_from_enceladus(state) -> Float64
 
-Altitude above the Enceladus reference surface (km), for a physical barycentre-frame state.
+Altitude above the Enceladus reference surface.
+
+  - `state` — physical barycentre-frame state (km, km/s)
+
+Returns the altitude in km.
 """
 altitude_from_enceladus(state::AbstractVector{<:Real}) =
     r_from_enceladus(state) - R_ENCELADUS
@@ -85,14 +101,16 @@ altitude_from_enceladus(state::AbstractVector{<:Real}) =
 """
     cartesian_to_keplerian(state) -> NamedTuple
 
-Convert a Cartesian state expressed RELATIVE TO ENCELADUS (km, km/s) to osculating
-Keplerian elements about Enceladus.
+Osculating Keplerian elements about Enceladus.
 
-This is a two-body diagnostic and is not valid as a description of the full CR3BP
-motion; subtract `X_ENCELADUS` from `x` before calling.
+  - `state` — Cartesian state RELATIVE TO ENCELADUS (km, km/s)
 
-Returns `(a, e, i, raan, aop, ta, period)` with `a` in km, angles in rad, `period` in s
-(`Inf` for a non-elliptic orbit).
+Returns `(a, e, i, raan, aop, ta, period)`: semi-major axis in km, angles in rad, period in
+s (`Inf` for a non-elliptic orbit).
+
+NOTE: the input is Enceladus-relative, not barycentre-frame — subtract `X_ENCELADUS` from
+`x` before calling. This is a two-body diagnostic and does not describe the full CR3BP
+motion.
 """
 function cartesian_to_keplerian(state::AbstractVector{<:Real})
     r_vec = float.(state[1:3])

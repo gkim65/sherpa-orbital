@@ -12,46 +12,26 @@ Event detection uses the radial-velocity sign-change condition:
   - Apoapsis:  d/dt(r_enc) = 0 with ṙ going from + to −
   - Periapsis: d/dt(r_enc) = 0 with ṙ going from − to +
 
-`r_enc` is the distance from Enceladus, NOT from the barycentre.
+`r_enc` is the distance from Enceladus, not from the barycentre.
 
-Integrator choice and event semantics
-------------------------------------
-The Python reference used `scipy.solve_ivp(method="RK45")`, i.e. Dormand-Prince 5(4).
-`Vern9` is used here instead: at the truth tolerances (rtol 1e-10 / atol 1e-12) a 5th-order
-method is working far below its efficient range, and the higher-order method reaches the
-same tolerance with a much better error constant. Trajectory agreement against the Python
-reference is recorded in the session log.
+Integration is by `Vern9`: at the truth tolerances (rtol 1e-10 / atol 1e-12) a 5th-order
+method works far below its efficient range, and the higher-order method reaches the same
+tolerance with a much better error constant.
 
-Event *semantics* differ between the two libraries and the difference matters, because these
-events classify crash vs. escape:
+Event direction is encoded by which `ContinuousCallback` slot is filled — `affect!` fires
+on an upcrossing of `g`, `affect_neg!` on a downcrossing, and `nothing` suppresses that
+direction:
 
-  - scipy: one event function per condition with a `direction` flag on the sign change of
-    `g`, root-found by Brent's method on a dense interpolant.
-  - Julia: `ContinuousCallback(g, affect!, affect_neg!)`, where `affect!` fires on an
-    UPcrossing (`g`: − → +) and `affect_neg!` on a DOWNcrossing. Passing `nothing` for one
-    of them suppresses that direction, which is how `direction` is reproduced here:
+    direction = +1  ->  ContinuousCallback(g, terminate!, nothing)
+    direction = -1  ->  ContinuousCallback(g, nothing, terminate!)
 
-        direction = +1  →  ContinuousCallback(g, terminate!, nothing)
-        direction = -1  →  ContinuousCallback(g, nothing, terminate!)
+Root-finding tolerances are tightened below the defaults so the recovered event time is
+not the limiting error source.
 
-    Root-finding tolerances are tightened below scipy's defaults (`abstol`/`reltol` on the
-    callback) so the recovered event time is not the limiting error source.
-
-⚠️ Behaviour change vs. the Python reference — events at t0
------------------------------------------------------------
-`solve_ivp` evaluates the event function at `t0` and reports a root if it is already zero
-there. The period-3 IC starts EXACTLY at apoapsis (`ṙ(0) = 0.0` identically), so the Python
-`propagate_to_apoapsis` returns the initial state itself — a zero-length "propagation" — and
-the non-terminal apoapsis event list carries a phantom `t = 0` entry.
-
-`ContinuousCallback` requires a sign CHANGE across a step, so it does not fire at `t0`, and
-these functions return the FIRST DOWNSTREAM apoapsis. That is the intended meaning of
-"propagate to the next apoapsis", so the Julia behaviour is kept rather than bug-compatible.
-
-Consequence for callers: anything that consumed the Python apoapsis list by index is off by
-one at `t = 0`. Validated (2026-08-24): after dropping scipy's phantom entry, apoapsis counts
-match exactly and event times agree to ≤1.1e-3 s over 3 orbits; `propagate_to_apoapsis`
-matches Python's *second* apoapsis to 5.7e-7 s. Periapsis is unaffected (no root at `t0`).
+NOTE: `ContinuousCallback` needs a sign CHANGE across a step, so an event never fires at
+`t0`. The IC starts exactly at apoapsis (`ṙ(0) = 0` identically), so
+`propagate_to_apoapsis` returns the first DOWNSTREAM apoapsis rather than the initial
+state. Periapsis is unaffected.
 """
 
 # ── Integration tolerances ────────────────────────────────────────────────────
@@ -67,7 +47,11 @@ const EVENT_TOL = 1e-14
 """
     r_enceladus(u) -> Float64
 
-Distance from Enceladus' centre (km).
+Distance from Enceladus' centre.
+
+  - `u` — barycentre-frame state (km, km/s); only the position is read
+
+Returns the distance in km.
 """
 r_enceladus(u::AbstractVector{<:Real}) =
     sqrt((u[1] - X_ENCELADUS)^2 + u[2]^2 + u[3]^2)
@@ -75,7 +59,12 @@ r_enceladus(u::AbstractVector{<:Real}) =
 """
     rdot_enceladus(u) -> Float64
 
-Radial velocity relative to Enceladus (km/s). Positive = moving away.
+Radial velocity relative to Enceladus.
+
+  - `u` — barycentre-frame state (km, km/s)
+
+Returns the radial rate in km/s; positive is moving away. Zero at an apse, which is the
+event condition the apse callbacks watch.
 """
 function rdot_enceladus(u::AbstractVector{<:Real})
     dx = u[1] - X_ENCELADUS
@@ -86,14 +75,17 @@ end
 """
     altitude(u) -> Float64
 
-Altitude above the Enceladus reference surface (km).
+Altitude above the Enceladus reference surface.
+
+  - `u` — barycentre-frame state (km, km/s)
+
+Returns `r_enceladus(u) - R_ENCELADUS` in km.
 """
 altitude(u::AbstractVector{<:Real}) = r_enceladus(u) - R_ENCELADUS
 
 # ── Event constructors ────────────────────────────────────────────────────────
 # Each returns a ContinuousCallback. `terminal` selects whether the crossing stops the
-# integration (`terminate!`) or is only recorded via a saved-values callback by the caller.
-# The direction convention is documented in the module docstring.
+# integration or is only recorded. Direction convention is in the module docstring.
 
 _directed_callback(g, direction::Int, affect) =
     direction > 0 ? ContinuousCallback(g, affect, nothing;
@@ -106,7 +98,11 @@ _directed_callback(g, direction::Int, affect) =
 """
     apoapsis_callback(; terminal = true) -> ContinuousCallback
 
-Event at apoapsis: `ṙ_enc = 0` crossing from + to − (scipy `direction = -1`).
+Event at apoapsis: `ṙ_enc = 0` crossing from + to −.
+
+  - `terminal` — stop the integration at the crossing, rather than only recording it
+
+Returns a `ContinuousCallback`.
 """
 function apoapsis_callback(; terminal::Bool = true)
     g(u, t, integrator) = rdot_enceladus(u)
@@ -116,7 +112,11 @@ end
 """
     periapsis_callback(; terminal = true) -> ContinuousCallback
 
-Event at periapsis: `ṙ_enc = 0` crossing from − to + (scipy `direction = +1`).
+Event at periapsis: `ṙ_enc = 0` crossing from − to +.
+
+  - `terminal` — stop the integration at the crossing, rather than only recording it
+
+Returns a `ContinuousCallback`.
 """
 function periapsis_callback(; terminal::Bool = true)
     g(u, t, integrator) = rdot_enceladus(u)
@@ -126,9 +126,14 @@ end
 """
     altitude_callback(altitude_km; terminal = false) -> ContinuousCallback
 
-Event when the altitude above Enceladus descends through `altitude_km` (scipy
-`direction = -1`). Used for stationkeeping: Strategy 3 fires at the 600-km altitude
-crossing (MacKenzie 2020 §B.2.3).
+Event when the altitude above Enceladus descends through a shell.
+
+  - `altitude_km` — shell altitude above the surface (km)
+  - `terminal` — stop the integration at the crossing, rather than only recording it
+
+Returns a `ContinuousCallback`. Descending only, so it does not fire on the outbound leg.
+Strategy 3 triggers control at the `CONTROL_ALT_KM` = 600 km crossing
+(MacKenzie 2020 §B.2.3).
 """
 function altitude_callback(altitude_km::Real; terminal::Bool = false)
     target_r = R_ENCELADUS + altitude_km
@@ -139,8 +144,11 @@ end
 """
     crash_callback(crash_altitude_km = PERIAPSIS_CRASH_ALT) -> ContinuousCallback
 
-Terminal event fired when the altitude descends below `crash_altitude_km` — surface
-impact. Always terminal.
+Terminal event for surface impact: the altitude descending below a floor.
+
+  - `crash_altitude_km` — impact altitude (km); defaults to `PERIAPSIS_CRASH_ALT`
+
+Returns a `ContinuousCallback`. Always terminal.
 """
 function crash_callback(crash_altitude_km::Real = PERIAPSIS_CRASH_ALT)
     crash_r = R_ENCELADUS + crash_altitude_km
@@ -154,17 +162,19 @@ end
     propagate(eom!, state0, tspan; callback = nothing, rtol, atol, saveat = Float64[],
               max_step = Inf) -> ODESolution
 
-Integrate `eom!` (an in-place `f(du, u, p, t)`) from `tspan[1]` to `tspan[2]` (s).
+Integrate `eom!` from `tspan[1]` to `tspan[2]`.
 
-  - `state0`: `[x, y, z, vx, vy, vz]` in km / km/s
-  - `callback`: a `ContinuousCallback` / `CallbackSet` for event detection
-  - `rtol`, `atol`: integration tolerances (default: truth model)
-  - `saveat`: request output at specific times (s); empty = solver's own steps
-  - `max_step`: maximum allowed step size (s)
+  - `eom!` — in-place equations of motion, `f(du, u, p, t)`
+  - `state0` — initial state `[x, y, z, vx, vy, vz]` (km, km/s)
+  - `tspan` — `(t0, tf)` in seconds
+  - `callback` — a `ContinuousCallback` or `CallbackSet` for event detection
+  - `rtol`, `atol` — integration tolerances; default to the truth-model values
+  - `saveat` — output times (s); empty uses the solver's own steps
+  - `max_step` — maximum step size (s)
 
-Returns the `ODESolution`; `sol.t[end]` and `sol.u[end]` are the terminating time and
-state, which for a terminal callback is the event itself. The solution is dense
-(interpolable) unless `saveat` is given.
+Returns the `ODESolution`. `sol.t[end]` and `sol.u[end]` are the terminating time and
+state, which for a terminal callback is the event itself. Dense (interpolable) unless
+`saveat` is given.
 """
 function propagate(
     eom!,
@@ -192,9 +202,16 @@ end
 """
     propagate_to_apoapsis(eom!, state0, t_max; rtol, atol) -> (state_apo, t_apo)
 
-Propagate until the next apoapsis (`ṙ_enc = 0`, decelerating), within `t_max` seconds.
-Returns the state (km, km/s) and time (s) at apoapsis. Throws if no apoapsis is found
-within `t_max`.
+Propagate until the next apoapsis (`ṙ_enc = 0`, receding).
+
+  - `eom!` — equations of motion
+  - `state0` — initial state (km, km/s)
+  - `t_max` — search horizon (s)
+  - `rtol`, `atol` — integration tolerances
+
+Returns `(state_apo, t_apo)` in (km, km/s) and seconds. Throws if no apoapsis is found
+within `t_max`. Never returns `t = 0` even if `state0` is at an apoapsis — see the module
+docstring.
 """
 function propagate_to_apoapsis(
     eom!,
@@ -212,8 +229,14 @@ end
 """
     propagate_to_periapsis(eom!, state0, t_max; rtol, atol) -> (state_peri, t_peri)
 
-Propagate until the next periapsis (`ṙ_enc = 0`, accelerating), within `t_max` seconds.
-Returns the state (km, km/s) and time (s) at periapsis. Throws if no periapsis is found
+Propagate until the next periapsis (`ṙ_enc = 0`, approaching).
+
+  - `eom!` — equations of motion
+  - `state0` — initial state (km, km/s)
+  - `t_max` — search horizon (s)
+  - `rtol`, `atol` — integration tolerances
+
+Returns `(state_peri, t_peri)` in (km, km/s) and seconds. Throws if no periapsis is found
 within `t_max`.
 """
 function propagate_to_periapsis(
@@ -233,8 +256,16 @@ end
     propagate_n_orbits(eom!, state0, n_orbits, orbit_period_s; rtol, atol, saveat)
         -> ODESolution
 
-Propagate for `n_orbits` complete orbital periods of `orbit_period_s` seconds, with a
-terminal crash event. The returned solution ends early (at `sol.t[end] < n*T`) if the
+Propagate for a whole number of orbital periods, with a terminal crash event.
+
+  - `eom!` — equations of motion
+  - `state0` — initial state (km, km/s)
+  - `n_orbits` — how many periods to cover
+  - `orbit_period_s` — one period (s)
+  - `rtol`, `atol` — integration tolerances
+  - `saveat` — output times (s)
+
+Returns the `ODESolution`, ending early at `sol.t[end] < n_orbits * orbit_period_s` if the
 spacecraft impacts.
 """
 function propagate_n_orbits(
@@ -255,10 +286,15 @@ end
 """
     collect_apses(eom!, state0, t_max; rtol, atol) -> (peri, apo)
 
-Record every periapsis and apoapsis passage in `[0, t_max]` without terminating, as
-two vectors of `(t, state)` pairs. This is the non-terminal counterpart to
-[`propagate_to_periapsis`](@ref); it replaces scipy's "non-terminal event with
-`t_events`" pattern, which has no direct `ContinuousCallback` equivalent.
+Record every apse passage in `[0, t_max]` without terminating.
+
+  - `eom!` — equations of motion
+  - `state0` — initial state (km, km/s)
+  - `t_max` — how long to propagate (s)
+  - `rtol`, `atol` — integration tolerances
+
+Returns `(peri, apo)`, each a vector of `(t, state)` pairs in seconds and (km, km/s). The
+non-terminal counterpart to [`propagate_to_periapsis`](@ref).
 """
 function collect_apses(
     eom!,

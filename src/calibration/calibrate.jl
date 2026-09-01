@@ -1,93 +1,46 @@
 """
-calibration/calibrate.jl — MEASURE the dev-transition kernels from the Julia truth model.
+calibration/calibrate.jl — measure the transition kernels from the truth model.
 
-WHAT THIS REPLACES
-`artifacts/tables.json` has until now held HAND-TRANSCRIBED numbers, copied out of the
-Python experiment logs (exp 11b for CORRECT/OBSERVE, exp 12 for EXCURSE) with the DRIFT/FAR
-rows filled in by engineering judgement anchored on very few trials. That artifact's own
-`meta.caveats` says so. This module measures them from the ported Julia truth model, so the
-committed artifact becomes a machine-generated record with a reproducible provenance.
+Rows are keyed [`KernelKey`](@ref) — altitude bin and residual bin — and their columns are
+the joint successor `(alt, residual)`. Two sources feed them:
 
-⚠️ THE MEASUREMENT IS THE PRODUCT — read the caveats before trusting a row.
+  - `tree_walk!` — an exhaustive action-sequence tree from the nominal orbit, threaded.
+    The bulk of the samples, and the only source that reaches a state one action produces
+    for another to depart from.
+  - `action_walk!` — single-action walks from the nominal orbit and from seeded
+    halo-family members in each altitude bin. Serial. The only source for `BELOW_20`, and
+    for the observed losses in some `R_CRITICAL` rows.
 
-  1. THE ORBIT IS THE KNOWN-DEFECTIVE ONE. The period-3 IC's periapsis sits at +87°
-     latitude — the NORTH pole — not the south pole the science case wants (docs/todo.md
-     "Step A′"). Every kernel here is conditional on that orbit. A row must NOT be
-     presented as characterising the intended south-polar orbit.
-  2. THE ORBIT IS VIOLENTLY UNSTABLE — it escapes in ~2 revs uncontrolled. This is why
-     there is no longer an OBSERVE action to calibrate: a no-burn pass is not a decision on
-     this orbit, it is a step toward losing the vehicle (see `actions`).
-  3. EVERY ROW IS REPORTED WITH ITS TRIAL COUNT and a row below `MIN_TRIALS_TRUSTED` is
-     flagged, not silently smoothed. A row with n = 0 is FILLED with a self-transition so
-     the kernel stays a valid stochastic matrix, and named in `meta.unmeasured_rows`.
-  4. `converged` IS THE WRONG SUCCESS TEST FOR AN EXCURSION. `mode = :altitude_position`
-     leaves the apoapsis-POSITION block in the residual, which never clears
-     `TARGET_TOL_KM` from a drifted state, so `converged` reads false on passes that hit
-     the commanded altitude to ~0.05 km. The EXCURSE rows count a trial as
-     non-converged on `peri_err_km`, the periapsis-altitude error alone.
+Every row carries its trial count. A row below `MIN_TRIALS_TRUSTED` is flagged rather than
+smoothed; an `n = 0` row is filled by [`_fill_unmeasured_row`](@ref) and named in
+`meta.unmeasured_rows`.
 
-METHOD — ONE WALKER, EVERY ACTION (unified 2026-08-31)
-  `action_walk!` flies short walks of a SINGLE action, RESTARTED from the seed every
-  `EXCURSE_PASSES_PER_RESTART` passes so each restart contributes a fresh departure from
-  the origin bin, and carries the residual (orbit damage) along the walk so later passes
-  are booked as degraded departures. Every action is measured this way — first from the
-  nominal limit cycle, then seeded from a real halo-family member in each altitude bin so
-  the bins a working controller never visits are measured rather than invented.
+NOTE: truth/onboard split. `truth_eom!` is an argument, integrated only in the coast
+helpers. All planning goes through `solve_burn` on the onboard CR3BP.
 
-  The only per-action differences are ARGUMENTS: `:position` + nominal apse vectors for
-  CORRECT, `:altitude_position` + a commanded altitude for each EXCURSE, and the matching
-  success test (`converged` vs `peri_err_km` — see caveat 4). ONE KERNEL PER ACTION.
+NOTE: seeded rows are optimistic. A seed is a freshly-placed periodic family member, the
+most stable state in the system, so a row measured only from seeds understates how fast the
+orbit diverges.
 
-  ⚠️ CORRECT USED TO HAVE ITS OWN BESPOKE PATH — a sustained loop, written out inline
-  twice — and it only ever flew from PRISTINE states. So every `CORRECT` row at
-  `R_DEGRADED` / `R_CRITICAL` was n = 0, and the recovery behaviour the residual dimension
-  exists to model ("the first CORRECT does not clear the damage, the second does") was not
-  measured at all. Routing CORRECT through the shared walker is what fixed that.
-            ⚠️ CHANGED 2026-08-31: the walk used to be carried forward across ALL trials,
-            which made the trial count a WALK LENGTH. Because an accurate excursion settles
-            after 1–2 passes, every later pass was recorded departing the DESTINATION bin
-            and the origin rows stayed at n = 1 — see `excurse_walk!`.
-            ⚠️ CHANGED 2026-08-30. Every EXCURSE_* used to SHARE one kernel, on exp 12's
-            finding that excursion SAFETY did not differ meaningfully by band (only ΔV
-            did). That is right for the safety question and wrong for the science one: a
-            kernel also encodes WHERE YOU LAND, which is the point of aiming at a band.
-            Pooling made EXCURSE_{LOW,MID,HIGH} identical in T — a degenerate action set
-            in which nothing steers altitude. See `alt_kernel` in tables.jl.
+NOTE: `converged` is not the success test for an excursion. In `:altitude_position` the
+apoapsis-position block never clears `TARGET_TOL_KM` from a drifted state, so `converged`
+reads false on passes that hit the commanded altitude to well under a km. EXCURSE rows
+score on `peri_err_km` instead.
 
-⚠️ SEEDING IS WHAT MAKES THE ROWS MEAN ANYTHING, AND IT HAS A KNOWN BIAS. A seeded state is
-a freshly-placed PERIODIC family member, which is the most stable state in the system; a row
-measured only from seeds therefore understates how fast the orbit diverges. That bias is what
-made the old OBSERVE rows come back as 100% self-transitions and taught the solved policy
-that coasting was free — it chose OBSERVE twice and escaped at 3.78 d (2026-08-30). The
-EXCURSE walks mitigate it by flying a few passes per restart rather than one, so the later
-passes of each restart condition on drifted states. Prefer a row with sustained-loop trials in
-it over one that is purely seeded. (Before 2026-08-31 the walker was never re-seeded at all,
-which avoided the bias but produced n = 1 origin rows — a worse failure.)
-
-⚠️ ROWS ARE CONDITIONED ON ORBIT DAMAGE AS OF 2026-08-31. A row's key is a
-[`KernelKey`](@ref) — the altitude bin AND the residual bin — and its columns are the JOINT
-successor `(alt, residual)`. Keyed on altitude alone, a row averages a FRESH departure with
-a departure from an already-degraded orbit, and the average reports P(loss) = 0.0 for the
-transition that actually loses the vehicle. That is not a calibration-effort problem (more
-trials just average harder) and it cannot be fixed by raising the loss penalties (they
-multiply P(loss), and anything × 0.0 is 0.0).
-
-⚠️ AND THE ROW COUNT TRIPLED, ON THE SAME TRIAL BUDGET. Five altitude rows became fifteen
-(alt × residual) rows per action. The trials are REDISTRIBUTED, not multiplied, so rows
-that previously cleared `MIN_TRIALS_TRUSTED` may not any more — and many (alt, residual)
-combinations are simply not reachable (the vehicle cannot be at 18 km with a pristine
-residual after a violent transfer). Check `meta.trials` and `meta.unmeasured_rows`; an
-unreachable row filled with a self-transition is not evidence about anything.
-
-⚠️ TRUTH/ONBOARD SPLIT. `truth_eom!` is an argument and is integrated only in the coast
-helpers; all planning goes through `solve_burn` on the onboard CR3BP.
+NOTE: only the tree is threaded; run with `-t auto`. Output is bit-identical either way,
+because the tree books its counts serially in a fixed order.
 """
 
 """
     CalibrationRow
 
-One measured kernel row: the counts over `ALT_ALL`, the normalized probabilities, and the
-diagnostics needed to judge whether the row is trustworthy.
+One measured kernel row.
+
+  - `counts` — successor counts over [`kernel_columns`](@ref), the joint (alt, residual)
+  - `probs` — `counts ./ n`, or empty when `n == 0`
+  - `n` — trials contributing to this row
+  - `n_nonconverged` — solve failures folded into it
+  - `dv_ms` — per-trial ΔV (m/s), for the `action_dv_cost` proxy
 """
 struct CalibrationRow
     counts::Vector{Int}          # over kernel_columns() — the JOINT (alt, residual)
@@ -97,37 +50,42 @@ struct CalibrationRow
     dv_ms::Vector{Float64}       # per-trial ΔV, for the action_dv_cost proxy
 end
 
-"""Representative altitude (km) for seeding a bin: its midpoint, or a sensible interior
-point for the two open-ended outer bins."""
+"""
+    _bin_rep_alt(bin, e) -> Float64
+
+Representative seeding altitude (km) for an altitude bin: its midpoint, or an interior
+point for the two open-ended outer bins.
+
+  - `bin` — the altitude bin
+  - `e` — the four bin edges (km)
+"""
 function _bin_rep_alt(bin::Symbol, e::NTuple{4,<:Real})
-    # NOT the midpoint (10 km): the continued family floor is 17.565 km, so a 10 km seed
-    # finds no member and the row silently stays unmeasured. Seed just inside the family.
+    # Not the midpoint: the continued family floor is ~17.6 km, so a lower seed finds no
+    # member and the row silently stays unmeasured.
     bin === :BELOW_20 && return 18.0
     bin === :A20_27   && return 0.5 * (e[1] + e[2])
     bin === :A27_34   && return 0.5 * (e[2] + e[3])
     bin === :A34_44   && return 0.5 * (e[3] + e[4])
-    # ABOVE_44 is open-ended, so pick a seed that is HOLDABLE rather than the geometric
-    # continuation. Measured 2026-08-30: a family member holds its own altitude at 45 km but
-    # ESCAPES by pass 3 at 55 and 60 km, so seeding at 55 would measure a doomed orbit and
-    # report it as this bin's behaviour. 46 km is just inside the band and survivable.
+    # ABOVE_44 is open-ended, so seed somewhere HOLDABLE rather than at the geometric
+    # continuation: a member holds its own altitude at 45 km but escapes by pass 3 at 55.
     return 46.0
 end
 
 """
     _bin_sample_alts(bin, e, n) -> Vector{Float64}
 
-`n` seeding altitudes (km) SPREAD ACROSS a bin, rather than one representative point.
+Seeding altitudes spread across a bin, rather than one representative point.
 
-⚠️ WHY THE SPREAD EXISTS (2026-08-31). Seeding a bin at a single altitude measures one
-canonical orbit and reports it as the behaviour of the whole bin. But a bin is a RANGE: a
-20.5 km departure and a 26.5 km departure are both `A20_27` and do not behave the same. The
-kernel row is supposed to mean "I am somewhere in this cell", so the measurement should
-sample the cell, not a point in it.
+  - `bin` — the altitude bin
+  - `e` — the four bin edges (km)
+  - `n` — how many altitudes to return; `n <= 1` falls back to [`_bin_rep_alt`](@ref)
 
-Interior points only — the endpoints are deliberately inset by 15% of the bin width so a
-sample never sits on a boundary where `alt_bin` could round it into the neighbour. The two
-open-ended bins keep their measured, holdable anchors (see [`_bin_rep_alt`](@ref)) and are
-spread over a narrow window around them rather than out into the region that escapes.
+Returns `n` altitudes in km. A row means "somewhere in this cell", so the measurement
+samples the cell rather than a point in it.
+
+NOTE: interior points only — endpoints are inset by 15% of the bin width so a sample never
+sits on a boundary where `alt_bin` could round it into the neighbour. The open-ended bins
+are spread over a narrow holdable window rather than out into the region that escapes.
 """
 function _bin_sample_alts(bin::Symbol, e::NTuple{4,<:Real}, n::Integer)
     n <= 1 && return [_bin_rep_alt(bin, e)]
@@ -151,18 +109,12 @@ function _bin_sample_alts(bin::Symbol, e::NTuple{4,<:Real}, n::Integer)
 end
 
 """
-Samples per (altitude bin × action) seeding cell — how many DISPERSED departures to fly.
+Seed altitudes per (altitude bin x action) cell. The cell's trial budget is divided across
+them, so this buys spread rather than costing more.
 
-⚠️ THIS IS WHAT MAKES A ROW A DISTRIBUTION RATHER THAN A REPLICATE. Noise-free, the truth
-integrator and the burn solver are both deterministic, so repeating a walk from the SAME
-seed reproduces it exactly: a row reading n = 48 was 16 identical restarts of a 3-pass walk,
-not 48 independent samples. Dispersing the departure state (position/velocity jitter) and
-spreading the seed altitude across the bin are what make the replicates genuinely differ, so
-`n` starts to mean sample size rather than repeat count.
-
-⚠️ IT DOES NOT MAKE THE DANGEROUS ROWS SAFER, and should not be expected to. A cell
-measured at P(LOST) = 1.00 over many DISPERSED samples is strong evidence; the point of
-sampling is that the number means something, not that it softens.
+NOTE: noise-free, the truth integrator and burn solver are both deterministic, so restarts
+from the SAME seed reproduce each other exactly. Spreading the seed altitude across the bin
+is what makes `n` a sample size rather than a repeat count.
 """
 const SEED_SAMPLES_PER_CELL = 3
 
@@ -170,32 +122,23 @@ const SEED_SAMPLES_PER_CELL = 3
 Depth of the exhaustive action-sequence tree (see `tree_walk!` inside `calibrate_tables`).
 
 Every action sequence of this length is flown from the nominal orbit, so the measurement
-covers the CROSS PRODUCT of actions rather than one action at a time. That is what reaches
-`(CORRECT, R_DEGRADED)` — a state CORRECT cannot produce for itself.
+covers the cross product of actions rather than one action at a time. That is what reaches
+`(CORRECT, R_DEGRADED)`, a state CORRECT cannot produce for itself.
 
-Cost before pruning is `(|A|^(d+1) - |A|) / (|A| - 1)` passes; at |A| = 4:
+Cost before pruning is `(|A|^(d+1) - |A|) / (|A| - 1)` passes — at |A| = 4, 1364 at depth 5
+and 21844 at depth 7. Escaping branches prune their whole subtree, so the flown count runs
+well under that. `experiments/calibrate.jl` takes the depth as its first argument.
 
-  | depth | passes | note                                   |
-  |-------|--------|----------------------------------------|
-  |     4 |    340 | thin                                   |
-  |     5 |   1364 | comparable to the pre-tree calibration  |
-  |     6 |   5460 | ~4x                                    |
-  |     7 |  21844 | ~16x                                   |
-
-Escaping branches prune their whole subtree, so the flown count runs well under these.
-Raising this is a ONE-NUMBER change. There is deliberately no resume/extend path: the tree
-is bottom-heavy (each level is ~|A| times the one before), so reusing a shallower tree can
-never save more than ~1/|A| of the work — the frontier, which is the bulk, always has to be
-flown. Threading is the speedup that actually pays; see `tree_walk!`.
+NOTE: there is no resume path. The tree is bottom-heavy, so reusing a shallower one can
+never save more than ~1/|A| of the work; the frontier always has to be flown.
 """
 const TREE_DEPTH = 5
 
-"""Minimum trials before a measured row is considered anything but indicative.
+"""Minimum trials before a measured row is anything but indicative.
 
-⚠️ READ THIS AS SAMPLE SIZE ONLY IF THE SAMPLES DIFFER. Noise-free with an undispersed seed
-the environment is deterministic, so `n` counts REPLICATES of one trajectory, not draws from
-a distribution — see [`SEED_SAMPLES_PER_CELL`](@ref). Check `meta.effort.seed_samples` before
-reading a trial count as statistical confidence.
+NOTE: a trial count is a sample size only if the samples differ. Noise-free the environment
+is deterministic, so restarts from one seed are replicates rather than draws — check
+`meta.effort.seed_samples` before reading `n` as statistical confidence.
 """
 const MIN_TRIALS_TRUSTED = 20
 
@@ -230,69 +173,42 @@ _to_peri(eom!, s, h)  = _coast(eom!, s, h, _terminal_periapsis_callback_arg, not
 """Map a terminal coast outcome onto its `ALT_ALL` label."""
 _terminal_dev(outcome::Symbol) = outcome === :crash ? :CRASHED : :LOST
 
-# ── Why the EXCURSE target is an ALTITUDE, not a position vector ───────────────
-# Superseded 2026-08-30 by `mode = :altitude_position`; the helper this replaces
-# (`_excurse_targets`, a radially-scaled waypoint) is gone. The measurements that forced
-# the change are worth keeping:
-#
-# Aiming ONE impulse at a real family member's absolute apse POSITIONS from a drifted state
-# fails on PHASE, not altitude. `next_apse_positions(member.ic)` returns where THAT member's
-# periapsis sits at ITS OWN epoch. From the 31 km limit cycle vs the 30 km member, periapsis
-# ALTITUDES differ ~22 km but periapsis POSITIONS are 585 km apart and apoapsis positions
-# 2319 km apart, so the `:position` residual at ΔV = 0 is 2392 km:
-#
-#   | commanded | family-member apses | scaled waypoint     |
-#   |-----------|---------------------|---------------------|
-#   | 20 km     | 177.6 m/s -> ESCAPE | 2.39 m/s -> 37.9 km |
-#   | 40 km     | 179.8 m/s -> 395 km | 1.51 m/s -> 42.8 km |
-#   | 50 km     |  73.0 m/s -> 562 km | 1.23 m/s -> 45.3 km |
-#
-# Both columns are bad: the "real orbit" throws the vehicle out, and the waypoint only moves
-# achieved periapsis 37.9 -> 45.3 km across a 30 km command range (~25% authority).
-# `:altitude_position` constrains the periapsis ALTITUDE directly and delivers the command to
-# ~0.2 km, which is what made these rows measurable at all.
+# An EXCURSE commands the periapsis ALTITUDE (`mode = :altitude_position`), not a position
+# vector. Aiming one impulse at a real family member's absolute apse positions fails on
+# PHASE — those are where that member sits at its own epoch, which is unrelated to ours —
+# and a radially-scaled waypoint has too little authority to move achieved periapsis. See
+# `_sarsop_band_targets` in common/simulate.jl.
 
 """
     CALIBRATION_EFFORT
 
-The MEASUREMENT-EFFORT defaults, in one named place rather than scattered as inline
-literals across the signature.
+Measurement-effort defaults, in one named place rather than as inline literals across the
+signature. Recorded into `meta.effort`, so an artifact says how hard it was measured.
 
-⚠️ EFFORT IS NOT θ. These control how HARD the environment is sampled — trial counts, loop
-lengths, the RNG seed. The same environment measured with 8 or 24 trials is the SAME θ
-measured with different confidence, so these are deliberately NOT fields on
-`StationkeepingPOMDP` (which holds the environment) and are NOT part of a sweep grid. They
-are recorded into `meta.effort` so an artifact says how hard it was measured, which is the
-only way to tell a thin row that is thin BY CONFIGURATION from one thin because the walk
-settled.
+  - `n_steps`             — total CORRECT passes from the nominal limit cycle, spread over
+                            restarts
+  - `horizon_s`           — accepted and recorded, but see the note below
+  - `excurse_trials`      — passes per primary excursion walk
+  - `seed_trials`         — CORRECT passes per seeded altitude bin
+  - `excurse_seed_trials` — EXCURSE passes per (bin x band) seed
+  - `seed_bins`           — also seed the bins a working controller never visits
+  - `seed_samples`        — altitudes sampled across each bin when seeding; the cell's
+                            budget is split across them, so this buys spread not cost
+  - `tree_depth`          — action-tree depth, the main coverage mechanism
+  - `rng_seed`            — only consumed when `noisy_thruster` is on; noise-free the
+                            measurement is fully deterministic
 
-  - `n_steps`             — CORRECT passes to fly from the nominal limit cycle.
-                            ⚠️ Was the length of ONE sustained loop; since the 2026-08-31
-                            walker unification it is a total pass budget spread over
-                            restarts, exactly like `excurse_trials`.
-  - `horizon_s`           — ⚠️ DEAD as of 2026-08-31. It capped the wall-clock of the
-                            bespoke sustained CORRECT loop, which no longer exists: every
-                            action now goes through the restarting `action_walk!` or the
-                            action tree, both bounded by pass COUNT rather than elapsed
-                            time. Still accepted and recorded into `meta.effort` so older
-                            drivers keep working and older artifacts stay comparable, but
-                            changing it has NO effect on the measurement.
-  - `excurse_trials`      — steps per primary excursion walk.
-  - `seed_trials`         — CORRECT trials per seeded altitude bin.
-  - `excurse_seed_trials` — EXCURSE trials per (bin × band) seed.
-  - `seed_bins`           — seed the bins a working controller never visits at all.
-  - `seed_samples`        — how many ALTITUDES to sample across each bin when seeding. The
-                            cell's trial budget is split across them, so this trades
-                            replicates for genuine spread rather than costing more.
-  - `rng_seed`            — reproducibility seed. Only consumed when `noisy_thruster` is
-                            on; noise-free the measurement is fully deterministic.
+NOTE: effort is not θ. These say how hard the environment was sampled, not which
+environment it is, so they are deliberately not fields on `StationkeepingPOMDP` and are not
+part of a sweep grid.
 
-⚠️ `excurse_trials`/`excurse_seed_trials` were RAISED 8 → 24 on 2026-08-30 when the EXCURSE
-kernel became per-action (splitting one pooled row three ways divides the trials). That did
-NOT fix the thin ORIGIN rows, and more trials cannot: an accurate walk SETTLES into its
-destination bin after 1–2 passes, so a longer walk feeds the destination row (n = 139) while
-the origin row it departed keeps n = 1. Fixing that needs more RESTARTS, not longer walks —
-deferred, see docs/todo.md.
+NOTE: `horizon_s` is dead. It capped the wall clock of a sustained CORRECT loop that no
+longer exists — every action now goes through `action_walk!` or the tree, both bounded by
+pass count. Still accepted so older drivers keep working, but changing it does nothing.
+
+NOTE: raising the trial counts does not fix a thin ORIGIN row. An accurate walk settles
+into its destination bin after 1-2 passes, so a longer walk feeds the destination row while
+the origin row it departed stays thin. More restarts, not longer walks.
 """
 const CALIBRATION_EFFORT = (
     n_steps             = 120,
@@ -315,16 +231,12 @@ const CALIBRATION_EFFORT = (
 
 Does changing this θ field require re-measuring the transition kernels?
 
-⚠️ THIS DISTINCTION IS WORTH ~7 MINUTES PER θ. Some environment parameters enter T/O/R
-ANALYTICALLY and cost nothing to sweep; others change the orbital dynamics and force a full
-`calibrate_tables` run. Measured 2026-08-31:
+  - `field` / `θ` — a single field name, or a NamedTuple whose keys are checked
 
-  | θ field            | how it enters            | cost per θ |
-  |--------------------|--------------------------|------------|
-  | `sigma_nav_km`     | `observation_matrix`     | ~2 s       |
-  | `plume_gradient`   | `transition_matrix`      | ~2 s       |
-  | `noisy_thruster`   | RE-MEASURED kernels      | ~7 min     |
-  | `thruster_kwargs`  | RE-MEASURED kernels      | ~7 min     |
+Returns `true` for `:noisy_thruster` and `:thruster_kwargs`, which change the dynamics and
+force a full `calibrate_tables` run (minutes per θ). `sigma_nav_km` enters
+`observation_matrix` analytically and `plume_gradient` enters `transition_matrix`
+analytically, so both are seconds per θ and reuse the committed kernels.
 
 So a 3-value nav sweep is seconds and a 3-value thruster sweep is ~20 minutes. A sweep
 driver that does not know the difference either wastes 20 minutes or, worse, reuses stale
@@ -340,20 +252,21 @@ needs_recalibration(θ::NamedTuple) = any(needs_recalibration, keys(θ))
 
 Measure the transition kernels for the environment described by `config`.
 
-⚠️ THE CONFIG IS THE SINGLE OWNER OF θ (2026-08-31). This method reads `alt_edges`,
-`band_names`, `band_target_km`, `noisy_thruster` and `thruster_kwargs` FROM the config.
-Before this existed, `calibrate_tables` had its own keyword defaults for the same
-quantities and every driver hand-mapped the config across — with defaults that silently
-DISAGREED (`alt_edges` was `(20,30,40,50)` here vs `(20,27,34,44)` in the struct, and
-`band_target_km` `25/35/45` vs `23.5/30.5/46`). Calling it without the hand-mapping
-measured kernels keyed to bins the model does not use, and nothing errored.
+  - `config` — the scenario. θ is read from it: `alt_edges`, `band_names`,
+    `band_target_km`, `noisy_thruster`, `thruster_kwargs`
+  - `truth_eom!`, `truth_name` — the truth model to measure against, and its label
+  - remaining keywords — measurement effort, see [`CALIBRATION_EFFORT`](@ref)
 
-Remaining keywords are MEASUREMENT EFFORT (see [`CALIBRATION_EFFORT`](@ref)), not
-environment, plus `truth_eom!`.
+Returns `(rows, diagnostics)`: a `Dict{Symbol,Dict{KernelKey,CalibrationRow}}` per action,
+and the per-row diagnostics that [`tables_from_rows`](@ref) turns into an artifact.
 
     cfg  = StationkeepingPOMDP(; plume_gradient = 4.0)
     rows, diag = calibrate_tables(cfg; verbose = true)
-    write_tables(tables_from_rows(rows, diag); path = theta_path("tables", (plume_gradient = 4.0,)))
+    write_tables(tables_from_rows(rows, diag);
+                 path = theta_path("tables", (plume_gradient = 4.0,)))
+
+NOTE: prefer this method over the keyword-only one. The config is the single owner of θ, so
+there is nothing to hand-map and nothing to disagree.
 """
 function calibrate_tables(config::StationkeepingPOMDP;
                           truth_eom! = cr3bp_j2_eom!,
@@ -396,69 +309,46 @@ end
     calibrate_tables(; truth_eom!, n_steps, horizon_s, alt_edges, band_target_km,
                      mode, verbose) -> (rows, diagnostics)
 
-Low-level form. Measure all kernels and return them with a per-row diagnostics dict.
+Low-level form: measure all kernels against hand-specified bins, without a config.
 
-⚠️ PREFER THE `calibrate_tables(config)` METHOD. This one's `alt_edges` /
-`band_target_km` defaults are LEGACY and do not match `StationkeepingPOMDP`'s — calling it
-bare measures kernels for bins the model does not use. It stays public only so a
-measurement can be run against hand-specified bins without inventing a whole config.
+  - `truth_eom!` — truth model to measure against; defaults to [`cr3bp_j2_eom!`](@ref)
+  - `alt_edges`, `band_names`, `band_target_km` — θ, the discretization and aim points
+  - `noisy_thruster`, `thruster_kwargs` — whether and how burns execute with error
+  - `ic`, `period_s` — the reference orbit and its period (s)
+  - `mode` — targeting mode for the CORRECT burns
+  - `family_table` — prebuilt halo family for seeding; `nothing` uses the cached span
+  - remaining keywords — measurement effort, see [`CALIBRATION_EFFORT`](@ref)
 
-  - `truth_eom!` — the truth model to calibrate against. Defaults to
-    [`cr3bp_j2_eom!`](@ref) (CR3BP + Enceladus J2), which is the rung the committed
-    hand-transcribed tables were measured on, so the diff is apples-to-apples.
-  - `n_steps` — sustained-loop steps to log for the CORRECT rows.
-  - `mode` — targeting mode for `solve_burn`. `:position` is Strategy 3 proper and matches
-    how the kernels are defined; see caveat 4 above about its convergence.
-    ⚠️ Applies to the CORRECT burns only — `excurse_walk!` always uses
-    `:altitude_position`, which is why band delivery is ~0.2 km while `meta.mode` reads
-    `:position`.
+Returns `(rows, diagnostics)`.
+
+NOTE: prefer `calibrate_tables(config)`. This method's `alt_edges` / `band_target_km`
+defaults do not match `StationkeepingPOMDP`'s, so calling it bare measures kernels keyed to
+bins the model does not use — and nothing errors.
+
+NOTE: `mode` applies to the CORRECT burns only. Every EXCURSE uses `:altitude_position`
+regardless, which is why band delivery is ~0.2 km while `meta.mode` reads `:position`.
 """
 function calibrate_tables(;
     truth_eom! = cr3bp_j2_eom!,
     truth_name::AbstractString = "CR3BP + Enceladus J2",
-    # ── θ: THE ENVIRONMENT PARAMETERS ────────────────────────────────────────
-    # These are the axes a POMDP FAMILY is swept along (see the module header). The kernels
-    # this function returns ARE `T_θ`, so every θ needs its own `calibrate_tables` call.
+    # ── θ: the environment parameters ────────────────────────────────────────
+    # The kernels this function returns ARE `T_θ`, so every θ needs its own call.
     #
-    # `noisy_thruster` closes a real gap: until 2026-08-30 every burn here was applied
-    # PERFECTLY while the rollout harness routed ΔV through `apply_dv_noisy`, so the kernels
-    # described a perfect-thruster world and understated excursion risk badly. Measured over
-    # 12 seeds, holding a commanded band for 8 passes:
-    #
-    #   | band | kernel P(LOST), noise-free | actual, noisy thruster |
-    #   |------|---------------------------|------------------------|
-    #   | LOW  |                      0.19 |         1.00  (12/12)  |
-    #   | MID  |                     0.056 |         1.00  (12/12)  |
-    #   | HIGH |                      0.00 |         0.00  ( 0/12)  |
-    #
-    # A policy solved against the noise-free kernels therefore excurses freely and dies:
-    # 100% survival noise-free, 0/10 noisy. Set `noisy_thruster = true` to measure the
-    # environment the vehicle actually flies.
-    #
-    # ⚠️ NOISE-FREE IS STILL A LEGITIMATE θ, not a bug — it is the optimistic corner of the
-    # family and the reference the regret of every other θ is measured against. Keep it
-    # available; just do not mistake it for the deployment environment.
+    # Noise-free is the optimistic corner of the family and the reference other θ are
+    # measured against — a legitimate θ, but not the deployment environment. Turning noise
+    # on raises measured P(LOST) for the LOW and MID excursions sharply.
     noisy_thruster::Bool = false,
     rng::AbstractRNG = Xoshiro(0),
     thruster_kwargs::NamedTuple = NamedTuple(),
-    # ⚠️ SOUTH POLAR, ALWAYS (2026-08-31). The plumes are at Enceladus's SOUTH pole, so the
-    # science case only makes sense with periapsis over that hemisphere — and the plume
-    # gradient θ is meaningless on a north-polar orbit. This default used to be
-    # `PERIOD1_NORTH_IC_ND`, which repeatedly read as "we are measuring the wrong orbit".
-    #
-    # It was not actually wrong, and the reason is worth keeping: `PERIOD1_SOUTH_IC_ND =
-    # mirror_z(PERIOD1_NORTH_IC_ND)` is an EXACT z-reflection, both primaries are
-    # z-symmetric under CR3BP+J2, and every kernel here is keyed on periapsis ALTITUDE —
-    # which is reflection-invariant. So the two ICs give identical kernels (see halo_ic.jl:
-    # "every controller result measured on the north-polar IC transfers to this one
-    # unchanged"), and the seeded walks already used the south family table.
-    #
-    # Defaulting to south anyway, permanently, so the config STATES the science case instead
-    # of relying on a reader knowing the symmetry argument. Do not change this back.
+    # South-polar, because the plumes are at the south pole and the plume gradient θ is
+    # meaningless over the north. The north-polar member gives identical kernels — it is an
+    # exact z-reflection, the dynamics are z-symmetric, and every row is keyed on periapsis
+    # ALTITUDE, which the reflection preserves — but defaulting to south states the science
+    # case rather than relying on a reader knowing that.
     ic::AbstractVector{<:Real} = nondim_to_cr3bp(collect(PERIOD1_SOUTH_IC_ND)),
     period_s::Real = PERIOD1_TRIPLE_PERIOD_S,
     n_steps::Integer = 120,
-    # ⚠️ DEAD — see CALIBRATION_EFFORT. Recorded into meta, never read by the measurement.
+    # Dead — recorded into meta, never read by the measurement. See CALIBRATION_EFFORT.
     horizon_s::Real = 25 * 86400.0,
     alt_edges::NTuple{4,Float64} = (20.0, 30.0, 40.0, 50.0),
     band_names::NTuple{3,Symbol} = (:LOW, :MID, :HIGH),
@@ -468,11 +358,9 @@ function calibrate_tables(;
     excurse_trials::Integer = 8,
     family_table::Union{Nothing,Vector{NamedTuple}} = halo_family_table_cached(),
     seed_bins::Bool = true,
-    # ⚠️ SET SO EVERY ROW CLEARS `MIN_TRIALS_TRUSTED`, not by feel. A row measured from 3
-    # trials reads as a probability distribution but cannot distinguish a real one-third from
-    # a coin flip that landed that way, and the solver will exploit the difference as if it
-    # were signal. 8 CORRECT trials per bin plus the sustained loop's own visits, and
-    # 8 EXCURSE trials per (bin × band), is what puts all five rows above 20.
+    # Sized so rows clear `MIN_TRIALS_TRUSTED`. A row measured from a handful of trials
+    # reads as a distribution but cannot tell a real one-third from a coin flip that landed
+    # that way, and the solver will exploit the difference as if it were signal.
     seed_trials::Integer = 8,
     # EXCURSE seeding runs per (bin × band), so it multiplies out faster than the
     # CORRECT seeding and gets its own knob rather than sharing one.
@@ -492,7 +380,7 @@ function calibrate_tables(;
 )
     ic = collect(float.(ic))
     period_s = float(period_s)
-    one_rev_s = period_s / 3          # 3 periapsis passes per period-3 orbit
+    one_rev_s = period_s / 3          # `period_s` defaults to 3x the true period
 
     # Count-based apse search: `one_rev_s = T/3` is the inter-periapsis CONTROL cadence, not
     # an apse-to-apse revolution — as a search window it lands 0.136 s short of the first
@@ -500,51 +388,26 @@ function calibrate_tables(;
     r_peri_nom, r_apo_nom = next_apse_positions(ic; eom! = cr3bp_eom!)
     apo_nom_alt = norm(_enc_relative(r_apo_nom)) - R_ENCELADUS
 
-    # Bin by achieved periapsis ALTITUDE. ⚠️ This must stay bit-identical to `alt_bin`
-    # in states.jl, or the kernels are labelled with bins the model does not use.
-    # ⚠️ ONE binning implementation, shared with the model. This used to be a hand-copied
-    # inline closure carrying a comment that it "must stay bit-identical to `alt_bin` in
-    # states.jl" — so it now simply IS `alt_bin`. See states.jl for the edges-only method.
+    # Bin by achieved periapsis altitude, through the model's own `alt_bin` so there is one
+    # implementation rather than two that must stay bit-identical.
     bin_of(h) = alt_bin(alt_edges, h)
     alt_of(u) = norm(_enc_relative(u[1:3])) - R_ENCELADUS
 
-    # Apply a commanded ΔV the way the ENVIRONMENT does. Routed through the same
+    # Apply a commanded ΔV the way the environment does, through the same
     # `apply_dv`/`apply_dv_noisy` pair the rollout harness uses, so a kernel measured here
-    # and a rollout flown there cannot disagree about what the thruster does — which they
-    # silently did until 2026-08-30 (calibration perfect, rollout noisy).
+    # and a rollout flown there cannot disagree about what the thruster does.
     exec_dv(dv) = noisy_thruster ? apply_dv_noisy(dv, rng; thruster_kwargs...)[1] :
                                    apply_dv(dv)
 
-    # ⚠️ COLUMNS ARE THE JOINT (alt, residual) SUCCESSOR as of 2026-08-31, not the marginal
-    # altitude. A row now answers "given I am in this bin with this much orbit damage and
-    # take this action, where do I land AND how damaged am I then?" — the second half is
-    # what lets the policy learn that the first CORRECT after an excursion does not clear
-    # the damage and only the second one does.
+    # Columns are the JOINT (alt, residual) successor, so a row answers both "where do I
+    # land" and "how damaged am I then" — the second half is what lets the policy learn
+    # that the first CORRECT after an excursion does not clear the damage.
     cols = kernel_columns()
-    # ⚠️ KEYED PER BAND AS OF 2026-08-30. This replaces ONE pooled EXCURSE kernel.
+    # One kernel per EXCURSE action, not one pooled across bands: a kernel encodes where
+    # you LAND, and pooling makes the three excursions identical in T.
     #
-    # The old keys were just `(:CORRECT, :EXCURSE)`, on the exp-12 finding that excursion
-    # RISK did not differ by band — only ΔV did. True for the SAFETY question, and wrong for
-    # the SCIENCE question, because a kernel also encodes WHERE YOU LAND, which is the whole
-    # point of aiming at a band. The file's own note said to re-check it after the band
-    # rebase; this is that re-check.
-    #
-    # The measured consequence, from the artifact this replaces: the `A34_44` EXCURSE row
-    # (from the limit cycle) read 1/3 A20_27, 1/3 A27_34, 1/3 ABOVE_44 over n = 3. That is
-    # not "an excursion lands randomly" — it is the LOW walk landing in LOW, the MID walk in
-    # MID and the HIGH walk in HIGH, one trial each, POOLED. Aiming was measured, then
-    # averaged away.
-    #
-    # Why it stayed invisible: `action_dv_cost` gave the three actions distinct prices, so
-    # the policy looked like it was choosing among three excursions when it was really
-    # choosing among three prices. At `fuel_weight = 0` the reward spread across
-    # EXCURSE_{LOW,MID,HIGH} is exactly 0.0 and the action set is degenerate — no action
-    # raises P(landing in a deep band), so a plume-gradient θ cannot change behaviour.
-    #
-    # ⚠️ TRIAL COUNTS ARE DIVIDED, NOT MULTIPLIED. Splitting one pooled row into three gives
-    # each new row ~1/3 of the trials, so rows that previously cleared `MIN_TRIALS_TRUSTED`
-    # may no longer. Raise `excurse_trials` / `excurse_seed_trials` to compensate and CHECK
-    # `meta.trials` — a thin row is exactly what this file exists to make auditable.
+    # NOTE: per-band keying DIVIDES the trials rather than multiplying them, so rows that
+    # cleared `MIN_TRIALS_TRUSTED` under a pooled kernel may not. Check `meta.trials`.
     action_keys = (:CORRECT, (Symbol("EXCURSE_", b) for b in band_names)...)
     # counts[action][KernelKey(alt_from, residual_from)] -> Vector{Int} over kernel_columns()
     all_keys = kernel_keys_all()
@@ -569,51 +432,34 @@ function calibrate_tables(;
     bump!(a, from::KernelKey, to_alt::Symbol, to_res::Symbol = :R_OK) =
         counts[a][from][kernel_entry_index(to_alt, to_res)] += 1
 
-    # ── ONE WALKER FOR EVERY ACTION ────────────────────────────────────────────
-    # ⚠️ UNIFIED 2026-08-31. CORRECT used to be measured by a bespoke sustained loop
-    # (written out inline TWICE — once here, once in the bin-seeding block) while the
-    # EXCURSE actions went through a factored `excurse_walk!`. The two paths had drifted
-    # into different restart policies, different seeding loops and different trial knobs.
-    #
-    # THAT ASYMMETRY CAUSED A SUBSTANTIVE BUG, not just duplication. `excurse_walk!` WALKS,
-    # so damage accumulates across its passes and it naturally produced degraded-departure
-    # rows. The CORRECT paths only ever flew from pristine states — a healthy limit cycle,
-    # or a freshly-placed family member — so EVERY `CORRECT` row at `R_DEGRADED` /
-    # `R_CRITICAL` came back n = 0. That is precisely the recovery behaviour the residual
-    # dimension exists to model ("the first CORRECT does not clear the damage, the second
-    # does"), and it was the one thing the measurement could not see. The file already
-    # warned that "a hand-copied second loop is how the two would silently diverge"; they
-    # diverged.
-    #
-    # Now every action — CORRECT included — goes through `action_walk!`. The legitimate
-    # per-action differences survive as ARGUMENTS (targeting mode, aim point, success
-    # test), not as separate implementations.
+    # ── One walker for every action ────────────────────────────────────────────
+    # Every action, CORRECT included, goes through `action_walk!`. The legitimate per-action
+    # differences are arguments — targeting mode, aim point, success test — not separate
+    # implementations: a second hand-copied loop is how the two would silently diverge.
     st0, u0 = _to_peri(truth_eom!, ic, 4 * one_rev_s)
     base = st0 === :ok ? copy(u0) : copy(ic)
 
     """
         action_walk!(akey, start_state, n_trials; kwargs...)
-        action_walk!(pattern, start_state, n_trials; kwargs...)
 
-    Fly `n_trials` passes, restarting from `start_state` every `passes_per_restart`
-    passes, and log each pass into the kernel of whichever action flew it.
+    Fly `n_trials` passes of one action, restarting from `start_state` every
+    `passes_per_restart` passes, and book each pass into that action's kernel.
 
-    `akey` may be a single action (every pass flies it) or a PATTERN — a vector of actions
-    cycled over the walk. The pattern form is what measures an action departing from a
-    damage level that only ANOTHER action can produce; see `RECOVERY_PATTERNS`.
+      - `akey` — the action every pass flies
+      - `start_state` — the state each restart departs from (km, km/s)
+      - `n_trials` — total pass budget, spread over restarts
+      - `mode_` — `:position` aims at nominal apse position vectors (CORRECT);
+        `:altitude_position` commands the periapsis altitude (EXCURSE)
+      - `peri_tgt` — commanded periapsis altitude (km), for `:altitude_position`
+      - `rp`, `ra` — nominal periapsis / apoapsis position targets, for `:position`
+      - `band` — science band an EXCURSE aims at, or `nothing`; only used for the per-band
+        ΔV and achieved-altitude diagnostics
+      - `passes_per_restart` — passes flown before returning to `start_state`
 
-    The residual is carried ALONG the walk and reset on restart: it is the state of the
-    ORBIT, not of the pass, so a transition is booked under the damage the PREVIOUS pass
-    left behind. A fresh departure from a seed is undamaged by construction; pass 2 or 3
-    of a walk departs under whatever the earlier passes accumulated. That conditioning is
-    the whole reason the walk restarts rather than running once and long.
-
-      - `mode_` / `peri_tgt` / `ra` / `rp` — the targeting. `:position` aims at nominal
-        apse POSITION vectors (`rp`, `ra`) and is what CORRECT means; `:altitude_position`
-        commands the periapsis ALTITUDE (`peri_tgt`) and keeps the apoapsis position
-        constraints, which is what an EXCURSE means.
-      - `band` — the science band an EXCURSE aims at, or `nothing` for CORRECT. Only used
-        to accumulate the per-band ΔV / achieved-altitude diagnostics.
+    The residual is carried along the walk and reset on restart: it is the state of the
+    ORBIT, so a transition is booked under the damage the PREVIOUS pass left behind. A
+    fresh departure from a seed is undamaged by construction; later passes of a walk depart
+    under whatever the earlier ones accumulated.
     """
     function action_walk!(akey::Symbol, start_state, n_trials;
                           mode_::Symbol, peri_tgt = nothing,
@@ -621,32 +467,15 @@ function calibrate_tables(;
                           band = nothing,
                           passes_per_restart::Integer = EXCURSE_PASSES_PER_RESTART)
 
-        # ⚠️ RESTARTS, NOT ONE LONG WALK (fixed 2026-08-31). `walker` used to be initialised
-        # ONCE outside this loop and carried forward, so `n_trials` was a WALK LENGTH, not a
-        # trial count. An accurate excursion SETTLES — it reaches the commanded band on pass
-        # 1–2 and stays — so every later pass was recorded departing the DESTINATION bin and
-        # the origin row kept n = 1. That is why raising the trial counts 8 → 24 on
-        # 2026-08-30 changed nothing for the rows the policy leans on hardest
-        # (`EXCURSE_*` from the limit-cycle bin: "I am holding station, what if I dive?"),
-        # which read as 100% success off a single sample — the same shape as the thin-kernel
-        # bug that killed the OBSERVE action.
+        # Restarts, not one long walk. An accurate excursion SETTLES — it reaches the
+        # commanded band in a pass or two and stays — so a single long walk books every
+        # later pass as departing the DESTINATION bin and leaves the origin row at n = 1.
+        # Restarting spends the same pass budget on many fresh departures instead.
         #
-        # Now: restart from `start_state` every `passes_per_restart` passes, so each restart
-        # contributes a fresh DEPARTURE from the origin bin. `n_trials` is still the total
-        # pass budget, so cost is unchanged; the passes are just redistributed.
-        #
-        # The trade-off is real and is the reason for short walks rather than one pass per
-        # restart: `start_state` is a fresh PERIODIC family member, the most stable state in
-        # the system, so restarting understates divergence. That seeding bias is what
-        # corrupted the OBSERVE kernel. A few passes per restart sees whether the excursion
-        # actually survives while still producing many departures.
+        # A few passes per restart rather than one, because `start_state` is a periodic
+        # family member and the most stable state in the system: restarting understates
+        # divergence, so the later passes of each restart are what see a drifted departure.
         walker = copy(start_state)
-        # ⚠️ THE RESIDUAL IS CARRIED ALONG THE WALK and RESET on each restart, exactly like
-        # `walker` itself. It is the state of the ORBIT, so a fresh departure from the seed
-        # is by construction undamaged (`:R_OK`) while pass 2 or 3 of a walk departs under
-        # whatever damage the earlier passes accumulated. That is the conditioning the whole
-        # dimension exists to record — without it, both get booked to the same row and
-        # averaged, which is the defect being fixed.
         res_from = :R_OK
         for t in 1:n_trials
             # Fresh departure at the start of each restart block.
@@ -672,49 +501,34 @@ function calibrate_tables(;
                 continue
             end
 
-            # The ONE targeting difference between the actions, as an argument rather than
-            # a separate implementation. `:position` (CORRECT) aims at the nominal apse
-            # POSITION vectors; `:altitude_position` (EXCURSE) commands the periapsis
-            # ALTITUDE and keeps the apoapsis position constraints.
+            # The one targeting difference between the actions, as an argument rather than
+            # a separate implementation.
             b = mode_ === :altitude_position ?
                 solve_burn(sc, one_rev_s; eom! = cr3bp_eom!, mode = :altitude_position,
                            peri_target_km = peri_tgt, r_apo_nom = ra) :
                 solve_burn(sc, one_rev_s; eom! = cr3bp_eom!, mode = mode_,
                            r_peri_nom = rp, r_apo_nom = ra)
 
-            # ⚠️ THE SUCCESS TEST DIFFERS BY MODE, and both are documented caveats.
-            # In `:altitude_position` the total residual is dominated by the apoapsis
-            # POSITION block and never clears `TARGET_TOL_KM` from a drifted state, so
-            # `converged` would flag every excursion as failed; the delivery question is
-            # whether the COMMANDED ALTITUDE was met, which is `peri_err_km`. In
-            # `:position` there is no commanded altitude to check, and the ~8 km residual
-            # floor means `converged` reads false on almost every healthy pass — it is
-            # still the only signal available, so it is what gets counted.
+            # The success test differs by mode. In `:altitude_position` the total residual
+            # is dominated by the apoapsis-position block and never clears `TARGET_TOL_KM`
+            # from a drifted state, so `converged` would flag every excursion as failed;
+            # the delivery question is `peri_err_km`. In `:position` there is no commanded
+            # altitude to check and the residual floor means `converged` reads false on
+            # almost every healthy pass, but it is the only signal available.
             ok_ = mode_ === :altitude_position ?
                   (isfinite(b.peri_err_km) && b.peri_err_km < TARGET_TOL_KM) :
                   b.converged
             ok_ || (nonconv[akey][from] += 1)
 
-            # ⚠️ A LOST APSE PAIR IS A LOSS, AND IT MUST BE CHARGED TO *THIS* BIN.
+            # A lost apse pair is a LOSS, charged to THIS bin. When the onboard prediction
+            # cannot find the next apse pair, `solve_burn` returns a non-finite residual and
+            # ΔV = 0 and the pass flies uncontrolled. The vehicle is not yet outside the
+            # escape shell, so the coast below still reaches a periapsis — booking that as
+            # an ordinary transition hides the death and charges the eventual escape to
+            # whatever bin the vehicle fled to, which reads as "this excursion is free".
             #
-            # When the onboard prediction cannot find the next apse pair, `solve_burn`
-            # returns a non-finite residual and ΔV = 0 — the pass flies UNCONTROLLED. The
-            # spacecraft is not yet outside the escape shell, so the coast below still
-            # reaches a periapsis and the old code recorded that as an ordinary transition
-            # (typically to ABOVE_50), then charged the escape on the FOLLOWING pass to
-            # whatever bin the vehicle had fled to.
-            #
-            # That misattribution is not cosmetic — it is what made the kernel dangerous.
-            # Measured 2026-08-30, holding the commanded 25 km from the drifted limit cycle:
-            # passes 1 and 2 deliver 25.07 and 25.21 km, pass 3 loses the apse pair, and the
-            # vehicle is gone by pass 4 — EVERY time. Yet `EXCURSE/A20_30` came back with
-            # P(LOST) = 0.0 and a 71% self-transition, because the deaths were booked against
-            # ABOVE_50 (whose 0.667 LOST mass is largely these misattributions). The solved
-            # policy then chose EXCURSE_LOW three passes running and escaped at 5.3 d — it
-            # was behaving correctly given a kernel that told it low excursions are free.
-            #
-            # A control step with no control is a loss of the orbit at the bin where the
-            # decision was made, so record it there and stop the walk.
+            # A control step with no control is a loss at the bin where the decision was
+            # made, so record it there and end the walk.
             if !isfinite(b.residual_km) || b.dv_mag_ms == 0.0
                 bump!(akey, from, :LOST)
                 push!(dvs[akey][from], 0.0)
@@ -760,62 +574,37 @@ function calibrate_tables(;
 
     # ── THE ACTION TREE ────────────────────────────────────────────────────────
     """
-        tree_walk!(root_state, max_depth; cache) -> nothing
+        tree_walk!(root_state, max_depth, excurse_targets) -> (passes, nodes)
 
-    Enumerate EVERY action sequence up to `max_depth` from `root_state`, booking each pass
+    Enumerate every action sequence up to `max_depth` from `root_state`, booking each pass
     as one kernel sample.
 
-    ⚠️ THIS IS THE COVERAGE MECHANISM (2026-08-31), and it replaces two failed attempts.
-    A kernel row is `P(s' | s, a)`, so every reachable `(s, a)` needs visiting — but the
-    single-action walks only ever fly ONE action per walk, which structurally cannot reach
-    a state that another action produces. That is why every `CORRECT` row at `R_DEGRADED` /
-    `R_CRITICAL` came back n = 0: CORRECT alone is a stable limit cycle at ~8 km residual
-    and never damages its own orbit, so it can only DEPART degraded if something else
-    degraded it first. The fix is not a longer walk or a bigger trial count; it is to fly
-    the CROSS PRODUCT of actions.
+      - `root_state` — the state every sequence departs from (km, km/s)
+      - `max_depth` — sequence length; see [`TREE_DEPTH`](@ref) for the cost
+      - `excurse_targets` — commanded altitude per EXCURSE action, resolved before the
+        threaded region so the family table is not queried inside it
 
-    The two alternatives were tried and are worse:
-      * placing the vehicle at a target damage level — there is nothing to place. Damage is
-        a property of how far the orbit has drifted from what one impulse can fix, not a
-        location.
-      * perturbing a seed into a damaged state — breaks the onboard apse prediction and
-        books solver failures as deaths. Measured 2026-08-31 from the 30.5 km member with
-        identical targets: undispersed solves to residual 12.231 km / ΔV 1.884 m/s, while a
-        0.5 km / 0.5 m/s perturbation gives residual = Inf and ΔV = 0. Whole-run symptom was
-        CORRECT/A27_34/R_OK at P(LOST) = 0.471 — absurd, since correcting from a healthy mid
-        orbit is the safe baseline. NOT a stability problem: a dispersed CORRECT walk
-        survives at every scale tried and every seed altitude holds its own orbit for 8
-        passes. The orbit is fine; the PLANNER is what the perturbation breaks, and it fails
-        discontinuously, so shrinking the scale is not a fix.
+    Returns `(passes, nodes)`: passes flown and live nodes reached.
 
-    A tree needs neither: every node is a state the vehicle genuinely flew to, reached the
-    way it would actually reach it.
+    This is the coverage mechanism. A kernel row is `P(s' | s, a)`, so every reachable
+    `(s, a)` needs visiting — and a single-action walk structurally cannot reach a state
+    that a DIFFERENT action produces. CORRECT alone is a stable limit cycle and never
+    damages its own orbit, so `CORRECT` from a degraded departure only exists if something
+    else degraded it first. Flying the cross product is what reaches those rows.
 
-    ⚠️ PARALLELISED BREADTH-FIRST, IN TWO PHASES PER LEVEL (2026-08-31). Each level's
-    passes are independent — they share only their (already-computed) parent states — so
-    they are flown with `@threads` and their outcomes collected into a per-pass result
-    vector. NOTHING is booked during the parallel phase; the counts are folded in serially
-    afterwards. That keeps `bump!`/`push!` off the threaded path entirely, so no locking is
-    needed and, more importantly, the ARTIFACT IS BIT-IDENTICAL to a serial run: booking
-    order is fixed by the level's node ordering, not by which thread finishes first.
-    Julia must be started with `-t auto` (or `JULIA_NUM_THREADS`) for this to use more than
-    one core; with one thread it degenerates to the serial walk.
+    NOTE: parallelised breadth-first in two phases per level. Passes are flown with
+    `@threads` and NOTHING is booked during that phase; counts are folded in serially
+    afterwards, in the level's node order. So no locking is needed and the artifact is
+    bit-identical to a serial run. Start Julia with `-t auto` to use more than one core.
 
-    ⚠️ PREFIX SHARING IS EXACT ONLY BECAUSE THE DYNAMICS ARE DETERMINISTIC. A node's state
-    is fully determined by its action prefix, so the 4 children of a node all branch from
-    ONE parent state and a depth-d tree costs `(4^(d+1) - 4)/3` passes rather than
-    `d * 4^d`. With `noisy_thruster = true` that no longer holds — each node would need
-    several sampled children — so the cost model and this caching are both noise-free
-    assumptions.
+    NOTE: prefix sharing is exact only because the dynamics are deterministic — a node's
+    state is fully determined by its action prefix, so children branch from one parent
+    state. Under `noisy_thruster = true` each node would need several sampled children, and
+    both the cost model and this sharing stop holding.
 
-    ⚠️ COVERAGE IS REACHABILITY-WEIGHTED, NOT UNIFORM. States the vehicle passes through
-    often get many samples; states reachable only at depth > `max_depth` get none, and
-    `BELOW_20` / `ABOVE_44` may never appear at all from the nominal orbit. That is why the
-    family-member seeding below is RETAINED — placement at an altitude is legitimate and
-    was never the part that failed.
-
-    Pre-resolved EXCURSE targets are passed in as `excurse_targets` so the family table is
-    not queried inside the threaded region.
+    NOTE: coverage is reachability-weighted, not uniform. States the vehicle passes through
+    often get many samples; `BELOW_20` is not reached from the nominal orbit at all, which
+    is why the family-member seeding below is retained.
     """
     function tree_walk!(root_state, max_depth::Integer, excurse_targets)
         n_passes = 0
@@ -957,35 +746,18 @@ function calibrate_tables(;
                      ra = collect(r_apo_nom), band = band)
     end
 
-    # ── SEED EVERY ACTION FROM EVERY ALTITUDE BIN ──────────────────────────────
-    # ⚠️ WITHOUT SEEDING, A KERNEL DESCRIBES ONE BIN. Measured 2026-08-30: the primary walks
-    # all start from the IC limit cycle (~37 km) and, once `:altitude_position` made the aim
-    # accurate, they SETTLE — 8 passes commanded 35 km go 34.97, 34.95, 34.94 … and never
-    # leave the bin they started in. Rows are keyed by the bin a pass STARTS in, so covering
-    # them means starting passes in them. A working controller has no reason to visit
-    # BELOW_20 or ABOVE_44, yet the solver queries those states, and filling them with a
-    # guess would teach the policy something never measured.
+    # ── Seed every action from every altitude bin ──────────────────────────────
+    # Rows are keyed by the bin a pass STARTS in, so covering a bin means starting passes
+    # in it. The primary walks all depart the ~37 km limit cycle and, once the aim is
+    # accurate, they settle and never leave the bin they started in — so without seeding a
+    # kernel describes one bin. A working controller has no reason to visit `BELOW_20`, yet
+    # the solver queries those states, and filling them with a guess would teach the policy
+    # something never measured.
     #
-    # ⚠️ ONE LOOP FOR ALL ACTIONS (2026-08-31). This used to be TWO blocks — one seeding the
-    # EXCURSE walks per (bin × band), one seeding CORRECT per bin with its own hand-written
-    # copy of the burn/coast/book logic. Merging them is what finally measures CORRECT from
-    # a DEGRADED orbit: the shared walker accumulates damage across a restart block, so
-    # `CORRECT` now produces `R_DEGRADED` / `R_CRITICAL` departures the same way the
-    # excursions always did. Those rows were ALL n = 0 before, which meant the recovery
-    # behaviour the residual dimension exists to model was pure inference.
-    #
-    # ⚠️ AND THE LOW BINS ARE REACHABLE — the earlier read that they were not was wrong.
-    # Commanding 20 or 25 km from the 37 km limit cycle escapes, but that is the TRANSFER
-    # failing, not the destination: placed ON the 18/20/22/25/28 km family members and told
-    # to hold their own altitude, `:altitude_position` holds every one of them to ~0.09 km
-    # for 12 passes with real burns. `ABOVE_44` is the genuinely hard bin — 55 and 60 km
-    # escape by the third pass.
-    # ⚠️ SEEDS ARE SPREAD ACROSS EACH BIN, BUT NOT DISPERSED (2026-08-31). Sampling several
-    # ALTITUDES per bin is sound — a bin is a range, and one point should not stand in for
-    # it — and every sampled seed was checked to hold its own orbit for 8 passes. Adding a
-    # state-space PERTURBATION on top was tried and rejected: it breaks the onboard apse
-    # prediction rather than the orbit, so the kernel records solver failures as deaths.
-    # See `tree_walk!` for the measurements; reachability is handled by the tree instead.
+    # Seeds are spread across each bin (a bin is a range, and one point should not stand in
+    # for it) but never state-space DISPERSED: a perturbation breaks the onboard apse
+    # prediction rather than the orbit, so the kernel would record solver failures as
+    # deaths. Reachability is the tree's job instead.
     if seed_bins && family_table !== nothing
         for bin in ALT_BINS
             alts = _bin_sample_alts(bin, alt_edges, seed_samples)
@@ -1066,7 +838,7 @@ function calibrate_tables(;
             "seed_trials"         => seed_trials,
             "excurse_seed_trials" => excurse_seed_trials,
             "seed_bins"           => seed_bins,
-            # ⚠️ READ THIS BEFORE READING A TRIAL COUNT. With `seed_samples = 1` and a
+            # Read this before reading a trial count. With `seed_samples = 1` and a
             # noise-free thruster the environment is deterministic, so `n` counts
             # REPLICATES of one trajectory rather than samples from a distribution.
             "seed_samples"        => seed_samples,
@@ -1083,28 +855,27 @@ end
 
 The distribution to use for a row with `n = 0`, i.e. one the measurement never visited.
 
-⚠️ A SELF-TRANSITION FILL IS NOT NEUTRAL, AND IT BIT US TWICE (2026-08-31). Filling an
-unmeasured row with "you stay exactly where you are" hands the solver an action that is
-free, perfectly safe, and — because the coverage gate keys off the landed bin — often
-SCIENCE-BANKING as well. A solver maximising value will find that action and take it. This
-is the identical failure mode that killed the OBSERVE action (four rows measured as 100%
-self-transitions taught the policy that coasting was free; it coasted and escaped at
-3.78 d), and it reappeared the moment the residual split created 34 unmeasured rows: with
-a self-transition fill, `EXCURSE_LOW` from `A27_34/R_CRITICAL` looked like a safe +10.5
-while the measured `EXCURSE_MID` from the same state was a −157.5, so the policy chose the
-unmeasured one.
+The distribution to use for a row the measurement never visited.
 
-The fill therefore BACKS OFF ALONG THE DAMAGE AXIS instead: reuse the SAME action's
-measured row at the nearest LESS-DEGRADED residual bin. That is the conservative reading of
-the one monotonicity the measurements do support — more damage never makes an action safer
-(measured: `EXCURSE_LOW/A20_27` goes P(LOST) 0.000 → 0.000 → 1.000 across R_OK →
-R_DEGRADED → R_CRITICAL; `EXCURSE_MID/A27_34` goes 0.000 → 0.000 → 0.800). So inheriting
-the healthier bin's outcome UNDERSTATES the risk rather than fabricating safety, and it
-never invents a free action.
+  - `rows` — all measured rows, to donate from
+  - `action` — the action whose row is being filled
+  - `key` — the unmeasured (altitude, residual) conditioning
 
-If no less-degraded row was measured either, fall back to the self-transition — there is
-genuinely nothing to infer from — and rely on `meta.unmeasured_rows` to flag it. Such a row
-is not evidence, and a policy leaning on one means nothing.
+Returns a probability vector over [`kernel_columns`](@ref).
+
+The fill BACKS OFF ALONG THE DAMAGE AXIS: reuse the same action's measured row at the
+nearest less-degraded residual bin. That is the conservative reading of the one
+monotonicity the measurements support — more damage never makes an action safer — so it
+understates risk rather than fabricating safety.
+
+NOTE: do not "simplify" this to a self-transition. Filling an unmeasured row with "you
+stay where you are" hands the solver an action that is free, perfectly safe, and (because
+the coverage gate keys off the landed bin) often science-banking as well. A solver
+maximising value will find that action and take it.
+
+If no less-degraded row was measured either, it falls back to the self-transition because
+there is genuinely nothing to infer from. `meta.unmeasured_rows` flags those; a policy
+leaning on one means nothing.
 """
 function _fill_unmeasured_row(rows::Dict{Symbol,Dict{KernelKey,CalibrationRow}},
                               action::Symbol, key::KernelKey)
@@ -1125,22 +896,22 @@ end
     tables_from_rows(rows, diagnostics) -> AltTables
 
 Assemble measured [`CalibrationRow`](@ref)s into an [`AltTables`](@ref) ready for
-[`write_tables`](@ref). This is the step that was missing while `artifacts/tables.json`
-held hand-transcribed numbers: `calibrate_tables` measured the rows and nothing turned
-them into the artifact, so the numbers were copied across by hand and could drift from the
-run that produced them with nothing to detect it.
+[`write_tables`](@ref).
 
-⚠️ A ROW WITH `n = 0` IS NOT MEASURED. `calibrate_tables(seed_bins = true)` seeds a trial
-from every altitude bin precisely so this does not happen, but many (altitude × residual)
-combinations are simply not reachable — the vehicle cannot arrive at 18 km with a pristine
-solve after a violent transfer — so the residual split leaves ~34 of 60 rows empty. They
-are filled by [`_fill_unmeasured_row`](@ref), which inherits the same action's measured
-behaviour at the nearest LESS-DEGRADED damage bin rather than fabricating a self-transition;
-read that function's docstring before changing it, because the obvious fill is actively
-dangerous here. `meta.trials` records the count for every row so the fill is auditable
-rather than invisible. A policy is no more trustworthy than its least-visited row — check
-`meta.trials` against [`MIN_TRIALS_TRUSTED`](@ref) before believing what the policy does in
-a rarely-visited bin.
+  - `rows` — per-action measured rows from [`calibrate_tables`](@ref)
+  - `diagnostics` — the accompanying diagnostics dict, recorded into `meta`
+
+Returns an [`AltTables`](@ref) with θ, effort, per-row trial counts and the list of
+unmeasured rows in its metadata.
+
+NOTE: a row with `n = 0` is not measured. Seeding covers the bins a controller never
+visits, but many (altitude, residual) combinations are simply unreachable — the vehicle
+cannot arrive low with a pristine solve after a violent transfer. Those are filled by
+[`_fill_unmeasured_row`](@ref); read its docstring before changing the strategy, because
+the obvious fill is actively dangerous.
+
+NOTE: a policy is no more trustworthy than its least-visited row. Check `meta.trials`
+against [`MIN_TRIALS_TRUSTED`](@ref) before believing what a policy does in a rare bin.
 """
 function tables_from_rows(rows::Dict{Symbol,Dict{KernelKey,CalibrationRow}},
                           diagnostics::AbstractDict)
