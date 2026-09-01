@@ -127,12 +127,13 @@ covers the cross product of actions rather than one action at a time. That is wh
 
 Cost before pruning is `(|A|^(d+1) - |A|) / (|A| - 1)` passes — at |A| = 4, 1364 at depth 5
 and 21844 at depth 7. Escaping branches prune their whole subtree, so the flown count runs
-well under that. `experiments/calibrate.jl` takes the depth as its first argument.
+well under that: depth 7 flies ~10,800. `experiments/calibrate.jl` takes the depth as its
+first argument.
 
 NOTE: there is no resume path. The tree is bottom-heavy, so reusing a shallower one can
 never save more than ~1/|A| of the work; the frontier always has to be flown.
 """
-const TREE_DEPTH = 5
+const TREE_DEPTH = 7
 
 """Minimum trials before a measured row is anything but indicative.
 
