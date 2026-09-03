@@ -19,6 +19,52 @@ const DEFAULT_TABLES_PATH =
     normpath(joinpath(@__DIR__, "..", "artifacts", "tables.json"))
 
 """
+    tables_path_for(noisy_thruster, sigma_pct; dir = ...) -> String
+
+Artifact path for a kernel set measured under a given thruster noise level, so a noisy
+calibration cannot overwrite the noise-free `tables.json` and each σ gets its own file.
+
+  - `noisy_thruster` — whether burns executed with error during calibration
+  - `sigma_pct` — 1σ burn-magnitude error in percent; ignored when noise-free
+  - `dir` — directory holding the artifact (defaults to the packaged `artifacts/`)
+
+Returns an absolute path: `tables.json` when noise-free, else
+`tables_noisy_gaussian<sigma>.json` — e.g. `tables_noisy_gaussian2.0.json` at B-24
+Model 2, `tables_noisy_gaussian0.7.json` at Model 1.
+
+Pass `dir` to keep a sweep out of the package — the artifact only has to live in
+`artifacts/` if a git-URL dependent needs to resolve it from the package cache.
+"""
+function tables_path_for(noisy_thruster::Bool, sigma_pct::Real;
+                         dir::AbstractString = dirname(DEFAULT_TABLES_PATH))
+    noisy_thruster || return normpath(joinpath(dir, "tables.json"))
+    return normpath(joinpath(dir, string("tables_noisy_gaussian", float(sigma_pct), ".json")))
+end
+
+"""
+    tables_path_for(config; dir = ...) -> String
+
+Artifact path implied by a config's thruster settings — the form both `calibrate.jl` and
+the model layer use, so the file a calibration WRITES is the file a solve READS.
+"""
+tables_path_for(config::StationkeepingPOMDP;
+                dir::AbstractString = dirname(DEFAULT_TABLES_PATH)) =
+    tables_path_for(config.noisy_thruster, config.thruster_sigma_pct; dir = dir)
+
+"""
+    resolve_tables_path(config) -> String
+
+The artifact a config should load kernels from: `config.tables_path` when set, else the
+path implied by its thruster settings ([`tables_path_for`](@ref)).
+
+NOTE: this is why a noisy config does not silently read the NOISE-FREE kernels. Before it
+existed, every consumer fell back to `DEFAULT_TABLES_PATH`, so forgetting `tables_path`
+solved a noisy θ against noise-free measurements with no error anywhere.
+"""
+resolve_tables_path(config::StationkeepingPOMDP) =
+    something(config.tables_path, tables_path_for(config))
+
+"""
     KernelKey
 
 The conditioning of one measured row: which altitude bin the pass departed from, and how
@@ -199,6 +245,19 @@ Returns an [`AltTables`](@ref). Throws if the artifact predates the current form
 altitude ordering, column convention or residual edges disagree with the model, or if any
 row is not a normalized distribution — a silent mismatch would corrupt every transition.
 """
+function load_tables(config::StationkeepingPOMDP)
+    path = resolve_tables_path(config)
+    isfile(path) || error(
+        "no measured kernels at $path for this config " *
+        (config.noisy_thruster ?
+            "(noisy, $(config.thruster_sigma_pct)% 1-sigma)" : "(noise-free)") *
+        ". A thruster-noise level is a RECALIBRATION axis — measure it first:\n" *
+        "    julia --project=experiments -t 1 experiments/calibrate.jl 7" *
+        (config.noisy_thruster ? " $(config.thruster_sigma_pct)" : "") * "\n" *
+        "or set `tables_path` explicitly to reuse an artifact from elsewhere.")
+    return load_tables(path)
+end
+
 function load_tables(path::AbstractString = DEFAULT_TABLES_PATH)
     isfile(path) || error("measured tables not found at $path — run the calibration " *
                           "step (experiments/calibrate.jl) to generate them")

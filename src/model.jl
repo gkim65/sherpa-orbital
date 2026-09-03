@@ -17,17 +17,16 @@ Assemble the science/safety stationkeeping POMDP.
 
 Returns a `QuickPOMDP` over `SKState`.
 
-    using SherpaOrbital, NativeSARSOP
+    using SherpaOrbital, SARSOP
     pomdp  = build_pomdp(StationkeepingPOMDP(; r_science = 40.0))
-    policy = solve(SARSOPSolver(; precision = 1e-3, use_binning = false), pomdp)
+    policy = solve(SARSOP.SARSOPSolver(; precision = 1e-3, timeout = 900.0), pomdp)
 
-NOTE: `use_binning = false` is required for NativeSARSOP on this model — see `visit_cap`
-in `StationkeepingPOMDP.jl`.
+NOTE: solve with SARSOP.jl, not NativeSARSOP — the latter stops early on this model
+without raising, see `experiments/example.jl`.
 """
 function build_pomdp(config::StationkeepingPOMDP = StationkeepingPOMDP();
                      tables::Union{Nothing,AltTables} = nothing)
-    tbl = tables === nothing ?
-        load_tables(something(config.tables_path, DEFAULT_TABLES_PATH)) : tables
+    tbl = tables === nothing ? load_tables(config) : tables
 
     S = states(config)
     A = actions(config)
@@ -76,7 +75,6 @@ or checking a hand-edited artifact.
 """
 function model_tables(config::StationkeepingPOMDP = StationkeepingPOMDP();
                       tables::Union{Nothing,AltTables} = nothing)
-    tbl = tables === nothing ?
-        load_tables(something(config.tables_path, DEFAULT_TABLES_PATH)) : tables
+    tbl = tables === nothing ? load_tables(config) : tables
     return transition_matrix(config, tbl), observation_matrix(config)
 end
