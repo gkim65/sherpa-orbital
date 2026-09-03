@@ -339,6 +339,71 @@ function SARSOPController(policy_data::AbstractDict;
 end
 
 """
+    SARSOPController(policy, config; ref_ic = nothing, sigma_nav_km = config.sigma_nav_km,
+                     retarget_bands = false, family_table = nothing, tables = nothing)
+
+Build a controller from a SOLVED POLICY OBJECT plus the config describing the environment
+to fly it in. No JSON.
+
+  - `policy` — an `AlphaVectorPolicy`, either straight from `solve` or read back by
+    `SARSOP.load_policy(pomdp, "<stem>.out")`
+  - `config` — the environment to FLY IN. `T`/`O` and every label come from here, so this
+    need NOT be the config the policy was solved against
+  - `tables` — measured kernels; `nothing` resolves them from `config`
+  - `sigma_nav_km` — defaults to `config.sigma_nav_km`, unlike the Dict method whose
+    default is the `SIGMA_NAV_POS` constant regardless of config
+  - remaining keywords as for the Dict method
+
+Returns a [`SARSOPController`](@ref) ready for [`run_rollout`](@ref).
+
+This is the cross-θ primitive: pass a policy solved at θ_i with a config at θ_j and the
+belief filter runs on θ_j's dynamics, which is what a regret matrix cell is. Prefer it over
+[`export_policy`](@ref) + [`load_policy`](@ref), which serializes the DENSE `T[s][a][s']`
+(|S|^2 |A| floats — gigabytes at |S| = 5627), parses it back, and then has its `T`/`O`
+overwritten anyway.
+
+NOTE: only `|S|` is checked. Alpha vectors are indexed by state ENUMERATION ORDER, so a
+`config` whose states enumerate differently at the same `|S|` misindexes silently and
+yields a plausible, meaningless result. Sharing `S`/`A`/`O` across a θ family — which the
+regret formulation requires anyway — is what makes this safe.
+"""
+function SARSOPController(policy, config::StationkeepingPOMDP;
+                          ref_ic::Union{Nothing,AbstractVector{<:Real}} = nothing,
+                          sigma_nav_km::Real = config.sigma_nav_km,
+                          retarget_bands::Bool = false,
+                          family_table::Union{Nothing,Vector{NamedTuple}} = nothing,
+                          tables::Union{Nothing,AltTables} = nothing)
+    tbl   = tables === nothing ? load_tables(config) : tables
+    S     = states(config)
+    A     = actions(config)
+    alphas_v, alpha_acts = alpha_vectors(policy, collect(A))
+
+    length(first(alphas_v)) == length(S) || error(
+        "policy has length-$(length(first(alphas_v))) alpha vectors but this config has " *
+        "|S| = $(length(S)) — it was solved against a different state space")
+
+    belief = zeros(Float64, length(S))
+    belief[state_index(config)[SKState(config.correct_bin,
+                                       _zero_visits(config), 1, :R_OK)]] = 1.0
+    band_names = String.(collect(config.band_names))
+
+    return SARSOPController(
+        state_label.(S), [string(s.alt) for s in S], [collect(s.visits) for s in S],
+        [string(s.residual) for s in S], collect(RESIDUAL_EDGES),
+        String.(collect(A)), String.(observations(config)),
+        collect(config.alt_edges), band_names, String.(collect(config.band_bins)),
+        config.visit_cap,
+        Dict{String,Float64}(string(k) => Float64(v) for (k, v) in config.band_target_km),
+        reduce(vcat, (reshape(α, 1, :) for α in alphas_v)), alpha_acts,
+        transition_matrix(config, tbl), observation_matrix(config),
+        ref_ic === nothing ? nothing : collect(float.(ref_ic)),
+        float(sigma_nav_km), retarget_bands, family_table,
+        belief, zeros(Int, length(band_names)), "R_OK", "", nothing, nothing, NaN,
+        Dict{String,Tuple{Vector{Float64},Vector{Float64}}}(),
+    )
+end
+
+"""
     policy_residual_bin(c, residual_km) -> String
 
 Bin a live onboard `solve_burn` residual (km) using the EXPORTED edges.
@@ -633,16 +698,19 @@ periapsis approach, triggered at the descending `CONTROL_ALT_KM` shell.
   - `noisy_thruster` — execute ΔV through [`apply_dv_noisy`](@ref) rather than
     [`apply_dv`](@ref). **Default `false`** — see below.
 
-    NOTE: the default is `false` to MATCH THE KERNELS. The committed kernels are
+    NOTE: the default is `false` to MATCH THE DEFAULT KERNELS. `artifacts/tables.json` is
     calibrated noise-free (`meta.theta.noisy_thruster`), so a noisy rollout of a policy
-    solved against them is mismatched — the policy acts on a transition model that
-    understates execution error. The effect is not cosmetic: noisy runs miss their science
-    bands badly and sit deep in `R_CRITICAL`. Set this `true` deliberately, ideally against
-    kernels calibrated the same way.
+    solved against THOSE is mismatched — the policy acts on a transition model that
+    understates execution error. Set this `true` deliberately, and against kernels
+    calibrated the same way (`artifacts/tables_noisy_gaussian2.0.json` is the B-24 Model 2
+    pair). The severe mismatch symptom on record — missing the science bands badly and
+    sitting deep in `R_CRITICAL` — was measured under a since-removed unphysical uniform
+    law that overstated execution error by roughly 5x.
 
-    NOTE: the noisy path uses an unphysical error law unless told otherwise. With empty
-    `thruster_kwargs`, `apply_dv_noisy` takes the `:uniform` law — see `thruster.jl`. For a
-    quoted noisy result pass `(model = :gaussian_pct, sigma_pct = 2.0)`.
+  - `thruster_sigma_pct` — 1σ burn-magnitude error in percent, forwarded to
+    [`apply_dv_noisy`](@ref); ignored when `noisy_thruster = false`. Must MATCH the value
+    the kernels were calibrated at (`meta.theta.thruster_sigma_pct`), or the policy is
+    flown under a law it was not solved against.
   - `max_steps` — hard cap on control steps (safety guard; outcome `:max_steps`).
 
 Returns a NamedTuple with the SAME fields for every baseline, so a comparison table needs
@@ -682,9 +750,11 @@ function run_rollout(
     period_s::Real,
     horizon_s::Real;
     rng::AbstractRNG = Xoshiro(0),
-    # Default false so the rollout matches the kernels, which are measured noise-free — a
-    # noisy rollout of a policy solved against them tests a mismatch, not the policy.
+    # Default false to match the DEFAULT kernels (`artifacts/tables.json`, measured
+    # noise-free). Set it true together with the matching `thruster_sigma_pct` and the
+    # kernels calibrated at that sigma; noisy-here-but-noise-free-kernels tests a mismatch.
     noisy_thruster::Bool = false,
+    thruster_sigma_pct::Real = THRUSTER_SIGMA_PCT_B24_MODEL2,
     rtol_truth::Real = RTOL_TRUTH,
     atol_truth::Real = ATOL_TRUTH,
     max_steps::Integer = 2000,
@@ -782,8 +852,9 @@ function run_rollout(
         extra.converged || (n_failed_solves += 1)
 
         # 3. Execute it.
-        dv_applied, eta_eff = noisy_thruster ? apply_dv_noisy(dv_cmd, rng) :
-                                               (apply_dv(dv_cmd), 1.0)
+        dv_applied, eta_eff = noisy_thruster ?
+            apply_dv_noisy(dv_cmd, rng; sigma_pct = thruster_sigma_pct) :
+            (apply_dv(dv_cmd), 1.0)
         dv_ms = norm(dv_applied) * 1.0e3
         total_dv_ms += dv_ms
         dv_ms > 0.0 && (n_burns += 1)

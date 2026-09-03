@@ -6,10 +6,10 @@ revolution) and stationkeeps without ground contact, trading science (sampling a
 periapsis altitudes) against safety (not crashing or escaping an orbit that must be
 actively held). See README.md for how this relates to MacKenzie's period-3 science orbit.
 
-    using SherpaOrbital, NativeSARSOP
+    using SherpaOrbital, SARSOP
 
     pomdp  = build_pomdp(StationkeepingPOMDP(; r_science = 40.0))
-    policy = solve(SARSOPSolver(; precision = 1e-3), pomdp)
+    policy = solve(SARSOP.SARSOPSolver(; precision = 1e-3), pomdp)
     print_policy_table(policy)
 
 The library is solver-agnostic: no solver is a dependency, so `experiments/` chooses one.
@@ -147,8 +147,8 @@ export
     # baselines — truth-model-agnostic (the truth EOM is an argument)
     run_mpc,
     # spacecraft models (stochastic; explicit rng, never the global one)
-    ETA_EFF_MIN,
-    ETA_EFF_MAX,
+    THRUSTER_SIGMA_PCT_B24_MODEL1,
+    THRUSTER_SIGMA_PCT_B24_MODEL2,
     apply_dv,
     apply_dv_noisy,
     sample_eta_eff,
@@ -212,6 +212,8 @@ export
     N_KERNEL_COLS,
     load_tables,
     write_tables,
+    tables_path_for,
+    resolve_tables_path,
     validate_tables,
     # export + reporting
     export_policy,

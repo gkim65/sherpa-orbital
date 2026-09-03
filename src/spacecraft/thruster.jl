@@ -23,11 +23,6 @@ Every sampler takes an explicit `rng` and never touches the global RNG, so a rol
 stochastic stream is a function of its own seed alone.
 """
 
-# Uniform burn-efficiency bounds (original spec: "sample halo IC +
-# eta_eff ~ Uniform(0.8, 1.0)").
-const ETA_EFF_MIN = 0.8
-const ETA_EFF_MAX = 1.0
-
 """
     apply_dv(dv_commanded) -> Vector{Float64}
 
@@ -45,39 +40,28 @@ const THRUSTER_SIGMA_PCT_B24_MODEL1 = 0.7
 const THRUSTER_SIGMA_PCT_B24_MODEL2 = 2.0
 
 """
-    sample_eta_eff(rng; model, sigma_pct, eta_min, eta_max) -> Float64
+    sample_eta_eff(rng; sigma_pct) -> Float64
     sample_eta_eff(rng, n; kwargs...) -> Vector{Float64}
 
-Draw one (or `n`) burn-efficiency samples.
+Draw one (or `n`) burn-efficiency samples from a symmetric `η ~ N(1, sigma_pct/100)`.
 
   - `rng` — random stream to draw from
   - `n` — number of samples; the scalar method returns a single draw
-  - `model` — `:uniform` for `η ~ U(eta_min, eta_max)`, or `:gaussian_pct` for a symmetric
-    `η ~ N(1, sigma_pct/100)`
-  - `sigma_pct` — 1σ magnitude error in percent, for `:gaussian_pct`
-  - `eta_min`, `eta_max` — bounds for `:uniform` (dimensionless)
+  - `sigma_pct` — 1σ magnitude error in percent; defaults to B-24 Model 2 (2.0)
 
-Returns a dimensionless efficiency. `:gaussian_pct` is clamped at 0 so a >5σ draw cannot
-reverse the burn direction.
+Returns a dimensionless efficiency, clamped at 0 so a >5σ draw cannot reverse the burn
+direction.
 
-NOTE: `:uniform` is the default and every noisy burn in-tree uses it. It is not physical —
-`U(0.8, 1.0)` is 0-20% underburn, mean 10% short and never over, against Exhibit B-24's
-symmetric 0.7%/2.0% 1σ. `:gaussian_pct` implements B-24 but nothing in-tree selects it:
-`thruster_kwargs` is the intended route and `run_rollout` does not forward it.
+The law is Cassini in-flight maneuver error (MacKenzie et al. 2020, Exhibit B-24) and is
+the only one available, so an unqualified `noisy_thruster = true` is always physical.
+`sigma_pct` is set from `StationkeepingPOMDP.thruster_sigma_pct`, which both
+[`calibrate_tables`](@ref) and [`run_rollout`](@ref) forward here.
 """
 function sample_eta_eff(
     rng::AbstractRNG;
-    model::Symbol = :uniform,
     sigma_pct::Real = THRUSTER_SIGMA_PCT_B24_MODEL2,
-    eta_min::Real = ETA_EFF_MIN,
-    eta_max::Real = ETA_EFF_MAX,
 )
-    if model === :uniform
-        return eta_min + (eta_max - eta_min) * rand(rng)
-    elseif model === :gaussian_pct
-        return max(0.0, 1.0 + (float(sigma_pct) / 100) * randn(rng))
-    end
-    throw(ArgumentError("unknown thruster model $model; expected :uniform or :gaussian_pct"))
+    return max(0.0, 1.0 + (float(sigma_pct) / 100) * randn(rng))
 end
 
 sample_eta_eff(rng::AbstractRNG, n::Integer; kwargs...) =
@@ -92,8 +76,8 @@ Noisy-execution ΔV application: `ΔV_applied = ΔV_commanded · η_eff`.
   - `rng` — random stream for the η_eff draw; ignored when `eta_eff` is given
   - `eta_eff` — optional fixed efficiency (dimensionless) instead of a random draw, for
     deterministic tests
-  - remaining keywords are forwarded to [`sample_eta_eff`](@ref) to select the noise law
-    (`model`, `sigma_pct`, `eta_min`, `eta_max`)
+  - remaining keywords are forwarded to [`sample_eta_eff`](@ref) — in practice `sigma_pct`,
+    the 1σ magnitude error in percent
 
 Returns `(dv_applied, eta_eff)` — the applied ΔV (km/s) and the dimensionless efficiency
 that produced it.

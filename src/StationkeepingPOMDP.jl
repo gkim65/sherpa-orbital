@@ -59,9 +59,10 @@ km/s, m/s (ΔV costs), matching the Python truth model's conventions.
 - `noisy_thruster`: whether burns execute with error. `false` applies commanded ΔV exactly;
   `true` routes through `apply_dv_noisy`. NOTE: recalibration axis — changing it requires
   re-running `calibrate_tables`, unlike `sigma_nav_km`/`plume_gradient` which are analytic.
-- `thruster_kwargs`: forwarded to `sample_eta_eff` to pick the error law — `model`
-  (`:uniform` | `:gaussian_pct`), `sigma_pct`, `eta_min`, `eta_max`. See `thruster.jl` for
-  which law is defensible and which is the default.
+- `thruster_sigma_pct`: 1σ burn-magnitude error in percent (B-24 Model 2 = 2.0,
+  Model 1 = 0.7). The execution-error sweep axis. NOTE: recalibration axis — a new value
+  needs its own `calibrate_tables` run; the artifact path follows it, see
+  `tables_path_for`.
 - `plume_gradient`: θ, the altitude-gradient strength of plume intensity (slope of a linear
   tilt in band depth). 0 = no gradient, all bands identical. See `plume.jl`.
 - `plume_levels`: k, the number of observed intensity levels. 1 disables the dimension.
@@ -129,14 +130,10 @@ Base.@kwdef struct StationkeepingPOMDP
     # |A| and the reward structure untouched.
     band_target_km::Dict{Symbol,Float64} =
         Dict(:LOW => 23.5, :MID => 30.5, :HIGH => 46.0)
-    # NOTE: solve with `use_binning = false` (see `experiments/example.jl`).
-    # NativeSARSOP's `entropy(::SparseVector)` does not guard the `p log p` term and
-    # iterates the structural sparsity pattern, which holds entries at exactly 0.0 —
-    # `observation_matrix` gives every live state 0.0 in the CRASHED and LOST columns. That
-    # yields a NaN entropy and an `InexactError: Int64(NaN)`. Binning is a belief-grouping
-    # search heuristic, so disabling it changes the exploration bookkeeping, not the POMDP
-    # or its solution. Detuning `visit_cap` or `r_science` also silences the error, by
-    # changing which beliefs get explored; that changes the problem being solved.
+    # NOTE: this cap interacts with the solver. Detuning it (or `r_science`) changes
+    # which beliefs get explored, and so changes the problem being solved — do not tune it
+    # to make a solver behave. Use SARSOP.jl, which solves this model as posed; see
+    # `experiments/example.jl` for why NativeSARSOP does not.
     visit_cap::Int                  = 4
     # Altitude bin the CORRECT limit cycle settles in (37.17 km, 96% of passes in
     # 36-38 km). Not in `band_bins`, so `excursion_bands` gives all three science bands an
@@ -145,15 +142,24 @@ Base.@kwdef struct StationkeepingPOMDP
 
     # -- noise hyperparameters (swept) ----------------------------------------
     sigma_nav_km::Float64           = 2.0
-    # Whether calibration burns execute with error. `thruster_kwargs` forwards to
-    # `sample_eta_eff` (`model`, `sigma_pct`, `eta_min`, `eta_max`) to pick the error law.
+    # Whether calibration burns execute with error, and at what 1σ magnitude error.
     #
     # NOTE: recalibration axis — changing either forces a fresh `calibrate_tables` run, see
-    # `needs_recalibration`. Turning noise on raises measured P(LOST) for the LOW and MID
-    # excursions sharply. Noise-free is the optimistic corner of the family, not the
+    # `needs_recalibration`. Noise-free is the optimistic corner of the family, not the
     # deployment environment.
+    #
+    # What noise actually costs, at the default B-24 Model 2 law: survival barely moves
+    # (per-row P(lost or crashed) shifts by -0.008 to +0.104), but the successor
+    # distribution moves a lot — total-variation distance exceeds 0.10 on 24 of 60 rows.
+    # The mechanism is that burns stop REPAIRING the orbit, not that they crash it:
+    # EXCURSE_HIGH from A34_44|R_DEGRADED arrives R_OK 100% of the time noise-free but only
+    # 40% at 2%, so damage accumulates into R_CRITICAL, where P(lost) really is ~0.7. The
+    # sharp across-the-board P(LOST) rise on record came from a since-removed uniform law.
     noisy_thruster::Bool            = false
-    thruster_kwargs::NamedTuple     = NamedTuple()
+    # 1σ burn-magnitude error in percent. THE sweep knob for execution error: set it to
+    # anything, then re-run `experiments/calibrate.jl` to measure kernels at that level.
+    # Defaults to B-24 Model 2 (2.0); Model 1 is 0.7.
+    thruster_sigma_pct::Float64     = THRUSTER_SIGMA_PCT_B24_MODEL2
     # Slope of a linear tilt in band depth, centered on the mean depth over `ALT_BINS`; see
     # `plume.jl` for the functional form. 0 makes every bin's intensity distribution
     # identical and uniform; rising values shift intensity toward the deeper bins and away

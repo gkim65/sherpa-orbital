@@ -28,7 +28,7 @@ are at 95 km and 49 km, both above these bands, and give no yield-vs-altitude ta
 uncertainty is the point of the sweep; do not cite Cassini as if it pinned θ.
 
 NOTE: θ enters `transition_matrix` analytically, so a sweep over it needs no
-recalibration — only `noisy_thruster`/`thruster_kwargs` do. See `needs_recalibration`.
+recalibration — only `noisy_thruster`/`thruster_sigma_pct` do. See `needs_recalibration`.
 
 NOTE: intensity is observed, not hidden. It is what the instrument measured, so it enters
 the state as an observed dimension and does not complicate the belief.

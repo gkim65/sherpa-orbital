@@ -234,7 +234,7 @@ Does changing this θ field require re-measuring the transition kernels?
 
   - `field` / `θ` — a single field name, or a NamedTuple whose keys are checked
 
-Returns `true` for `:noisy_thruster` and `:thruster_kwargs`, which change the dynamics and
+Returns `true` for `:noisy_thruster` and `:thruster_sigma_pct`, which change the dynamics and
 force a full `calibrate_tables` run (minutes per θ). `sigma_nav_km` enters
 `observation_matrix` analytically and `plume_gradient` enters `transition_matrix`
 analytically, so both are seconds per θ and reuse the committed kernels.
@@ -244,7 +244,7 @@ driver that does not know the difference either wastes 20 minutes or, worse, reu
 kernels for a dynamics-changing θ.
 """
 needs_recalibration(field::Symbol) =
-    field in (:noisy_thruster, :thruster_kwargs)
+    field in (:noisy_thruster, :thruster_sigma_pct)
 needs_recalibration(θ::NamedTuple) = any(needs_recalibration, keys(θ))
 
 """
@@ -254,7 +254,7 @@ needs_recalibration(θ::NamedTuple) = any(needs_recalibration, keys(θ))
 Measure the transition kernels for the environment described by `config`.
 
   - `config` — the scenario. θ is read from it: `alt_edges`, `band_names`,
-    `band_target_km`, `noisy_thruster`, `thruster_kwargs`
+    `band_target_km`, `noisy_thruster`, `thruster_sigma_pct`
   - `truth_eom!`, `truth_name` — the truth model to measure against, and its label
   - remaining keywords — measurement effort, see [`CALIBRATION_EFFORT`](@ref)
 
@@ -289,7 +289,7 @@ function calibrate_tables(config::StationkeepingPOMDP;
         band_names      = config.band_names,
         band_target_km  = config.band_target_km,
         noisy_thruster  = config.noisy_thruster,
-        thruster_kwargs = config.thruster_kwargs,
+        thruster_sigma_pct = config.thruster_sigma_pct,
         # ── effort + truth model ──────────────────────────────────────────────
         truth_eom!          = truth_eom!,
         truth_name          = truth_name,
@@ -314,7 +314,8 @@ Low-level form: measure all kernels against hand-specified bins, without a confi
 
   - `truth_eom!` — truth model to measure against; defaults to [`cr3bp_j2_eom!`](@ref)
   - `alt_edges`, `band_names`, `band_target_km` — θ, the discretization and aim points
-  - `noisy_thruster`, `thruster_kwargs` — whether and how burns execute with error
+  - `noisy_thruster`, `thruster_sigma_pct` — whether burns execute with error, and the 1σ
+    magnitude error in percent
   - `ic`, `period_s` — the reference orbit and its period (s)
   - `mode` — targeting mode for the CORRECT burns
   - `family_table` — prebuilt halo family for seeding; `nothing` uses the cached span
@@ -340,7 +341,7 @@ function calibrate_tables(;
     # on raises measured P(LOST) for the LOW and MID excursions sharply.
     noisy_thruster::Bool = false,
     rng::AbstractRNG = Xoshiro(0),
-    thruster_kwargs::NamedTuple = NamedTuple(),
+    thruster_sigma_pct::Real = THRUSTER_SIGMA_PCT_B24_MODEL2,
     # South-polar, because the plumes are at the south pole and the plume gradient θ is
     # meaningless over the north. The north-polar member gives identical kernels — it is an
     # exact z-reflection, the dynamics are z-symmetric, and every row is keyed on periapsis
@@ -397,7 +398,8 @@ function calibrate_tables(;
     # Apply a commanded ΔV the way the environment does, through the same
     # `apply_dv`/`apply_dv_noisy` pair the rollout harness uses, so a kernel measured here
     # and a rollout flown there cannot disagree about what the thruster does.
-    exec_dv(dv) = noisy_thruster ? apply_dv_noisy(dv, rng; thruster_kwargs...)[1] :
+    exec_dv(dv) = noisy_thruster ?
+        apply_dv_noisy(dv, rng; sigma_pct = thruster_sigma_pct)[1] :
                                    apply_dv(dv)
 
     # Columns are the JOINT (alt, residual) successor, so a row answers both "where do I
@@ -595,8 +597,16 @@ function calibrate_tables(;
 
     NOTE: parallelised breadth-first in two phases per level. Passes are flown with
     `@threads` and NOTHING is booked during that phase; counts are folded in serially
-    afterwards, in the level's node order. So no locking is needed and the artifact is
-    bit-identical to a serial run. Start Julia with `-t auto` to use more than one core.
+    afterwards, in the level's node order. So no locking is needed. Start Julia with
+    `-t auto` to use more than one core.
+
+    NOTE: bit-identical to a serial run ONLY when `noisy_thruster = false`. The serial fold
+    fixes the booking order, but under noise `exec_dv` draws from a single shared `rng`
+    inside the threaded phase, so the draw ORDER varies with thread interleaving and
+    `rng_seed` does not pin the result. Runs then differ in which rows get measured at all:
+    at `(model = :gaussian_pct, sigma_pct = 2.0)`, depth 7, a `-t auto` run and a `-t 1`
+    run left 11 and 8 rows unmeasured respectively from the same seed. Calibrate a noisy
+    artifact with `-t 1` when it needs to be reproducible.
 
     NOTE: prefix sharing is exact only because the dynamics are deterministic — a node's
     state is fully determined by its action prefix, so children branch from one parent
@@ -820,7 +830,9 @@ function calibrate_tables(;
         # θ, recorded so an artifact is self-describing: a kernel set is only meaningful
         # together with the environment it was measured in.
         "noisy_thruster"     => noisy_thruster,
-        "thruster_kwargs"    => Dict(string(k) => v for (k, v) in pairs(thruster_kwargs)),
+        # `nothing` when noise-free: burns applied ΔV exactly, so no σ was in effect and
+        # recording one would imply a law this artifact was not measured under.
+        "thruster_sigma_pct" => noisy_thruster ? thruster_sigma_pct : nothing,
         "band_target_km"     => Dict(string(b) => band_target_km[b] for b in band_names),
         "mode"               => string(mode),
         "alt_edges"          => collect(alt_edges),
@@ -953,7 +965,7 @@ function tables_from_rows(rows::Dict{Symbol,Dict{KernelKey,CalibrationRow}},
             # kernels were actually measured against. The artifact is the record.
             "truth_eom"       => get(diagnostics, "truth_name", "unknown"),
             "noisy_thruster"  => get(diagnostics, "noisy_thruster", false),
-            "thruster_kwargs" => get(diagnostics, "thruster_kwargs", Dict{String,Any}()),
+            "thruster_sigma_pct" => get(diagnostics, "thruster_sigma_pct", nothing),
             "band_target_km"  => get(diagnostics, "band_target_km", Dict{String,Any}()),
             "alt_edges"       => get(diagnostics, "alt_edges", Float64[]),
         ),
