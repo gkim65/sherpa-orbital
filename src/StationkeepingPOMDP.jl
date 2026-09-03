@@ -155,11 +155,14 @@ Base.@kwdef struct StationkeepingPOMDP
     # EXCURSE_HIGH from A34_44|R_DEGRADED arrives R_OK 100% of the time noise-free but only
     # 40% at 2%, so damage accumulates into R_CRITICAL, where P(lost) really is ~0.7. The
     # sharp across-the-board P(LOST) rise on record came from a since-removed uniform law.
-    noisy_thruster::Bool            = false
+    # DEFAULT IS NOISY, at B-24 Model 1. Execution error is the deployment environment,
+    # not an option — noise-free is the optimistic corner of the family and is kept
+    # reachable (`noisy_thruster = false`) for the mismatch-free reference only.
+    noisy_thruster::Bool            = true
     # 1σ burn-magnitude error in percent. THE sweep knob for execution error: set it to
     # anything, then re-run `experiments/calibrate.jl` to measure kernels at that level.
-    # Defaults to B-24 Model 2 (2.0); Model 1 is 0.7.
-    thruster_sigma_pct::Float64     = THRUSTER_SIGMA_PCT_B24_MODEL2
+    # Model 1 (0.7) is the default; Model 2 is 2.0.
+    thruster_sigma_pct::Float64     = THRUSTER_SIGMA_PCT_B24_MODEL1
     # Slope of a linear tilt in band depth, centered on the mean depth over `ALT_BINS`; see
     # `plume.jl` for the functional form. 0 makes every bin's intensity distribution
     # identical and uniform; rising values shift intensity toward the deeper bins and away

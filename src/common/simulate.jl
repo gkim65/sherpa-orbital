@@ -696,21 +696,18 @@ periapsis approach, triggered at the descending `CONTROL_ALT_KM` shell.
     `noisy_thruster = true` or the controller draws observations; defaults to a fresh
     `Xoshiro(0)` so a caller cannot accidentally consume global RNG state.
   - `noisy_thruster` — execute ΔV through [`apply_dv_noisy`](@ref) rather than
-    [`apply_dv`](@ref). **Default `false`** — see below.
-
-    NOTE: the default is `false` to MATCH THE DEFAULT KERNELS. `artifacts/tables.json` is
-    calibrated noise-free (`meta.theta.noisy_thruster`), so a noisy rollout of a policy
-    solved against THOSE is mismatched — the policy acts on a transition model that
-    understates execution error. Set this `true` deliberately, and against kernels
-    calibrated the same way (`artifacts/tables_noisy_gaussian2.0.json` is the B-24 Model 2
-    pair). The severe mismatch symptom on record — missing the science bands badly and
-    sitting deep in `R_CRITICAL` — was measured under a since-removed unphysical uniform
-    law that overstated execution error by roughly 5x.
+    [`apply_dv`](@ref). **Default `true`** — execution error is the deployment
+    environment, so the default rollout is the realistic one.
 
   - `thruster_sigma_pct` — 1σ burn-magnitude error in percent, forwarded to
-    [`apply_dv_noisy`](@ref); ignored when `noisy_thruster = false`. Must MATCH the value
-    the kernels were calibrated at (`meta.theta.thruster_sigma_pct`), or the policy is
-    flown under a law it was not solved against.
+    [`apply_dv_noisy`](@ref); ignored when `noisy_thruster = false`. Defaults to B-24
+    Model 1 (0.7), matching `StationkeepingPOMDP`.
+
+    NOTE: this must equal the value the KERNELS were calibrated at
+    (`meta.theta.thruster_sigma_pct`), or the policy is flown under a law it was not
+    solved against and the run measures a model mismatch rather than the policy. The
+    defaults here and on the config are the same value for exactly that reason — change
+    one and you must change the other.
   - `max_steps` — hard cap on control steps (safety guard; outcome `:max_steps`).
 
 Returns a NamedTuple with the SAME fields for every baseline, so a comparison table needs
@@ -750,11 +747,11 @@ function run_rollout(
     period_s::Real,
     horizon_s::Real;
     rng::AbstractRNG = Xoshiro(0),
-    # Default false to match the DEFAULT kernels (`artifacts/tables.json`, measured
-    # noise-free). Set it true together with the matching `thruster_sigma_pct` and the
-    # kernels calibrated at that sigma; noisy-here-but-noise-free-kernels tests a mismatch.
-    noisy_thruster::Bool = false,
-    thruster_sigma_pct::Real = THRUSTER_SIGMA_PCT_B24_MODEL2,
+    # Defaults MATCH `StationkeepingPOMDP`'s, so a bare rollout flies the same law the
+    # default kernels were measured under. Change one and you must change the other, or
+    # the rollout measures a model mismatch instead of the policy.
+    noisy_thruster::Bool = true,
+    thruster_sigma_pct::Real = THRUSTER_SIGMA_PCT_B24_MODEL1,
     rtol_truth::Real = RTOL_TRUTH,
     atol_truth::Real = ATOL_TRUTH,
     max_steps::Integer = 2000,
