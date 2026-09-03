@@ -2,7 +2,7 @@
 
 julia_version = "1.12.6"
 manifest_format = "2.0"
-project_hash = "be7da677b2b709ea99e0683fff44de328471ead6"
+project_hash = "91a3b47670878f255c6b8c629532d26d7e5b2317"
 
 [[deps.ADTypes]]
 deps = ["PrecompileTools"]
@@ -961,12 +961,6 @@ version = "1.1.4"
 git-tree-sha1 = "90914795fc59df44120fe3fff6742bb0d7adb1d0"
 uuid = "d9ec5142-1e00-5aa0-9d6a-321866360f50"
 version = "0.14.3"
-
-[[deps.NativeSARSOP]]
-deps = ["LinearAlgebra", "POMDPTools", "POMDPs", "Printf", "SparseArrays"]
-git-tree-sha1 = "69c4360bbb43a3cd149de308be6d5c1f4b526634"
-uuid = "a07c76ea-660d-4c9a-8028-2e6dbd212cb8"
-version = "0.1.4"
 
 [[deps.NetworkOptions]]
 uuid = "ca575930-c2e3-43a9-ace4-1e988b2c1908"

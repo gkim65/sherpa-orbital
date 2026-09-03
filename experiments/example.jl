@@ -9,7 +9,7 @@ field with a literal default (see src/StationkeepingPOMDP.jl).
 =#
 
 using SherpaOrbital
-using NativeSARSOP
+using SARSOP
 using POMDPs
 
 # ── Scenario ─────────────────────────────────────────────────────────────────
@@ -22,22 +22,23 @@ print_model_summary(config)
 # ── Solve ────────────────────────────────────────────────────────────────────
 pomdp  = build_pomdp(config)
 
-# ⚠️ `use_binning = false` IS REQUIRED, not a tuning choice. With the default `true`,
-# NativeSARSOP throws `InexactError: Int64(NaN)` on this model. Diagnosed 2026-08-30: its
-# `entropy(::SparseVector)` method omits the `p > 0` guard that the dense method has, and
-# the belief update leaves observation-zeroed entries in the sparsity pattern at exactly
-# 0.0, so `0.0 * log(0.0) = NaN` flows into `get_interval_idx`. Belief binning is the only
-# caller of `entropy`, so disabling it avoids the bug entirely. Binning is a search
-# heuristic for grouping near-duplicate beliefs — switching it off costs some speed and
-# changes neither the POMDP nor the solution. Full write-up in `StationkeepingPOMDP.jl`
-# beside `visit_cap`.
+# NOTE: use SARSOP.jl (the C++ wrapper), NOT NativeSARSOP, on this model. NativeSARSOP
+# fails SILENTLY — no error is raised. Its Fast Informed Bound initialises the upper bound
+# at 133.66, BELOW the true optimum of ~144.48, so the precision gap is negative from the
+# first iteration and the search stops after 4 iterations with 22 alpha vectors. The
+# result is identical at every θ, which is what makes it easy to mistake for a converged
+# solve in a sweep.
 #
-# `max_time = 120` because the unbinned search is slower; measured, it converges in ~63 s
-# with 1991 alpha vectors, so this is headroom rather than a truncation.
-solver = SARSOPSolver(; precision = 1e-3, max_time = 120.0, verbose = false,
-                      use_binning = false)
+# NativeSARSOP also needs `use_binning = false` on this model or it throws
+# `InexactError: Int64(NaN)`: its `entropy(::SparseVector)` omits the `p > 0` guard the
+# dense method has, and observation-zeroed entries left in the sparsity pattern make
+# `0.0 * log(0.0)`. Moot here, but it is a second reason the wrapper is the path.
+#
+# SARSOP.jl's keyword is `timeout`, not `max_time`. Most of the wall clock is pomdpx
+# serialisation of a 5627-state model, not search.
+solver = SARSOP.SARSOPSolver(; precision = 1e-3, timeout = 900.0, verbose = false)
 
-println("\nSolving with NativeSARSOP ...")
+println("\nSolving with SARSOP ...")
 t_solve = @elapsed (policy = solve(solver, pomdp))
 println("  solved in $(round(t_solve, digits = 3)) s")
 

@@ -6,8 +6,15 @@ discretization, the alpha vectors and the T/O tables, so a consumer can reproduc
 greedy policy query and the discrete belief filter without re-deriving the model or
 knowing the enumeration order. [`SARSOPController`](@ref) is the in-tree consumer.
 
-NOTE: exported policies are gitignored — they are large and derived. Only
-`artifacts/tables.json`, the measured input, is committed.
+NOTE: exported policies are gitignored — they are large and derived. Only the measured
+kernels are committed: `artifacts/tables.json` (noise-free) and one
+`artifacts/tables_noisy_gaussian<sigma>.json` per calibrated thruster-noise level.
+
+NOTE: this JSON carries the DENSE `T[s][a][s']` — |S|^2 |A| floats, gigabytes at
+|S| = 5627 — so it is an archive format, not a hot path. To solve and fly in one process,
+take the alpha vectors off the policy object; to reload a solve, read SARSOP.jl's own
+`<stem>.out` via `SARSOP.load_policy(pomdp, path)`, which is ~6x smaller and needs no
+parsing of T/O that the config already determines.
 """
 
 const DEFAULT_POLICY_PATH =
@@ -84,15 +91,14 @@ Write a solved policy plus the model tables it was solved against to JSON.
 
 Returns the path written.
 
-    policy = solve(SARSOPSolver(; use_binning = false), build_pomdp(cfg))
+    policy = solve(SARSOP.SARSOPSolver(; precision = 1e-3), build_pomdp(cfg))
     export_policy(policy, cfg)
 """
 function export_policy(policy, config::StationkeepingPOMDP = StationkeepingPOMDP();
                        path::AbstractString = DEFAULT_POLICY_PATH,
                        tables::Union{Nothing,AltTables} = nothing,
                        meta::AbstractDict = Dict{String,Any}())
-    tbl = tables === nothing ?
-        load_tables(something(config.tables_path, DEFAULT_TABLES_PATH)) : tables
+    tbl = tables === nothing ? load_tables(config) : tables
 
     S = states(config)
     A = actions(config)

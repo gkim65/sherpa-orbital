@@ -1,7 +1,11 @@
 #=
 calibrate.jl — MEASURE the transition kernels and write artifacts/tables.json.
 
-    julia --project=experiments -t auto experiments/calibrate.jl [tree_depth]
+    julia --project=experiments -t auto experiments/calibrate.jl [tree_depth] [sigma_pct]
+
+The artifact path FOLLOWS the config (`tables_path_for`): noise-free writes `tables.json`,
+`sigma_pct = 2.0` writes `tables_noisy_gaussian2.0.json`. So a noisy run never clobbers the
+noise-free kernels, and each noise level gets its own file for a sweep.
 
 This is the generator for `artifacts/tables.json`. Before 2026-08-30 that artifact held
 hand-transcribed numbers and this step did not exist, so the committed kernels could drift
@@ -10,7 +14,13 @@ space, the bands, the orbit, or the truth model changes — the kernels are cond
 all four.
 
 ⚠️ `-t auto` MATTERS. The action tree is threaded (see `tree_walk!`); single-threaded it
-still works and gives BIT-IDENTICAL output, just several times slower.
+still works, just several times slower (measured at depth 7: 181 s threaded, 364 s serial).
+
+NOTE: the two give BIT-IDENTICAL output only for a NOISE-FREE config. Under
+`noisy_thruster = true` the threaded walk draws from a shared RNG, so `rng_seed` does not
+pin the artifact and successive runs disagree about which rows are measured — see the
+reproducibility NOTE on `tree_walk!`. Use `-t 1` for a noisy artifact meant to be
+reproduced.
 
 ⚠️ THE DEPTH IS AN ARGUMENT, so exploring it never needs a throwaway script. It used to be
 reachable only by editing `CALIBRATION_EFFORT`, which is why depth experiments kept getting
@@ -33,7 +43,12 @@ using Statistics: median, mean
 # ── Scenario ─────────────────────────────────────────────────────────────────
 # Must match the StationkeepingPOMDP config the policy will be solved against: the kernels
 # are keyed by altitude bin, so different edges mean different rows.
-config = StationkeepingPOMDP()
+#
+# Pass a 1σ burn-magnitude error in percent as the second argument to measure under
+# execution noise: `2.0` is B-24 Model 2, `0.7` is Model 1. Omitted means noise-free.
+sigma_pct = length(ARGS) >= 2 ? parse(Float64, ARGS[2]) : nothing
+config = sigma_pct === nothing ? StationkeepingPOMDP() :
+    StationkeepingPOMDP(; noisy_thruster = true, thruster_sigma_pct = sigma_pct)
 
 tree_depth = length(ARGS) >= 1 ? parse(Int, ARGS[1]) : CALIBRATION_EFFORT.tree_depth
 
@@ -44,6 +59,9 @@ println("  bands          : ", config.band_names, " -> ", config.band_bins,
         "  commanded(km)=", [config.band_target_km[b] for b in config.band_names])
 println("  rows/action    : ", length(kernel_keys_all()),
         " (alt x residual)   columns: ", length(kernel_columns()), " joint (alt, residual)")
+println("  thruster       : ", config.noisy_thruster ?
+        string("noisy, ", config.thruster_sigma_pct, "% 1-sigma") : "noise-free")
+println("  writes         : ", tables_path_for(config))
 println("  tree depth     : ", tree_depth, "   threads: ", Threads.nthreads())
 println()
 
@@ -178,5 +196,8 @@ if !isempty(unmeasured)
     println("    The policy's behaviour in those bins is not supported by measurement.")
 end
 
-path = write_tables(tables)
+# Path is DERIVED from the thruster law, so a noisy run cannot overwrite the noise-free
+# `tables.json` — the two are not interchangeable and the filename is the only thing a
+# downstream `tables_path =` has to go on.
+path = write_tables(tables; path = tables_path_for(config))
 println("\nWrote kernels -> $path")
