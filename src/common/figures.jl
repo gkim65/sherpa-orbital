@@ -404,3 +404,113 @@ function plot_sweep(rows, key::Symbol;
     end
     return fig
 end
+
+"""
+    plot_sweep_timelines(rows, key; path, theme, xlabel, arms, seed, size)
+
+Cumulative science over the horizon, one panel per swept value.
+
+  - `rows` — checkpoints from [`load_sweep`](@ref)
+  - `key` — the swept field, e.g. `:sigma_nav_km`
+  - `path` — output path WITHOUT extension; writes `.pdf`, `.svg` and `.png`
+  - `theme` — `:light` or `:dark`; saved transparent so either background works
+  - `xlabel` — x-axis label for the shared time axis
+  - `arms` — which arms to draw, in legend order; `nothing` uses every arm present
+  - `seed` — which seed's trace to draw per cell; `nothing` draws the median-science seed
+
+Returns the Makie `Figure`. Requires CairoMakie to be loaded by the caller.
+
+Shows WHEN a controller diverges rather than only where it ended: a run lost mid-horizon
+stops at its loss time and is marked, so a panel distinguishes "earned less" from "died
+trying". Reads the stored `science_cum` trace, so it needs no re-flying.
+"""
+function plot_sweep_timelines(rows, key::Symbol;
+                              path::AbstractString = "figures/sweep_timelines",
+                              theme::Symbol = :light,
+                              xlabel::AbstractString = "Time (days)",
+                              arms = nothing,
+                              seed::Union{Nothing,Integer} = nothing,
+                              size::Union{Nothing,Tuple{Int,Int}} = nothing)
+    Makie = get(Base.loaded_modules,
+                Base.PkgId(Base.UUID("13f3f980-e62b-5c42-98c6-ff1f3baf88f0"), "CairoMakie"),
+                nothing)
+    Makie === nothing && error(
+        "plot_sweep_timelines needs CairoMakie loaded by the caller: `using CairoMakie` " *
+        "before calling. The library declares no plotting dependency.")
+
+    k = String(key)
+    vals = sort(unique(Float64(r[k]) for r in rows if haskey(r, k)))
+    isempty(vals) && error("no checkpoints carrying the field $key")
+    all_arms = unique(r["arm"] for r in rows)
+    draw = arms === nothing ? all_arms : [a for a in arms if a in all_arms]
+
+    fg = theme === :dark ? Makie.RGBf(0.92, 0.92, 0.92) : Makie.RGBf(0.10, 0.10, 0.10)
+    palette = [Makie.RGBf(0.00, 0.45, 0.70), Makie.RGBf(0.90, 0.62, 0.00),
+               Makie.RGBf(0.00, 0.62, 0.45), Makie.RGBf(0.80, 0.47, 0.65),
+               Makie.RGBf(0.84, 0.37, 0.00), Makie.RGBf(0.35, 0.35, 0.35),
+               Makie.RGBf(0.58, 0.44, 0.86), Makie.RGBf(0.00, 0.62, 0.79)]
+
+    figsize = size === nothing ? (260 * length(vals) + 150, 300) : size
+    fig = Makie.Figure(; size = figsize, backgroundcolor = :transparent,
+                       fonts = (; regular = "CMU Serif", bold = "CMU Serif Bold"))
+
+    # Shared y limit so panels are comparable by eye rather than each self-scaling.
+    ymax = maximum(maximum(Float64.(r["science_cum"]); init = 0.0)
+                   for r in rows if r["arm"] in draw && !isempty(r["science_cum"]))
+    axes = Makie.Axis[]
+
+    for (vi, v) in enumerate(vals)
+        ax = Makie.Axis(fig[1, vi];
+                        xlabel = xlabel,
+                        ylabel = vi == 1 ? "Cumulative science reward" : "",
+                        title = "$k = $v",
+                        backgroundcolor = :transparent,
+                        xgridvisible = false, ygridvisible = true,
+                        titlecolor = fg, xlabelcolor = fg, ylabelcolor = fg,
+                        xticklabelcolor = fg, yticklabelcolor = fg,
+                        leftspinecolor = fg, bottomspinecolor = fg,
+                        topspinevisible = false, rightspinevisible = false,
+                        xtickcolor = fg, ytickcolor = fg)
+        push!(axes, ax)
+
+        for (ai, arm) in enumerate(draw)
+            cell = filter(r -> r["arm"] == arm && haskey(r, k) && Float64(r[k]) == v, rows)
+            isempty(cell) && continue
+            # One trace per panel: the requested seed, else the median-science seed, so a
+            # panel shows a REAL run rather than an average of runs that ended at
+            # different times.
+            pick = if seed === nothing
+                cell[sortperm([Float64(r["science"]) for r in cell])[cld(length(cell), 2)]]
+            else
+                idx = findfirst(r -> Int(r["seed"]) == seed, cell)
+                idx === nothing ? first(cell) : cell[idx]
+            end
+            t, y = Float64.(pick["t_days"]), Float64.(pick["science_cum"])
+            (isempty(t) || isempty(y)) && continue
+            n = min(length(t), length(y))
+            col = palette[mod1(ai, length(palette))]
+            sty = occursin("MPC", arm) ? :dash : :solid
+            Makie.lines!(ax, t[1:n], y[1:n]; color = col, linewidth = 2, linestyle = sty,
+                         label = vi == 1 ? arm : nothing)
+            # A lost run ends where it died; the marker says the curve STOPPED rather than
+            # flattened, which a truncated line alone does not distinguish.
+            if !Bool(pick["survived"])
+                Makie.scatter!(ax, [t[n]], [y[n]]; color = col, marker = :xcross,
+                               markersize = 11)
+            end
+        end
+        Makie.ylims!(ax, 0, ymax * 1.05)
+        vi == 1 || Makie.hideydecorations!(ax; grid = false)
+    end
+    Makie.linkaxes!(axes...)
+
+    Makie.Legend(fig[1, length(vals) + 1], first(axes); framevisible = false,
+                 labelcolor = fg, labelsize = 11, patchsize = (18.0f0, 10.0f0))
+    Makie.colsize!(fig.layout, length(vals) + 1, Makie.Auto(false))
+
+    mkpath(dirname(path))
+    for ext in ("pdf", "svg", "png")
+        Makie.save("$path.$ext", fig; backgroundcolor = :transparent)
+    end
+    return fig
+end
