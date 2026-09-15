@@ -261,3 +261,146 @@ function plot_baseline_comparison(runs, config::StationkeepingPOMDP;
     end
     return fig
 end
+
+"""
+    sweep_summary(rows, key) -> Vector{NamedTuple}
+
+Aggregate sweep checkpoints into one row per (arm, swept value).
+
+  - `rows` — checkpoints from [`load_sweep`](@ref)
+  - `key` — the swept field name, e.g. `:sigma_nav_km`
+
+Returns `(arm, value, n, science, science_sd, frac_degraded, survival, misbin, dv,
+samples)`, sorted by arm then value. `survival` is the fraction of seeds that neither
+crashed nor escaped; `misbin` is the measured observed-versus-true bin disagreement rate,
+which is the mechanism a nav sweep is testing.
+
+NOTE: reads only fields `save_rollout` writes, so a sweep does not need re-flying to add a
+metric here.
+"""
+function sweep_summary(rows, key::Symbol)
+    k = String(key)
+    cells = Dict{Tuple{String,Float64},Vector{Dict{String,Any}}}()
+    for r in rows
+        haskey(r, k) || continue
+        push!(get!(cells, (r["arm"], Float64(r[k])), Dict{String,Any}[]), r)
+    end
+    out = NamedTuple[]
+    for ((arm, v), rs) in cells
+        sci = [Float64(r["science"]) for r in rs]
+        # Misbin is per pass, pooled over the cell's rollouts rather than averaged per
+        # rollout, so a short (lost) run does not weigh as much as a full one.
+        mis = 0; nb = 0
+        for r in rs, (t, o) in zip(get(r, "true_bins", String[]), get(r, "obs_bins", String[]))
+            (isempty(t) || isempty(o)) && continue
+            nb += 1; t == o || (mis += 1)
+        end
+        push!(out, (arm = arm, value = v, n = length(rs),
+                    science = mean(sci),
+                    science_sd = length(sci) < 2 ? 0.0 : std(sci),
+                    frac_degraded = mean(Float64(r["frac_degraded"]) for r in rs),
+                    survival = mean(Bool(r["survived"]) for r in rs),
+                    misbin = nb == 0 ? NaN : mis / nb,
+                    dv = mean(Float64(r["total_dv_ms"]) for r in rs),
+                    samples = mean(Float64(r["n_samples"]) for r in rs)))
+    end
+    return sort(out, by = r -> (r.arm, r.value))
+end
+
+"""
+    plot_sweep(rows, key; path, theme, xlabel, panels, size)
+
+Plot a parameter sweep: one line per controller, the swept value on x.
+
+  - `rows` — checkpoints from [`load_sweep`](@ref)
+  - `key` — the swept field, e.g. `:sigma_nav_km`
+  - `path` — output path WITHOUT extension; writes `.pdf`, `.svg` and `.png`
+  - `theme` — `:light` or `:dark`; saved transparent so either background works
+  - `xlabel` — x-axis label; defaults to the field name
+  - `panels` — which metrics to stack, from `(:science, :frac_degraded, :survival,
+    :misbin, :dv, :samples)`
+
+Returns the Makie `Figure`. Requires CairoMakie to be loaded by the caller.
+
+Science carries a ±1sd band across seeds. This answers whether a ranking measured at one
+theta survives the sweep, which a single-run time series cannot.
+
+    using SherpaOrbital, CairoMakie
+    plot_sweep(load_sweep("artifacts/sweeps/sigma_nav_km"), :sigma_nav_km;
+               path = "figures/nav_sweep", xlabel = "Navigation error sigma (km)")
+"""
+function plot_sweep(rows, key::Symbol;
+                    path::AbstractString = "figures/sweep",
+                    theme::Symbol = :light,
+                    xlabel::AbstractString = String(key),
+                    panels = (:science, :frac_degraded, :survival, :misbin),
+                    size::Tuple{Int,Int} = (700, 200 * length(panels) + 60))
+    Makie = get(Base.loaded_modules,
+                Base.PkgId(Base.UUID("13f3f980-e62b-5c42-98c6-ff1f3baf88f0"), "CairoMakie"),
+                nothing)
+    Makie === nothing && error(
+        "plot_sweep needs CairoMakie loaded by the caller: `using CairoMakie` before " *
+        "calling. The library declares no plotting dependency.")
+
+    summ = sweep_summary(rows, key)
+    isempty(summ) && error("no checkpoints carrying the field $key")
+
+    fg = theme === :dark ? Makie.RGBf(0.92, 0.92, 0.92) : Makie.RGBf(0.10, 0.10, 0.10)
+    palette = [Makie.RGBf(0.00, 0.45, 0.70), Makie.RGBf(0.90, 0.62, 0.00),
+               Makie.RGBf(0.00, 0.62, 0.45), Makie.RGBf(0.80, 0.47, 0.65),
+               Makie.RGBf(0.84, 0.37, 0.00), Makie.RGBf(0.35, 0.35, 0.35),
+               Makie.RGBf(0.58, 0.44, 0.86), Makie.RGBf(0.00, 0.62, 0.79)]
+    LABEL = Dict(:science => "Science reward", :frac_degraded => "Fraction of passes\ndegraded",
+                 :survival => "Survival rate", :misbin => "Region misbin rate",
+                 :dv => "Total dV (m/s)", :samples => "Samples banked")
+
+    fig = Makie.Figure(; size = size, backgroundcolor = :transparent,
+                       fonts = (; regular = "CMU Serif", bold = "CMU Serif Bold"))
+    arms = unique(r.arm for r in summ)
+    axes = Makie.Axis[]
+
+    for (pi, p) in enumerate(panels)
+        last_panel = pi == length(panels)
+        ax = Makie.Axis(fig[pi, 1];
+                        xlabel = last_panel ? xlabel : "",
+                        ylabel = get(LABEL, p, String(p)),
+                        backgroundcolor = :transparent,
+                        xgridvisible = false, ygridvisible = true,
+                        xlabelcolor = fg, ylabelcolor = fg,
+                        xticklabelcolor = fg, yticklabelcolor = fg,
+                        leftspinecolor = fg, bottomspinecolor = fg,
+                        topspinevisible = false, rightspinevisible = false,
+                        xtickcolor = fg, ytickcolor = fg)
+        push!(axes, ax)
+        for (ai, arm) in enumerate(arms)
+            rs = filter(r -> r.arm == arm, summ)
+            isempty(rs) && continue
+            col = palette[mod1(ai, length(palette))]
+            # MPC hold collects no science, so it is dashed to mark it as the reference
+            # floor rather than a competitor.
+            sty = occursin("MPC", arm) ? :dash : :solid
+            x = [r.value for r in rs]
+            y = [Float64(getproperty(r, p)) for r in rs]
+            if p === :science
+                sd = [r.science_sd for r in rs]
+                Makie.band!(ax, x, y .- sd, y .+ sd; color = (col, 0.15))
+            end
+            Makie.lines!(ax, x, y; color = col, linewidth = 2, linestyle = sty,
+                         label = pi == 1 ? arm : nothing)
+            Makie.scatter!(ax, x, y; color = col, markersize = 7)
+        end
+        p in (:survival, :frac_degraded, :misbin) && Makie.ylims!(ax, -0.04, 1.04)
+        last_panel || Makie.hidexdecorations!(ax; grid = false)
+    end
+    Makie.linkxaxes!(axes...)
+
+    Makie.Legend(fig[1, 2], first(axes); framevisible = false, labelcolor = fg,
+                 labelsize = 11, patchsize = (18.0f0, 10.0f0))
+    Makie.colsize!(fig.layout, 2, Makie.Auto(false))
+
+    mkpath(dirname(path))
+    for ext in ("pdf", "svg", "png")
+        Makie.save("$path.$ext", fig; backgroundcolor = :transparent)
+    end
+    return fig
+end

@@ -41,7 +41,8 @@ const SEEDS = parse(Int, get(ENV, "SEEDS", "3"))
 const DAYS  = parse(Float64, get(ENV, "DAYS", "30"))
 const PLUME = parse(Float64, get(ENV, "PLUME", "1.5"))
 const OUT   = get(ENV, "OUT", joinpath("artifacts", "sweeps", String(KEY)))
-const ALL_ARMS = ["POMDP", "Threshold", "Cyclic k=2", "Cyclic k=0", "Greedy", "MPC hold"]
+const ALL_ARMS = ["POMDP", "Threshold", "Cyclic k=1", "Cyclic k=2", "Cyclic k=3",
+                  "Greedy", "MPC hold"]
 const ARMS  = haskey(ENV, "ARMS") ? split(ENV["ARMS"], ",") : ALL_ARMS
 
 state0   = nondim_to_cr3bp(collect(PERIOD1_SOUTH_IC_ND))

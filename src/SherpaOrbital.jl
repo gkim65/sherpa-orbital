@@ -183,6 +183,8 @@ export
     damage_trace,
     delivery_trace,
     plot_baseline_comparison,
+    sweep_summary,
+    plot_sweep,
     # per-rollout checkpointing — written as each rollout completes, so a killed sweep
     # keeps what it flew and resumes from disk
     cell_dir,
