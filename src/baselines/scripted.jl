@@ -15,6 +15,20 @@ NOTE: coverage is banked from the OBSERVED altitude bin for every baseline, exac
 SARSOP controller does. Crediting a baseline on the true bin would hand it a better sensor
 than the policy it is being compared against.
 
+NOTE: THE ARMS DIFFER IN HOW MUCH THEY CONSUME AN OBSERVATION, which matters when reading a
+nav sweep. `GreedyController` and `ThresholdController` choose actions from the observed
+coverage and the damage bin, so nav noise changes what they DO. `CyclicController` follows
+a fixed rotation and reads the observation only to bank coverage and to decide when every
+band has saturated, so it is close to open-loop; `MPCController` implements no
+`controller_observe!` at all and is fully open-loop. A flat line across a nav sweep is
+therefore not evidence of robustness for those two — they barely consume the swept
+variable. Compare the policy against the closed-loop baselines.
+
+NOTE: `controller_command` receives the TRUE state, so every controller plans its burn
+against truth and nav noise never corrupts a maneuver, only a decision. In flight the
+planner would target from the navigation solution instead. This understates what navigation
+error costs, uniformly across arms.
+
 NOTE: excursion commands are PERSISTENT here too — an `EXCURSE_*` sets the active reference
 and it stays set until a `CORRECT` clears it. Single-impulse authority is poor, so a band is
 reached by settling over several passes.

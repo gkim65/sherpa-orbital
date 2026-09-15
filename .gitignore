@@ -48,6 +48,10 @@ claude.md
 # Local verification/comparison harnesses (not committed)
 scratch/
 
-# SARSOP.jl writes these to the working directory on every solve (~40 MB).
+# SARSOP.jl writes these on every solve (~40 MB each). artifacts/solver/ is the
+# intended home; the bare names are what the solver defaults to if not redirected.
+artifacts/solver/
 model.pomdpx
 policy.out
+*.pomdpx
+*.out

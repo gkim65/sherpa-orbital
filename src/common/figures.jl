@@ -325,6 +325,12 @@ Returns the Makie `Figure`. Requires CairoMakie to be loaded by the caller.
 Science carries a ±1sd band across seeds. This answers whether a ranking measured at one
 theta survives the sweep, which a single-run time series cannot.
 
+NOTE: on a nav sweep, read the flat lines carefully. `MPCController` consumes no
+observation and `CyclicController` uses one only to bank coverage, so neither is really
+being tested by `sigma_nav_km` — they are open-loop reference floors, not robust
+controllers. The informative comparison is the policy against the closed-loop baselines
+(greedy, threshold), which choose actions from what they observed.
+
     using SherpaOrbital, CairoMakie
     plot_sweep(load_sweep("artifacts/sweeps/sigma_nav_km"), :sigma_nav_km;
                path = "figures/nav_sweep", xlabel = "Navigation error sigma (km)")
