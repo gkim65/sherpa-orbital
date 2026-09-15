@@ -22,6 +22,7 @@ References
 module SherpaOrbital
 
 using Distributions
+using JLD2
 using JSON
 using LinearAlgebra
 using OrdinaryDiffEq
@@ -74,6 +75,18 @@ include("common/report.jl")
 # The unified rollout harness. Last, because a SARSOP controller consumes the exported
 # policy artifact and the state helpers above.
 include("common/simulate.jl")
+
+# Scripted high-level baselines. After simulate.jl: they subtype `AbstractController` and
+# reuse its band-targeting and observation machinery, so only the decision layer differs.
+include("baselines/scripted.jl")
+
+# Figures. Reads rollout traces only, and resolves the plotting package at call time, so
+# the library keeps no plotting dependency.
+include("common/figures.jl")
+
+# Per-rollout checkpoints. After figures.jl: `save_rollout` stores the science/damage/
+# delivery traces alongside the raw per-step fields.
+include("common/checkpoint.jl")
 
 # Calibration: MEASURE the transition kernels from the truth model. Depends on the coast
 # helpers and geometry in common/simulate.jl, so it comes last.
@@ -159,6 +172,25 @@ export
     AbstractController,
     MPCController,
     SARSOPController,
+    # scripted high-level baselines — same low-level planner, rule instead of a policy
+    ScriptedCore,
+    scripted_core,
+    CyclicController,
+    GreedyController,
+    ThresholdController,
+    # figures — caller supplies CairoMakie
+    science_trace,
+    damage_trace,
+    delivery_trace,
+    plot_baseline_comparison,
+    # per-rollout checkpointing — written as each rollout completes, so a killed sweep
+    # keeps what it flew and resumes from disk
+    cell_dir,
+    rollout_filename,
+    n_checkpoints,
+    save_rollout,
+    load_cell,
+    load_sweep,
     controller_type,
     load_policy,
     run_rollout,

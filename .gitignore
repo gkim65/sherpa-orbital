@@ -38,6 +38,8 @@ docs/
 # theta-keyed names `theta_path` writes during a sweep (policy_plume_gradient=4.0.json).
 artifacts/policy.json
 artifacts/policy_*
+# Sweep checkpoints are derived: re-runnable via experiments/sweep.jl, and large.
+artifacts/sweeps/
 
 # Claude Code project instructions (local only)
 CLAUDE.md
@@ -45,3 +47,7 @@ claude.md
 
 # Local verification/comparison harnesses (not committed)
 scratch/
+
+# SARSOP.jl writes these to the working directory on every solve (~40 MB).
+model.pomdpx
+policy.out
