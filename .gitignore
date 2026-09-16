@@ -45,6 +45,8 @@ artifacts/tables*_nav*.json
 artifacts/solver/
 artifacts/sweeps/
 artifacts/*.log
+# Per-level run logs from experiments/cluster/run_sweep.sh.
+logs/
 # The dense-T JSON policy archive, superseded by SARSOP's .out (see src/export.jl). ~1.6 GB
 # each at |S| = 5627.
 artifacts/policy.json
