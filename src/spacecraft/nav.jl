@@ -75,3 +75,38 @@ observe_deviation(
     rng::AbstractRNG;
     sigma_r::Real = SIGMA_NAV_POS,
 ) = abs(float(true_dev_km) + sigma_r * randn(rng))
+
+"""
+    observe_state(true_state, rng; sigma_r = SIGMA_NAV_POS, sigma_v = nothing) -> Vector{Float64}
+
+Noisy full-state observation: independent Gaussian noise on each position and velocity
+component.
+
+  - `true_state` — true 6-state `[x, y, z, vx, vy, vz]` (km, km/s)
+  - `rng` — random stream for the noise draws
+  - `sigma_r` — 1σ PER-AXIS position noise (km)
+  - `sigma_v` — 1σ PER-AXIS velocity noise (km/s); `nothing` scales from `sigma_r` via
+    [`nav_sigma_vel_for`](@ref)
+
+Returns the noisy 6-state.
+
+This is what a controller PLANS from when it is not given truth. Both halves matter:
+`solve_burn` propagates forward to predict the next apses, so velocity error accumulates
+into apse-position error over an orbit rather than staying small.
+
+NOTE: noise is PER AXIS, so the position-error magnitude is about `sigma_r * sqrt(3)`.
+
+NOTE: isotropic and uncorrelated, which a real OD covariance is not.
+"""
+function observe_state(
+    true_state::AbstractVector{<:Real},
+    rng::AbstractRNG;
+    sigma_r::Real = SIGMA_NAV_POS,
+    sigma_v::Union{Nothing,Real} = nothing,
+)
+    sv = sigma_v === nothing ? nav_sigma_vel_for(sigma_r) : float(sigma_v)
+    out = collect(float.(true_state))
+    out[1:3] .+= sigma_r .* randn(rng, 3)
+    out[4:6] .+= sv .* randn(rng, 3)
+    return out
+end

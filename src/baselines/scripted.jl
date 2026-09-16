@@ -60,6 +60,11 @@ Base.@kwdef mutable struct ScriptedCore
     residual_edges::Vector{Float64}
     visit_cap::Int
     sigma_nav_km::Float64
+    # 1-sigma PER-AXIS position noise (km) on the state the controller PLANS from, set by
+    # `scripted_core` to the config's own `sigma_nav_km` so planning and deciding share one
+    # navigation quality. 0.0 plans from truth, which is an oracle — see
+    # `controller_nav_sigma`.
+    nav_sigma_km::Float64 = 0.0
     ref_ic::Union{Nothing,Vector{Float64}} = nothing
     retarget_bands::Bool = false
     family_table::Union{Nothing,Vector{NamedTuple}} = nothing
@@ -96,6 +101,9 @@ function scripted_core(config::StationkeepingPOMDP; kwargs...)
         residual_edges = collect(Float64.(RESIDUAL_EDGES)),
         visit_cap      = config.visit_cap,
         sigma_nav_km   = config.sigma_nav_km,
+        # Planning noise defaults to the same sigma the decision layer observes with; a
+        # caller can still override it to isolate one from the other.
+        nav_sigma_km   = config.sigma_nav_km,
         visits         = zeros(Int, length(names)),
         kwargs...)
 end
@@ -255,6 +263,7 @@ function CyclicController(core::ScriptedCore, k::Int)
 end
 
 controller_type(c::CyclicController) = "CYCLIC_k$(c.k)"
+controller_nav_sigma(c::CyclicController) = c.core.nav_sigma_km
 
 controller_setup!(c::CyclicController, state0::AbstractVector, ::Real) =
     _scripted_setup!(c.core, state0)
@@ -290,6 +299,7 @@ mutable struct GreedyController <: AbstractController
 end
 
 controller_type(::GreedyController) = "GREEDY"
+controller_nav_sigma(c::GreedyController) = c.core.nav_sigma_km
 
 controller_setup!(c::GreedyController, state0::AbstractVector, ::Real) =
     _scripted_setup!(c.core, state0)
@@ -336,6 +346,7 @@ function ThresholdController(core::ScriptedCore; max_residual::AbstractString = 
 end
 
 controller_type(c::ThresholdController) = "THRESHOLD_$(c.max_residual)"
+controller_nav_sigma(c::ThresholdController) = c.core.nav_sigma_km
 
 controller_setup!(c::ThresholdController, state0::AbstractVector, ::Real) =
     _scripted_setup!(c.core, state0)

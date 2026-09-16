@@ -234,7 +234,8 @@ Does changing this θ field require re-measuring the transition kernels?
 
   - `field` / `θ` — a single field name, or a NamedTuple whose keys are checked
 
-Returns `true` for `:noisy_thruster` and `:thruster_sigma_pct`, which change the dynamics and
+Returns `true` for `:noisy_thruster`, `:thruster_sigma_pct` and `:sigma_nav_km` (also
+accepted as `:nav_sigma_km`), which change the dynamics and
 force a full `calibrate_tables` run (minutes per θ). `sigma_nav_km` enters
 `observation_matrix` analytically and `plume_gradient` enters `transition_matrix`
 analytically, so both are seconds per θ and reuse the committed kernels.
@@ -244,7 +245,10 @@ driver that does not know the difference either wastes 20 minutes or, worse, reu
 kernels for a dynamics-changing θ.
 """
 needs_recalibration(field::Symbol) =
-    field in (:noisy_thruster, :thruster_sigma_pct)
+    # `:sigma_nav_km` is the CONFIG field; `:nav_sigma_km` is this module's kwarg for the
+    # same quantity. Both are accepted so a caller keyed on either name gets the right
+    # answer — a sweep over the config field is what actually asks.
+    field in (:noisy_thruster, :thruster_sigma_pct, :sigma_nav_km, :nav_sigma_km)
 needs_recalibration(θ::NamedTuple) = any(needs_recalibration, keys(θ))
 
 """
@@ -282,6 +286,11 @@ function calibrate_tables(config::StationkeepingPOMDP;
                           tree_depth::Integer = CALIBRATION_EFFORT.tree_depth,
                           seed_bins::Bool = CALIBRATION_EFFORT.seed_bins,
                           rng::AbstractRNG = Xoshiro(CALIBRATION_EFFORT.rng_seed),
+                          # Defaults to the CONFIG's own sigma, so the planner solves from
+                          # the same navigation quality the decision layer observes with.
+                          # One knob: a rollout flown at `config.sigma_nav_km` is matched to
+                          # kernels calibrated from this call.
+                          nav_sigma_km::Real = config.sigma_nav_km,
                           kwargs...)
     return calibrate_tables(;
         # ── θ, read from the config: ONE owner ────────────────────────────────
@@ -290,6 +299,7 @@ function calibrate_tables(config::StationkeepingPOMDP;
         band_target_km  = config.band_target_km,
         noisy_thruster  = config.noisy_thruster,
         thruster_sigma_pct = config.thruster_sigma_pct,
+        nav_sigma_km  = nav_sigma_km,
         # ── effort + truth model ──────────────────────────────────────────────
         truth_eom!          = truth_eom!,
         truth_name          = truth_name,
@@ -342,6 +352,14 @@ function calibrate_tables(;
     noisy_thruster::Bool = false,
     rng::AbstractRNG = Xoshiro(0),
     thruster_sigma_pct::Real = THRUSTER_SIGMA_PCT_B24_MODEL2,
+    # 1-sigma PER-AXIS position noise (km) on the state the onboard planner solves from,
+    # with velocity scaled by `nav_sigma_vel_for`. 0.0 plans from truth.
+    #
+    # NOTE: a RECALIBRATION axis once nonzero. Planning from an estimate changes the burn
+    # that is flown, so it changes the measured kernels — unlike `sigma_nav_km`, which only
+    # enters `observation_matrix` analytically. Kernels measured at one value are not valid
+    # for a rollout flown at another.
+    nav_sigma_km::Real = 0.0,
     # South-polar, because the plumes are at the south pole and the plume gradient θ is
     # meaningless over the north. The north-polar member gives identical kernels — it is an
     # exact z-reflection, the dynamics are z-symmetric, and every row is keyed on periapsis
@@ -504,12 +522,18 @@ function calibrate_tables(;
                 continue
             end
 
+            # Plan from a NAVIGATION ESTIMATE when one is configured, so the measured
+            # kernels model the same information the rollout will fly with. The burn still
+            # applies to the true state, so the error lands as a targeting miss.
+            sc_plan = nav_sigma_km > 0.0 ?
+                observe_state(sc, rng; sigma_r = nav_sigma_km) : sc
+
             # The one targeting difference between the actions, as an argument rather than
             # a separate implementation.
             b = mode_ === :altitude_position ?
-                solve_burn(sc, one_rev_s; eom! = cr3bp_eom!, mode = :altitude_position,
+                solve_burn(sc_plan, one_rev_s; eom! = cr3bp_eom!, mode = :altitude_position,
                            peri_target_km = peri_tgt, r_apo_nom = ra) :
-                solve_burn(sc, one_rev_s; eom! = cr3bp_eom!, mode = mode_,
+                solve_burn(sc_plan, one_rev_s; eom! = cr3bp_eom!, mode = mode_,
                            r_peri_nom = rp, r_apo_nom = ra)
 
             # The success test differs by mode. In `:altitude_position` the total residual
@@ -634,14 +658,18 @@ function calibrate_tables(;
             sh === :ok ||
                 return (kind = :terminal, from = from, a = a, out = _terminal_dev(sh))
 
+            # Same navigation-estimate treatment as `action_walk!`.
+            sc_plan = nav_sigma_km > 0.0 ?
+                observe_state(sc, rng; sigma_r = nav_sigma_km) : sc
+
             # Same per-action targeting split as `action_walk!`.
             b = if a === :CORRECT
-                solve_burn(sc, one_rev_s; eom! = cr3bp_eom!, mode = mode,
+                solve_burn(sc_plan, one_rev_s; eom! = cr3bp_eom!, mode = mode,
                            r_peri_nom = r_peri_nom, r_apo_nom = r_apo_nom)
             else
                 tgt = get(excurse_targets, a, nothing)
                 tgt === nothing ? nothing :
-                    solve_burn(sc, one_rev_s; eom! = cr3bp_eom!,
+                    solve_burn(sc_plan, one_rev_s; eom! = cr3bp_eom!,
                                mode = :altitude_position,
                                peri_target_km = tgt, r_apo_nom = r_apo_nom)
             end
@@ -833,6 +861,7 @@ function calibrate_tables(;
         # `nothing` when noise-free: burns applied ΔV exactly, so no σ was in effect and
         # recording one would imply a law this artifact was not measured under.
         "thruster_sigma_pct" => noisy_thruster ? thruster_sigma_pct : nothing,
+        "nav_sigma_km"  => nav_sigma_km,
         "band_target_km"     => Dict(string(b) => band_target_km[b] for b in band_names),
         "mode"               => string(mode),
         "alt_edges"          => collect(alt_edges),
@@ -966,6 +995,10 @@ function tables_from_rows(rows::Dict{Symbol,Dict{KernelKey,CalibrationRow}},
             "truth_eom"       => get(diagnostics, "truth_name", "unknown"),
             "noisy_thruster"  => get(diagnostics, "noisy_thruster", false),
             "thruster_sigma_pct" => get(diagnostics, "thruster_sigma_pct", nothing),
+            # The navigation noise the PLANNER solved from. Recorded here because it changes
+            # the burn that was flown and therefore the kernels: an artifact measured at one
+            # value is not valid for a rollout flown at another.
+            "nav_sigma_km"    => get(diagnostics, "nav_sigma_km", 0.0),
             "band_target_km"  => get(diagnostics, "band_target_km", Dict{String,Any}()),
             "alt_edges"       => get(diagnostics, "alt_edges", Float64[]),
         ),

@@ -90,3 +90,32 @@ const PERIAPSIS_CRASH_ALT = 5.0    # km  below this → terminal state
 #
 # Reference: MacKenzie, S. M. et al. (2020), Enceladus Orbilander, Exhibit C-8 §C.1.
 const SIGMA_NAV_POS = 2.0          # km
+
+# Optical navigation VELOCITY noise (1σ, km/s), per axis.
+#
+# Exhibit C-8 pairs the 300 m position figure with "several centimeters per second in
+# velocity" at 3σ, so 1σ is roughly 1 cm/s = 1e-5 km/s alongside a 1σ position of 0.1 km.
+# The ratio of the two sourced figures is what `nav_sigma_vel_for` scales by, so raising
+# the position noise raises the velocity noise with it rather than leaving velocity exact.
+#
+# NOTE: matters more than its magnitude suggests. `solve_burn` PROPAGATES FORWARD to predict
+# the next apses, so a velocity error accumulates into an apse-position error over an orbit:
+# 1 cm/s over the 12 hr period is about 430 m, comparable to the position error itself.
+#
+# Reference: MacKenzie, S. M. et al. (2020), Enceladus Orbilander, Exhibit C-8 §C.1.
+const SIGMA_NAV_VEL = 1.0e-5       # km/s
+
+"""
+    nav_sigma_vel_for(sigma_pos_km) -> Float64
+
+Per-axis 1σ velocity noise (km/s) accompanying a per-axis 1σ position noise (km), scaled by
+the ratio of the two Exhibit C-8 figures (0.1 km ↔ 1e-5 km/s).
+
+  - `sigma_pos_km` — per-axis 1σ position noise (km)
+
+Returns the per-axis 1σ velocity noise (km/s).
+
+NOTE: an assumed proportionality, not a sourced covariance. A real OD solution correlates
+position and velocity error and is not isotropic; this keeps one knob instead of two.
+"""
+nav_sigma_vel_for(sigma_pos_km::Real) = float(sigma_pos_km) * (SIGMA_NAV_VEL / 0.1)

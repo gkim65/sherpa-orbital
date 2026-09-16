@@ -166,6 +166,9 @@ export
     apply_dv_noisy,
     sample_eta_eff,
     observe_position,
+    observe_state,
+    SIGMA_NAV_VEL,
+    nav_sigma_vel_for,
     observe_altitude,
     observe_deviation,
     # unified rollout harness — one world, controller swapped by type
@@ -195,6 +198,7 @@ export
     load_cell,
     load_sweep,
     controller_type,
+    controller_nav_sigma,
     load_policy,
     run_rollout,
     discounted_return,

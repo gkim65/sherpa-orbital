@@ -36,20 +36,35 @@ Pass `dir` to keep a sweep out of the package — the artifact only has to live 
 `artifacts/` if a git-URL dependent needs to resolve it from the package cache.
 """
 function tables_path_for(noisy_thruster::Bool, sigma_pct::Real;
+                         nav_sigma_km::Real = 0.0,
                          dir::AbstractString = dirname(DEFAULT_TABLES_PATH))
-    noisy_thruster || return normpath(joinpath(dir, "tables.json"))
-    return normpath(joinpath(dir, string("tables_noisy_gaussian", float(sigma_pct), ".json")))
+    # Navigation noise on the PLANNER is a recalibration axis: it changes the burn that was
+    # flown, so kernels measured at one value are not valid at another. Keyed into the
+    # filename for the same reason the thruster sigma is.
+    nav = nav_sigma_km > 0.0 ? string("_nav", float(nav_sigma_km)) : ""
+    noisy_thruster || return normpath(joinpath(dir, string("tables", nav, ".json")))
+    return normpath(joinpath(dir,
+        string("tables_noisy_gaussian", float(sigma_pct), nav, ".json")))
 end
 
 """
     tables_path_for(config; dir = ...) -> String
 
-Artifact path implied by a config's thruster settings — the form both `calibrate.jl` and
-the model layer use, so the file a calibration WRITES is the file a solve READS.
+Artifact path implied by a config's thruster AND navigation settings — the form both
+`calibrate.jl` and the model layer use, so the file a calibration WRITES is the file a
+solve READS.
+
+  - `config` — the scenario
+  - `nav_sigma_km` — planner navigation noise the kernels were measured under; defaults to
+    `0.0` (planning from truth), NOT to `config.sigma_nav_km`, so the committed
+    truth-planning artifacts keep resolving by their existing names
+  - `dir` — artifact directory
 """
 tables_path_for(config::StationkeepingPOMDP;
+                nav_sigma_km::Real = 0.0,
                 dir::AbstractString = dirname(DEFAULT_TABLES_PATH)) =
-    tables_path_for(config.noisy_thruster, config.thruster_sigma_pct; dir = dir)
+    tables_path_for(config.noisy_thruster, config.thruster_sigma_pct;
+                    nav_sigma_km = nav_sigma_km, dir = dir)
 
 """
     resolve_tables_path(config) -> String

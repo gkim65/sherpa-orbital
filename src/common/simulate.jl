@@ -45,11 +45,30 @@ A stationkeeping controller. Implement three methods to plug a baseline into
   - `controller_observe!(c, peri_state, dev_km, label, extra, rng)` — post-step update from
     the achieved periapsis. Return a NamedTuple of extra trace fields (may be empty).
 
+  - `controller_nav_sigma(c)` — 1-sigma PER-AXIS position noise (km) to corrupt the state
+    handed to `controller_command`. `0.0` plans from the true state.
+
 Only `controller_command` may plan, and it may only use the ONBOARD model.
 """
 abstract type AbstractController end
 
 controller_setup!(::AbstractController, ::AbstractVector, ::Real) = nothing
+
+"""
+    controller_nav_sigma(c) -> Float64
+
+1-sigma PER-AXIS position noise (km) applied to the state `run_rollout` hands
+`controller_command`, so a controller plans from a navigation estimate rather than from
+truth. `0.0` (the default) plans from the true state.
+
+NOTE: PER AXIS, not a total 3-D magnitude. Noise is added independently to x, y and z, so
+the position-error magnitude is about `sigma * sqrt(3)`.
+
+Position AND velocity are perturbed: `solve_burn` propagates forward to predict apses, so
+velocity error accumulates into apse-position error over an orbit. The velocity sigma
+scales from this one via [`nav_sigma_vel_for`](@ref), keeping a single knob.
+"""
+controller_nav_sigma(::AbstractController) = 0.0
 controller_observe!(::AbstractController, ::AbstractVector, ::Real, ::Symbol,
                     ::NamedTuple, ::AbstractRNG) = NamedTuple()
 
@@ -113,6 +132,9 @@ an uncontrolled coast; check `n_failed_solves` before reading any outcome there.
 Base.@kwdef mutable struct MPCController <: AbstractController
     ref_ic::Union{Nothing,Vector{Float64}} = nothing
     mode::Symbol                           = :position
+    # 1-sigma PER-AXIS position noise (km) on the state this controller plans from. 0.0
+    # plans from truth, which is an oracle — see `controller_nav_sigma`.
+    nav_sigma_km::Float64                  = 0.0
     peri_target_km::Float64                = PERIAPSIS_ALT_TARGET
     apo_target_km::Float64                 = APOAPSIS_ALT_TARGET
     # Retargeting toggle: nothing = pinned reference.
@@ -130,6 +152,7 @@ Base.@kwdef mutable struct MPCController <: AbstractController
 end
 
 controller_type(::MPCController) = "MPC"
+controller_nav_sigma(c::MPCController) = c.nav_sigma_km
 
 function controller_setup!(c::MPCController, state0::AbstractVector, period_s::Real)
     if c.mode in (:position, :altitude_position)
@@ -253,6 +276,11 @@ mutable struct SARSOPController <: AbstractController
     # Configuration.
     ref_ic::Union{Nothing,Vector{Float64}}
     sigma_nav_km::Float64
+    # 1-sigma PER-AXIS position noise (km) on the state PLANNED from, distinct from
+    # `sigma_nav_km` above, which is the scalar altitude read the DECISION uses. 0.0 plans
+    # from truth. NOTE: the measured kernels were calibrated planning from truth, so a
+    # nonzero value here is a model mismatch for this arm until they are re-measured.
+    nav_sigma_km::Float64
     # Band-retargeting toggle. `false` (default) = the pre-2026-08-29 waypoint behaviour.
     retarget_bands::Bool
     family_table::Union{Nothing,Vector{NamedTuple}}
@@ -275,6 +303,7 @@ mutable struct SARSOPController <: AbstractController
 end
 
 controller_type(::SARSOPController) = "SARSOP"
+controller_nav_sigma(c::SARSOPController) = c.nav_sigma_km
 
 """
     SARSOPController(policy_data::AbstractDict; ref_ic = nothing,
@@ -286,6 +315,7 @@ Build a controller from a parsed policy payload. Use
 function SARSOPController(policy_data::AbstractDict;
                           ref_ic::Union{Nothing,AbstractVector{<:Real}} = nothing,
                           sigma_nav_km::Real = SIGMA_NAV_POS,
+                          nav_sigma_km::Real = 0.0,
                           retarget_bands::Bool = false,
                           family_table::Union{Nothing,Vector{NamedTuple}} = nothing)
     d = policy_data
@@ -331,7 +361,7 @@ function SARSOPController(policy_data::AbstractDict;
         Dict{String,Float64}(string(k) => Float64(v) for (k, v) in d["band_target_km"]),
         alphas, Int.(d["alpha_actions"]), T, O,
         ref_ic === nothing ? nothing : collect(float.(ref_ic)),
-        float(sigma_nav_km),
+        float(sigma_nav_km), float(nav_sigma_km),
         retarget_bands, family_table,
         belief, zeros(Int, length(band_names)), "R_OK", "", nothing, nothing, NaN,
         Dict{String,Tuple{Vector{Float64},Vector{Float64}}}(),
@@ -370,6 +400,7 @@ regret formulation requires anyway — is what makes this safe.
 function SARSOPController(policy, config::StationkeepingPOMDP;
                           ref_ic::Union{Nothing,AbstractVector{<:Real}} = nothing,
                           sigma_nav_km::Real = config.sigma_nav_km,
+                          nav_sigma_km::Real = config.sigma_nav_km,
                           retarget_bands::Bool = false,
                           family_table::Union{Nothing,Vector{NamedTuple}} = nothing,
                           tables::Union{Nothing,AltTables} = nothing)
@@ -397,7 +428,7 @@ function SARSOPController(policy, config::StationkeepingPOMDP;
         reduce(vcat, (reshape(α, 1, :) for α in alphas_v)), alpha_acts,
         transition_matrix(config, tbl), observation_matrix(config),
         ref_ic === nothing ? nothing : collect(float.(ref_ic)),
-        float(sigma_nav_km), retarget_bands, family_table,
+        float(sigma_nav_km), float(nav_sigma_km), retarget_bands, family_table,
         belief, zeros(Int, length(band_names)), "R_OK", "", nothing, nothing, NaN,
         Dict{String,Tuple{Vector{Float64},Vector{Float64}}}(),
     )
@@ -842,7 +873,19 @@ function run_rollout(
         t_now += shell.t
 
         # 2. Ask the controller for a command (ONBOARD planning only).
-        dv_cmd, label, extra = controller_command(controller, shell.u, period_s)
+        #
+        # The controller plans from a NAVIGATION ESTIMATE, not from truth: `shell.u` is the
+        # simulator's exact state, and a controller with `controller_nav_sigma > 0` is handed
+        # a position-perturbed copy of it. The burn is still applied to the TRUE state below,
+        # so the error shows up as a targeting miss rather than as a change to the dynamics.
+        #
+        # NOTE: planning from truth is an ORACLE. Left at 0.0 a controller nulls its
+        # residual perfectly however bad the navigation is, which reads as robustness in a
+        # nav sweep when it is really an unmodelled advantage.
+        nav_sigma  = controller_nav_sigma(controller)
+        plan_state = nav_sigma > 0.0 ?
+            observe_state(shell.u, rng; sigma_r = nav_sigma) : shell.u
+        dv_cmd, label, extra = controller_command(controller, plan_state, period_s)
 
         # Every action burns now that OBSERVE is gone, so every step ran a solve.
         n_solves += 1

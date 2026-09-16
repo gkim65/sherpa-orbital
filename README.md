@@ -52,74 +52,76 @@ One decision epoch is one periapsis pass (11.996 hr).
 
 **State.** `h` is the achieved periapsis-altitude region: five live regions (below 20,
 20–27 LOW, 27–34 MID, 34–44, above 44 HIGH km) plus absorbing `CRASHED` and `LOST`, so
-orbital safety requires no separate state variable. Three regions are science regions;
-34–44 km holds the `CORRECT` limit cycle at 37.2 km and is not one of them, so science
-requires a deliberate maneuver rather than passive holding. `c` is the per-region sample
-count, saturating at `visit_cap`. `i` is the plume intensity the last pass returned. `ρ` is
-the orbit-damage bin, `R_OK` / `R_DEGRADED` / `R_CRITICAL` at residual boundaries of 15 and
-25 km. Only `h` is partially observed; `c`, `i` and `ρ` are known exactly.
+orbital safety needs no separate state variable. Three are science regions; 34–44 km holds
+the `CORRECT` limit cycle at 37.2 km and is not one, so science requires a deliberate
+maneuver. `c` counts samples per science region, saturating at `visit_cap`. `i` is the plume
+intensity the last pass returned. `ρ` bins the planner's targeting residual at 15 and 25 km
+into `R_OK` / `R_DEGRADED` / `R_CRITICAL`. Only `h` is partially observed.
 
-`ρ` is what makes the coupling across passes representable. Conditioned on altitude alone,
-the transition model averages fresh and degraded departures from the same region and reports
-`P(lost) ≈ 0` for the maneuver that loses the vehicle. Conditioned on `ρ`, correcting from
-LOW at `R_CRITICAL` measures `P(lost) = 0.82`, against `0.0` at moderate and high altitude.
+Conditioned on altitude alone, the transition model averages fresh and degraded departures
+from the same region and reports `P(lost) ≈ 0` for the maneuver that loses the vehicle.
+Conditioned on `ρ`, correcting from LOW at `R_CRITICAL` measures `P(lost) = 0.82` against
+`0.0` at moderate and high altitude.
 
-**Actions.** Every action commands a maneuver; there is no null action, since an uncorrected
-pass is not a decision but a step toward losing the vehicle. `EXCURSE_*` sets a persistent
-reference held until a `CORRECT` clears it, so a band is reached by settling over several
-passes rather than in one impulse.
-
-**Observations.** A noisy read of the achieved altitude region, computed analytically by
-integrating a Gaussian nav error over the region boundaries. Science is credited on the
-*observed* region and only on a surviving pass, so ~11% of passes are attributed to the
-wrong region on average (16% in the outer, one-sided regions). Delivery error is
-sub-kilometre, so coverage error is a sensing problem rather than a control one.
+**Actions.** Every action commands a maneuver; there is no null action. `EXCURSE_*` sets a
+persistent reference held until a `CORRECT` clears it, so a band is reached over several
+passes rather than one impulse.
 
 **Reward.** `f` is the coverage increment, falling to `repeat_factor` once a region saturates
 or a pass lands outside every science region. `u(i′) ∈ {0.30, 0.65, 1.00}` scales with
-realized intensity; `y(ρ′) ∈ {1.00, 0.65, 0.30}` discounts samples taken from a degraded
-orbit. Both the science and loss terms are expectations under `T`, so maneuver risk enters
-as measured probability rather than a tuned penalty.
+realized intensity; `y(ρ′) ∈ {1.00, 0.65, 0.30}` discounts samples from a degraded orbit.
+Both the science and loss terms are expectations under `T`, so risk enters as measured
+probability rather than a tuned penalty. Science is credited on the *observed* region and
+only on a surviving pass.
 
-### Hierarchical decision and maneuver planning
+### Hierarchical planning
 
-Representing maneuvers directly in the POMDP would require reasoning over a continuous space
-of burn vectors. A discrete menu of burn directions is not a workable substitute: the
-stationkeeping burn is approximately orbit-normal, and a prograde-only or fixed-magnitude
-menu loses the vehicle within 1–2 days.
+Representing maneuvers in the POMDP would require a continuous action space. A discrete menu
+of burn directions is not a substitute: the stationkeeping burn is approximately
+orbit-normal, and a prograde-only or fixed-magnitude menu loses the vehicle within 1–2 days.
 
-Mission-level decisions and maneuver generation are therefore separated. The POMDP determines
-*what* objective to attempt over the discrete state above; an onboard planner determines
-*how* to execute it, solving for a continuous ΔV against a CR3BP model of the
-Saturn–Enceladus system. POMDP actions encode maneuver intent, not burn commands.
+The POMDP therefore chooses *what* objective to attempt; an onboard planner chooses *how*,
+solving a continuous ΔV against a CR3BP model of the Saturn–Enceladus system. Actions encode
+intent, not burn commands.
 
 ```
-belief  ──π──►  objective  ──►  planner (CR3BP)  ──ΔV──►  spacecraft (CR3BP + J₂)
-   ▲                                   │ residual              │ obs, intensity
-   └───────────────────────────────────┴───────────────────────┘
+estimate ──►  belief ──π──►  objective ──►  planner (CR3BP) ──ΔV──►  spacecraft (CR3BP + J₂)
+   ▲                                              │ residual                │
+   └──────────── navigation ◄─────────────────────┴────────────────────────┘
 ```
 
-The planner's targeting residual — the extent to which the orbit has drifted beyond
-single-impulse correction — is returned upward and binned as `ρ`. It requires no additional
-sensing, because the solver computes it while solving for the burn.
+The planner's targeting residual is returned upward and binned as `ρ`, so the damage variable
+costs no extra sensing. Trajectories are propagated under a truth model that adds Enceladus's
+J2, while the planner uses CR3BP alone; that discrepancy is the dynamical model uncertainty
+under study.
 
-Trajectories are propagated under a truth model that adds Enceladus's J2 oblateness, while
-the planner uses CR3BP alone. That discrepancy is the dynamical model uncertainty under
-study, and the two models are kept separate.
+**Navigation enters twice, at one σ.** `sigma_nav_km` sets both the noise on the altitude read
+a decision is made from and the per-axis position noise on the state the planner solves from
+(velocity scales via `nav_sigma_vel_for`, following Exhibit C-8's 0.1 km ↔ 1 cm/s pairing).
+Because planning noise changes the burn that is flown, `sigma_nav_km` is a **recalibration
+axis**: kernels measured at one value are not valid for a rollout flown at another.
 
 ### Measured transition kernels
 
-`T` is measured from the truth model rather than derived in closed form: one kernel per
-action, rows keyed on the joint `(h, ρ)` and columns on the joint successor. Keying on both
-matters — pooling across regions makes the excursions identical in `T`, and keying on
-altitude alone loses the conditional risk described above. Kernels are stored in
-[artifacts/tables.json](artifacts/tables.json) with their provenance, loaded at build time,
-and committed so a re-measurement appears in a diff.
+`T` is measured from the truth model, one kernel per action, rows keyed on the joint `(h, ρ)`
+and columns on the joint successor. One artifact per (thruster noise, navigation noise) pair,
+each carrying its own provenance:
+
+```
+artifacts/tables.json                           noise-free
+artifacts/tables_noisy_gaussian0.7.json         0.7% thruster, planning from truth
+artifacts/tables_noisy_gaussian0.7_nav0.1.json  0.7% thruster, planning at σ = 0.1 km
+```
 
 ```julia
-tables = load_tables()      # validates row-stochasticity and altitude ordering
+tables = load_tables(tables_path_for(config; nav_sigma_km = 0.1))
 validate_tables(tables)
 ```
+
+> **Check `meta.trials` before quoting a policy behaviour.** Of 60 rows, the committed
+> noise-free artifact has 44 measured with `n ≥ 20`, 4 thin, and 12 unmeasured and filled —
+> combinations the vehicle does not reach. `_fill_unmeasured_row` inherits the nearest
+> less-degraded measured row; a filled row is not evidence.
 
 ## `StationkeepingPOMDP` parameters
 
@@ -128,94 +130,90 @@ The struct is the configuration ([src/StationkeepingPOMDP.jl](src/Stationkeeping
 * **constructor:** `StationkeepingPOMDP(; kwargs...)`
 * **altitude discretization**
   * `alt_edges::NTuple{4,Float64}` — region boundaries (km), default `(20, 27, 34, 44)`
-  * `alt_rep_km::Dict{Symbol,Float64}` — per-region nav observation mean (km), default
-    `18 / 23.5 / 30.5 / 37.2 / 46`
+  * `alt_rep_km::Dict{Symbol,Float64}` — per-region nav observation mean (km)
 * **science regions**
   * `band_names::NTuple{3,Symbol}` — default `(:LOW, :MID, :HIGH)`
   * `band_bins::NTuple{3,Symbol}` — region per band, default `(:A20_27, :A27_34, :ABOVE_44)`
-  * `band_target_km::Dict{Symbol,Float64}` — commanded periapsis altitude (km), default
+  * `band_target_km::Dict{Symbol,Float64}` — commanded altitude (km), default
     `23.5 / 30.5 / 46.0`. HIGH is bounded above by the orbit: 55 and 60 km escape by pass 3
-  * `visit_cap::Int` — samples counted per region, default `4`. \|S\| grows as
-    `(cap+1)^n_bands`
+  * `visit_cap::Int` — samples counted per region, default `4`. \|S\| grows as `(cap+1)^3`
   * `correct_bin::Symbol` — region the `CORRECT` cycle settles in, default `:A34_44`
 * **uncertainty (sweep axes)**
-  * `sigma_nav_km::Float64` — 1σ nav noise (km), default `2.0`. Conservative; MacKenzie
-    Exhibit C-8 implies ~0.1 km
-  * `noisy_thruster::Bool` — default `true`. Recalibration axis
+  * `sigma_nav_km::Float64` — 1σ navigation error (km), default `2.0`. Drives both the
+    observation model and planner noise. MacKenzie Exhibit C-8 implies ~0.1 km.
+    **Recalibration axis**
+  * `noisy_thruster::Bool` — default `true`. **Recalibration axis**
   * `thruster_sigma_pct::Float64` — 1σ burn-magnitude error (%), default `0.7` (Exhibit B-24
-    Model 1; Model 2 is `2.0`). Recalibration axis
-  * `plume_gradient::Float64` — plume altitude-gradient strength, default `0.0`. Enters `T`
-    analytically, so a sweep needs no recalibration
-  * `plume_levels::Int` — intensity levels, default `3`. Changes \|S\|, so not a sweep axis
+    Model 1; Model 2 is `2.0`). **Recalibration axis**
+  * `plume_gradient::Float64` — plume altitude-gradient strength, default `0.0`. Analytic, so
+    no recalibration
+  * `plume_levels::Int` — intensity levels, default `3`. Changes \|S\|, not a sweep axis
 * **reward**
-  * `r_science::Float64` — default `20.0`
-  * `r_step_ok::Float64` — surviving pass, default `0.5`
-  * `r_crashed`, `r_lost::Float64` — default `-200.0`
+  * `r_science::Float64` = `20.0`, `r_step_ok::Float64` = `0.5`,
+    `r_crashed` / `r_lost::Float64` = `-200.0`
   * `repeat_factor::Float64` — yield after a region saturates, default `0.2`. Must be
     nonzero, or the policy goes indifferent once every region caps
-  * `intensity_value_min::Float64` — value of the weakest intensity level, default `0.3`
+  * `intensity_value_min::Float64` — weakest intensity level's value, default `0.3`
   * `damage_yield::NTuple{3,Float64}` — multiplier per damage bin, default
     `(1.0, 0.65, 0.3)`. A modelling choice, not measured; `(1,1,1)` disables it
-  * `fuel_weight::Float64` — default `0.0`, so `action_dv_cost` is inert. Raising it restores
-    the fuel tradeoff with no code change
-  * `action_dv_cost::Dict{Symbol,Float64}` — measured per-pass median ΔV (m/s)
+  * `fuel_weight::Float64` — default `0.0`, so `action_dv_cost` is inert
 * **solver**
   * `discount::Float64` — default `0.95`
-  * `tables_path::Union{Nothing,String}` — `nothing` resolves from `noisy_thruster` /
-    `thruster_sigma_pct`
+  * `tables_path::Union{Nothing,String}` — `nothing` resolves from the noise settings
 
 ## Examples
 
-### Solve and inspect a policy
+### Solve and inspect
 
 ```julia
 using Pkg
-Pkg.activate("experiments")     # from the repo root
+Pkg.activate("experiments")
 Pkg.instantiate()
 
 using SherpaOrbital, SARSOP, POMDPs
 
-config = StationkeepingPOMDP()          # baseline: noisy at 0.7% (B-24 Model 1)
+config = StationkeepingPOMDP(; sigma_nav_km = 0.1, plume_gradient = 1.5)
 print_model_summary(config)
 
-pomdp  = build_pomdp(config)
-
-# `policy_filename`/`pomdp_filename` default to `policy.out`/`model.pomdpx` in the WORKING
-# directory — name them so concurrent solves cannot overwrite each other, and so the policy
-# can be reloaded later without re-solving.
-policy = solve(SARSOP.SARSOPSolver(; precision = 1e-3, timeout = 900.0,
-                                   pomdp_filename  = "model.pomdpx",
-                                   policy_filename = "policy.out"), pomdp)
+tables = load_tables(tables_path_for(config; nav_sigma_km = config.sigma_nav_km))
+policy = solve(SARSOP.SARSOPSolver(; precision = 1e-3, timeout = 1800.0,
+                                   pomdp_filename  = "artifacts/solver/nav0.1.pomdpx",
+                                   policy_filename = "artifacts/solver/nav0.1.out"),
+               build_pomdp(config; tables = tables))
 
 print_policy_table(policy, config)
-export_policy(policy, config)           # -> artifacts/policy.json
 ```
 
-```bash
-julia --project=experiments experiments/example.jl
+Roughly 9 min to solve at |S| = 5627. Reload without re-solving:
+
+```julia
+policy = SARSOP.load_policy(build_pomdp(config; tables = tables),
+                            "artifacts/solver/nav0.1.out")
 ```
+
+Name `policy_filename` and `pomdp_filename` explicitly — SARSOP.jl otherwise writes
+`policy.out` and `model.pomdpx` into the working directory, so concurrent solves overwrite
+each other. `export_policy` writes a self-describing JSON instead, but it carries the dense
+`T[s][a][s']` (~1.6 GB here), so it is an archive format rather than the reload path.
 
 
 ### Fly a policy against the truth model
 
 ```julia
 ic  = nondim_to_cr3bp(collect(PERIOD1_SOUTH_IC_ND))
-res = run_rollout(SARSOPController(load_policy(); ref_ic = ic),
+res = run_rollout(SARSOPController(policy, config; ref_ic = ic, tables = tables),
                   ic, cr3bp_j2_eom!, PERIOD1_TRIPLE_PERIOD_S, 30 * 24 * 3600.0)
 
 res.outcome, res.n_bands, res.total_dv_ms
-discounted_return(res, config)
 ```
 
-About 10 s per 30-day rollout. This is the truth-model return, not the discrete-model one
-from `POMDPs.simulate` with a `RolloutSimulator` (milliseconds, states drawn from `T`). Both
-are valid and they are not interchangeable.
+About 10 s per 30-day rollout.
 
 ### Baselines
 
 Each baseline replaces the policy with a rule and shares everything below it — the same
-planner, band targets, observed-altitude coverage banking, and stop-once-saturated rule — so
-a performance gap is attributable to the decision layer.
+planner, band targets, navigation noise, and stop-once-saturated rule — so a gap is
+attributable to the decision layer.
 
 ```julia
 core = scripted_core(config; ref_ic = ic)
@@ -223,91 +221,81 @@ core = scripted_core(config; ref_ic = ic)
 CyclicController(core, 2)                          # LOW, CORRECT×2, MID, ... then hold
 GreedyController(core)                             # excurse to the least-sampled band
 ThresholdController(core; max_residual = "R_OK")   # excurse only from a clean orbit
-MPCController(; ref_ic = ic, mode = :position)     # hold only, no science
+MPCController(; ref_ic = ic, mode = :position, nav_sigma_km = config.sigma_nav_km)
 ```
+
+`MPCController` defaults to `nav_sigma_km = 0.0`, which plans from the true state and is an
+oracle — pass the config's σ for a fair comparison.
 
 ### Sweeps
 
 ```bash
-KEY=sigma_nav_km       VALS=2,4,6,8  SEEDS=3  julia --project=experiments experiments/sweep.jl
-KEY=thruster_sigma_pct VALS=0.7,2    SEEDS=5  julia --project=experiments experiments/sweep.jl
-KEY=plume_gradient     VALS=0,1.5,4  DAYS=15  julia --project=experiments experiments/sweep.jl
+KEY=sigma_nav_km       VALS=0,0.1,0.3,1,2  SEEDS=3  julia --project=experiments -t auto experiments/sweep.jl
+KEY=thruster_sigma_pct VALS=0.7,2          SEEDS=3  julia --project=experiments -t auto experiments/sweep.jl
+KEY=plume_gradient     VALS=0,1.5,4        SEEDS=3  julia --project=experiments -t auto experiments/sweep.jl
 ```
 
-Other knobs: `ARMS`, `DAYS`, `PLUME`, `OUT`. Each rollout is checkpointed on completion, so a
-killed sweep keeps what it already flew and rerunning the same command resumes from disk. The
-per-step trace is stored, not just the return, so a new metric or figure needs no re-run:
+Other knobs: `ARMS`, `DAYS`, `PLUME`, `OUT`. On a recalibration axis each level calibrates,
+solves and flies — about 13 min per level.
+
+Everything is keyed by value and skipped if present, so a sweep can be extended without
+redoing any of it:
+
+```bash
+# fill in the curve: only the new levels calibrate, solve and fly
+KEY=sigma_nav_km VALS=0,0.05,0.1,0.2,0.3,0.5,1,2 SEEDS=3 julia --project=experiments -t auto experiments/sweep.jl
+
+# add seeds: nothing re-solves
+KEY=sigma_nav_km VALS=0,0.1,0.3,1,2 SEEDS=10 julia --project=experiments -t auto experiments/sweep.jl
+```
+
+Each rollout checkpoints on completion with its full per-step trace, so a killed sweep keeps
+what it flew and a new metric needs no re-run:
 
 ```julia
 rows = load_sweep("artifacts/sweeps/sigma_nav_km")
 rows[1]["actions"]                          # action per pass
-rows[1]["peri_alts_km"]                     # where each pass actually went
+rows[1]["peri_alts_km"]                     # where each pass went
 rows[1]["residuals_km"]                     # planner residual per pass
 rows[1]["obs_bins"], rows[1]["true_bins"]   # observed vs. actual region
 ```
 
-A `plume_gradient` sweep needs one solved policy per value, since the reward changes. Nav and
-thruster sweeps reuse a single policy while the world varies, which is the deployment
-question: a precomputed policy meeting conditions it was not solved for.
-
 ### Regenerate the kernels
 
 ```bash
-julia --project=experiments -t auto experiments/calibrate.jl     # ~7 min
+julia --project=experiments -t auto experiments/calibrate.jl     # ~3-7 min
 ```
 
-The artifact path follows the config, so a noisy run never clobbers the noise-free
-`tables.json`. Use `-t 1` for a noisy artifact meant to be reproduced exactly — the threaded
-walk draws from a shared RNG, so `rng_seed` does not pin it.
+The artifact path follows the config, so a run never clobbers kernels measured under
+different noise. Use `-t 1` for an artifact meant to be reproduced exactly — the threaded
+walk shares an RNG, so `rng_seed` does not pin it.
 
 ## Figures
 
 ```julia
 using SherpaOrbital, CairoMakie      # the caller supplies the plotting package
 
-runs = ["POMDP" => res_pomdp, "Threshold" => res_thresh, "MPC hold" => res_mpc]
-plot_baseline_comparison(runs, config; path = "figures/baselines", theme = :light)
+# one run, over the horizon
+plot_baseline_comparison(["POMDP" => res_pomdp, "MPC hold" => res_mpc], config;
+                         path = "figures/baselines")
+
+# a sweep: metrics against the swept value, and per-level science timelines
+rows = load_sweep("artifacts/sweeps/sigma_nav_km")
+plot_sweep(rows, :sigma_nav_km; path = "figures/nav_sweep",
+           xlabel = "Navigation error σ (km)")
+plot_sweep_timelines(rows, :sigma_nav_km; path = "figures/nav_timelines")
 ```
 
-Writes PDF, SVG and PNG, transparent so one figure reads on either background. Two panels:
-cumulative science earned, and the fraction of passes flown degraded or worse, with a marker
-where a run was lost. They are separate because a single scalar return conflates them — a run
-that survives the full horizon can still score badly for expected loss it never incurred.
+All write PDF, SVG and PNG, transparent, with a `theme = :dark` option. Science and risk are
+plotted separately because one scalar return conflates them — a run that survives the full
+horizon can still score badly for expected loss it never incurred.
 
 ```julia
 science_trace(res, config)    # (t_days, cumulative)
-damage_trace(res)             # (t_days, residual_km, level, n_degraded, frac_degraded, lost_day)
-delivery_trace(res, config)   # commanded vs. achieved periapsis altitude, per excursion
+damage_trace(res)             # residual, level, n_degraded, frac_degraded, lost_day
+delivery_trace(res, config)   # commanded vs. achieved periapsis, per excursion
+sweep_summary(rows, :sigma_nav_km)
 ```
-
-## Measured results
-
-30-day horizon, seeds 0–2, CR3BP + Enceladus J2 truth. Both rows are matched: kernels
-calibrated and rollout flown under the same thruster law, which is what `thruster_sigma_pct`
-exists to guarantee.
-
-| thruster | outcome | return (mean ± sd) | ΔV (m/s) | bands | samples |
-|---|---|---|---|---|---|
-| **0.7%, B-24 Model 1** (default) | **holds 30 d, 3/3** | **135.4 ± 1.4** | 116–126 | 3 | 12 |
-| noise-free (optimistic corner) | holds 30 d, 3/3 | 142.5 ± 0.9 | 90–95 | 3 | 11–12 |
-
-Execution error costs return but not the mission: every seed holds the full 30 days and banks
-all three bands either way. The ~7-point gap is the policy correcting more often and earlier,
-so at γ = 0.95 the science it defers is science discounted.
-
-The mechanism is failed repair rather than crashes. `EXCURSE_HIGH` from `A34_44|R_DEGRADED`
-arrives `R_OK` 100% of the time noise-free, 52% at 0.7%, and 40% at 2.0%; damage then
-accumulates into the `R_CRITICAL` states where `P(lost)` really is ~0.7. Per-row
-`P(lost or crashed)` moves by at most +0.10 between noise-free and 2%, while total-variation
-distance over the successor distribution exceeds 0.10 on 24 of 60 rows.
-
-Two behaviours worth noting, neither engineered. The policy corrects on roughly half of all
-passes and interleaves excursions between corrections rather than chaining them. And it runs
-LOW as a bounded campaign: `EXCURSE_LOW` fires a few times, spaced three passes apart, then
-never again — the "excurse, then correct twice" pattern the measured kernels require.
-
-`outcome = :idle` means the horizon was reached with no crash and no escape but the controller
-stopped triggering before the end: survival, not a claim of active hold to the last second.
 
 ## Repository layout
 
@@ -323,7 +311,7 @@ src/
   transition.jl           T[s,a,s'] — coverage banking + intensity draw
   rewards.jl              r(s,a)
   model.jl                build_pomdp
-  export.jl               solved policy -> JSON, θ-keyed paths
+  export.jl               solved policy -> JSON archive, θ-keyed paths
   calibration/            measure the kernels from the truth model
   dynamics/               CR3BP (onboard) + J2 variants (truth), kept separate
   planner.jl              onboard burn planner (CR3BP only)
@@ -331,14 +319,14 @@ src/
   baselines/scripted.jl   cyclic / greedy / threshold baselines
   spacecraft/             thruster + nav models (explicit rng)
   common/simulate.jl      unified rollout harness
-  common/figures.jl       comparison figures (CairoMakie, resolved at call time)
+  common/figures.jl       comparison and sweep figures (CairoMakie at call time)
   common/checkpoint.jl    per-rollout sweep checkpoints
   common/report.jl        model + policy pretty-printing
 experiments/              own Project.toml — isolates the solver dependency
   example.jl              solve, inspect, export
-  calibrate.jl            regenerate artifacts/tables.json
-  sweep.jl                sweep an axis, checkpointing per rollout
-artifacts/                tables.json committed; policies and sweeps gitignored
+  calibrate.jl            regenerate a kernel artifact
+  sweep.jl                calibrate, solve and fly across a swept axis
+artifacts/                tables*.json committed; solver output and sweeps gitignored
 test/                     runtests.jl
 legacy/                   frozen Python, deliberately not ported
 ```
@@ -352,25 +340,25 @@ julia --project=. -e 'using Pkg; Pkg.test()'                                 # f
 julia --project=. -e 'using Pkg; Pkg.test(test_args=["plume","rewards"])'     # ~8 s
 ```
 
-The orbit-geometry, family-continuation and rollout testsets take minutes, which is too slow
-for an edit loop on the model layer; pass substrings to run only matching testsets.
+The orbit-geometry, family-continuation and rollout testsets take minutes; pass substrings to
+run only matching ones.
 
 ## Physics conventions
 
 - **Frame:** Saturn–Enceladus CR3BP rotating frame. Saturn at x = −μ, Enceladus at x = 1−μ.
 - **Units:** km, km/s, s. ΔV costs in m/s.
-- **Truth vs. onboard:** the truth model includes J2, the onboard planner is CR3BP only. The
-  gap between them is the model uncertainty being studied, and the two are kept separate.
+- **Truth vs. onboard:** truth model includes J2, the onboard planner is CR3BP only. The gap
+  between them is the model uncertainty being studied; the two stay separate.
 - **Stability:** all six Floquet multipliers lie on the unit circle, so the orbit is
-  marginally stable rather than hyperbolically unstable. The fast divergence of an
-  uncontrolled orbit is the J2 model gap, not orbital instability.
+  marginally stable rather than hyperbolically unstable. An uncontrolled orbit diverges
+  because of the J2 model gap, not orbital instability.
 
-> **The orbit studied here is period-1, not MacKenzie's period-3.** We fly a period-1 member
-> of the Saturn–Enceladus L1 halo family: 11.996 hr, one periapsis per revolution, south-polar
-> periapsis, commanded between ~23 and ~46 km. MacKenzie §B.2.3 specifies a period-3 member
-> instead, whose three geometrically distinct periapses buy ground-track diversity. That is a
-> different orbit in the same family but the
-> altitude/risk tradeoff the POMDP solves is the same either way.
+> **This is a period-1 orbit, not MacKenzie's period-3.** We fly a period-1 member of the
+> Saturn–Enceladus L1 halo family: 11.996 hr, one periapsis per revolution, south-polar
+> periapsis, commanded between ~23 and ~46 km. MacKenzie §B.2.3 specifies a period-3 member,
+> whose three geometrically distinct periapses buy ground-track diversity. Reaching it is a
+> branch-switching problem — no period-tripling bifurcation has been shown here at these
+> altitudes. The altitude/risk tradeoff is the same either way.
 
 ## Key references
 
