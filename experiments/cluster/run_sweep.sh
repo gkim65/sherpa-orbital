@@ -58,7 +58,9 @@ for V in $VALS_ALL; do
   else
     # Keep going: the levels are independent, and a re-run resumes this one from disk.
     echo "    FAILED rc=$rc after ${mins} min, ${n} rollouts — see $LOG" | tee -a "$SUMMARY"
-    tail -5 "$LOG" | sed 's/^/      /' | tee -a "$SUMMARY"
+    # The ERROR line, not the tail: a Julia stack trace ends in `_start()`, so tailing a
+    # failed log shows the least informative part of it.
+    grep -m1 -A4 "^ERROR" "$LOG" | sed 's/^/      /' | tee -a "$SUMMARY"
   fi
 done
 

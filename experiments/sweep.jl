@@ -89,6 +89,9 @@ Saved as SARSOP's own `.out`, not the JSON archive: the JSON carries the dense
 T and O from the config, so the archive buys nothing here.
 """
 function cell_policy(cfg, tbl, v)
+    # SARSOP opens these paths directly and does not create the directory, so a fresh
+    # clone has nowhere to write and the solve dies on the first level.
+    mkpath(joinpath("artifacts", "solver"))
     stem = joinpath("artifacts", "solver",
                     string(KEY, "=", v, "_plume=", PLUME))
     pomdp = build_pomdp(cfg; tables = tbl)
