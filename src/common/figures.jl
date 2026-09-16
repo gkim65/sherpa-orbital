@@ -295,9 +295,31 @@ function sweep_summary(rows, key::Symbol)
             (isempty(t) || isempty(o)) && continue
             nb += 1; t == o || (mis += 1)
         end
+        # Survival time, three ways, because one number cannot carry a bimodal
+        # distribution: runs either fail within days or reach the horizon.
+        #   `days_mean`   over ALL runs, censored ones counted at the horizon. Lands in the
+        #                 gap between the two modes, so it describes no actual run.
+        #   `days_median` same population, robust to the split but still a mixture.
+        #   `days_failed` median over the runs that DIED — "when it fails, how fast".
+        dys = [Float64(r["survival_days"]) for r in rs]
+        fail = [Float64(r["survival_days"]) for r in rs if !Bool(r["survived"])]
+        # Science among the runs that SURVIVED. Pooling survivors with failures averages two
+        # populations: a run that dies on day 3 banks almost nothing, so the mixed mean
+        # tracks the survival rate rather than the science a working controller collects.
+        # Measured at sigma = 0.3: Threshold pools to 54.7 +/- 31.0, but its three survivors
+        # are 92.4 +/- 3.9 against the policy's 100.2 +/- 4.6 — an 8% gap, not a 2x one.
+        # NaN when nothing survived; there is no science to report, which a gap in the plot
+        # states more honestly than a zero.
+        srv = [Float64(r["science"]) for r in rs if Bool(r["survived"])]
         push!(out, (arm = arm, value = v, n = length(rs),
+                    days_mean = mean(dys),
+                    days_median = median(dys),
+                    days_failed = isempty(fail) ? NaN : median(fail),
                     science = mean(sci),
                     science_sd = length(sci) < 2 ? 0.0 : std(sci),
+                    science_survivors = isempty(srv) ? NaN : mean(srv),
+                    science_survivors_sd = length(srv) < 2 ? 0.0 : std(srv),
+                    n_survivors = length(srv),
                     frac_degraded = mean(Float64(r["frac_degraded"]) for r in rs),
                     survival = mean(Bool(r["survived"]) for r in rs),
                     misbin = nb == 0 ? NaN : mis / nb,
@@ -318,7 +340,12 @@ Plot a parameter sweep: one line per controller, the swept value on x.
   - `theme` — `:light` or `:dark`; saved transparent so either background works
   - `xlabel` — x-axis label; defaults to the field name
   - `panels` — which metrics to stack, from `(:science, :frac_degraded, :survival,
-    :misbin, :dv, :samples)`
+    :dv, :misbin, :samples)`
+
+NOTE: `:misbin` is near zero at realistic navigation error — the altitude regions are
+7-10 km wide, so a sub-kilometre read almost never lands in the wrong one. It is
+informative only over a much wider sigma range; the failure mechanism at these levels is
+PLANNING error, not misattribution.
 
 Returns the Makie `Figure`. Requires CairoMakie to be loaded by the caller.
 
@@ -339,7 +366,7 @@ function plot_sweep(rows, key::Symbol;
                     path::AbstractString = "figures/sweep",
                     theme::Symbol = :light,
                     xlabel::AbstractString = String(key),
-                    panels = (:science, :frac_degraded, :survival, :misbin),
+                    panels = (:science, :frac_degraded, :survival, :dv),
                     size::Tuple{Int,Int} = (700, 200 * length(panels) + 60))
     Makie = get(Base.loaded_modules,
                 Base.PkgId(Base.UUID("13f3f980-e62b-5c42-98c6-ff1f3baf88f0"), "CairoMakie"),
@@ -358,7 +385,11 @@ function plot_sweep(rows, key::Symbol;
                Makie.RGBf(0.58, 0.44, 0.86), Makie.RGBf(0.00, 0.62, 0.79)]
     LABEL = Dict(:science => "Science reward", :frac_degraded => "Fraction of passes\ndegraded",
                  :survival => "Survival rate", :misbin => "Region misbin rate",
-                 :dv => "Total dV (m/s)", :samples => "Samples banked")
+                 :dv => "Total dV (m/s)", :samples => "Samples banked",
+                 :days_mean => "Mean survival\n(days)",
+                 :days_median => "Median survival\n(days)",
+                 :days_failed => "Median days to\nfailure (failed runs)",
+                 :science_survivors => "Science reward\n(surviving runs)")
 
     fig = Makie.Figure(; size = size, backgroundcolor = :transparent,
                        fonts = (; regular = "CMU Serif", bold = "CMU Serif Bold"))
@@ -390,12 +421,16 @@ function plot_sweep(rows, key::Symbol;
             if p === :science
                 sd = [r.science_sd for r in rs]
                 Makie.band!(ax, x, y .- sd, y .+ sd; color = (col, 0.15))
+            elseif p === :science_survivors
+                sd = [r.science_survivors_sd for r in rs]
+                Makie.band!(ax, x, y .- sd, y .+ sd; color = (col, 0.15))
             end
             Makie.lines!(ax, x, y; color = col, linewidth = 2, linestyle = sty,
                          label = pi == 1 ? arm : nothing)
             Makie.scatter!(ax, x, y; color = col, markersize = 7)
         end
         p in (:survival, :frac_degraded, :misbin) && Makie.ylims!(ax, -0.04, 1.04)
+        p in (:days_mean, :days_median, :days_failed) && Makie.ylims!(ax, low = 0)
         last_panel || Makie.hidexdecorations!(ax; grid = false)
     end
     Makie.linkxaxes!(axes...)
@@ -513,6 +548,259 @@ function plot_sweep_timelines(rows, key::Symbol;
     Makie.Legend(fig[1, length(vals) + 1], first(axes); framevisible = false,
                  labelcolor = fg, labelsize = 11, patchsize = (18.0f0, 10.0f0))
     Makie.colsize!(fig.layout, length(vals) + 1, Makie.Auto(false))
+
+    mkpath(dirname(path))
+    for ext in ("pdf", "svg", "png")
+        Makie.save("$path.$ext", fig; backgroundcolor = :transparent)
+    end
+    return fig
+end
+
+"""
+    survival_days(rows, key, value; arms = nothing) -> Vector{NamedTuple}
+
+Per-rollout survival time for one sweep cell, grouped by arm.
+
+  - `rows` — checkpoints from [`load_sweep`](@ref)
+  - `key` — the swept field, e.g. `:sigma_nav_km`
+  - `value` — the swept value to select
+  - `arms` — arms to include, in order; `nothing` uses every arm present
+
+Returns `(arm, days, censored)` per arm: `days` is the survival time of each rollout and
+`censored` marks the ones that reached the horizon without a crash or an escape.
+
+NOTE: a rollout that survives reports the HORIZON, not a time of death. Those entries are
+right-censored — the run would have gone on — so a mean over `days` understates nothing but
+also means nothing. Plot the distribution, and mark the censored fraction.
+"""
+function survival_days(rows, key::Symbol, value::Real; arms = nothing)
+    k = String(key)
+    present = unique(r["arm"] for r in rows)
+    draw = arms === nothing ? present : [a for a in arms if a in present]
+    out = NamedTuple[]
+    for arm in draw
+        cell = filter(r -> r["arm"] == arm && haskey(r, k) && Float64(r[k]) == Float64(value),
+                      rows)
+        isempty(cell) && continue
+        push!(out, (arm = arm,
+                    days = [Float64(r["survival_days"]) for r in cell],
+                    censored = [Bool(r["survived"]) for r in cell]))
+    end
+    return out
+end
+
+"""
+    plot_survival_box(rows, key; path, theme, xlabel, arms, size)
+
+Survival time per rollout as a box plot, one group per swept value.
+
+  - `rows` — checkpoints from [`load_sweep`](@ref)
+  - `key` — the swept field, e.g. `:sigma_nav_km`
+  - `path` — output path WITHOUT extension; writes `.pdf`, `.svg` and `.png`
+  - `theme` — `:light` or `:dark`; saved transparent so either background works
+  - `xlabel` — x-axis label
+  - `arms` — arms to draw, in order; `nothing` uses every arm present
+
+Returns the Makie `Figure`. Requires CairoMakie to be loaded by the caller.
+
+An arm that never died draws a bar at the horizon rather than a box, so perfect survival
+does not read as missing data; a partly-censored arm is annotated with how many of its
+rollouts reached the horizon.
+
+Replaces a mean-and-spread summary of survival, which is misleading here: the distribution
+is bimodal — a run either fails within days or reaches the horizon — so a mean sits in a gap
+where no rollout landed. Censored rollouts (reached the horizon) are drawn as open markers
+at the top.
+"""
+function plot_survival_box(rows, key::Symbol;
+                           path::AbstractString = "figures/survival",
+                           theme::Symbol = :light,
+                           xlabel::AbstractString = String(key),
+                           arms = nothing,
+                           size::Tuple{Int,Int} = (760, 380))
+    Makie = get(Base.loaded_modules,
+                Base.PkgId(Base.UUID("13f3f980-e62b-5c42-98c6-ff1f3baf88f0"), "CairoMakie"),
+                nothing)
+    Makie === nothing && error(
+        "plot_survival_box needs CairoMakie loaded by the caller: `using CairoMakie` " *
+        "before calling. The library declares no plotting dependency.")
+
+    k = String(key)
+    vals = sort(unique(Float64(r[k]) for r in rows if haskey(r, k)))
+    present = unique(r["arm"] for r in rows)
+    draw = arms === nothing ? present : [a for a in arms if a in present]
+
+    fg = theme === :dark ? Makie.RGBf(0.92, 0.92, 0.92) : Makie.RGBf(0.10, 0.10, 0.10)
+    palette = [Makie.RGBf(0.00, 0.45, 0.70), Makie.RGBf(0.90, 0.62, 0.00),
+               Makie.RGBf(0.00, 0.62, 0.45), Makie.RGBf(0.80, 0.47, 0.65),
+               Makie.RGBf(0.84, 0.37, 0.00), Makie.RGBf(0.35, 0.35, 0.35),
+               Makie.RGBf(0.58, 0.44, 0.86), Makie.RGBf(0.00, 0.62, 0.79)]
+
+    fig = Makie.Figure(; size = size, backgroundcolor = :transparent,
+                       fonts = (; regular = "CMU Serif", bold = "CMU Serif Bold"))
+    # Arms are clustered within each swept value, so a group reads as "at this sigma, who
+    # survives" rather than making the reader hop between panels.
+    n_arm = length(draw)
+    centres = collect(eachindex(vals)) .* (n_arm + 2.5)
+    ax = Makie.Axis(fig[1, 1]; xlabel = xlabel, ylabel = "Survival time (days)",
+                    xticks = (centres, string.(vals)),
+                    backgroundcolor = :transparent,
+                    xgridvisible = false, ygridvisible = true,
+                    xlabelcolor = fg, ylabelcolor = fg,
+                    xticklabelcolor = fg, yticklabelcolor = fg,
+                    leftspinecolor = fg, bottomspinecolor = fg,
+                    topspinevisible = false, rightspinevisible = false,
+                    xtickcolor = fg, ytickcolor = fg)
+
+    horizon = maximum(Float64(r["survival_days"]) for r in rows)
+    for (vi, v) in enumerate(vals)
+        groups = survival_days(rows, key, v; arms = draw)
+        for (ai, g) in enumerate(groups)
+            col = palette[mod1(findfirst(==(g.arm), draw), length(palette))]
+            x = centres[vi] - (n_arm + 1) / 2 + ai
+            nc = count(g.censored)
+            # An arm that never died has no box to draw, and an empty slot reads as missing
+            # data rather than as perfect survival. Mark it with a filled bar at the
+            # horizon instead, and keep the legend entry on this path too.
+            if nc == length(g.days)
+                Makie.scatter!(ax, [x], [horizon]; color = col, marker = :hline,
+                               markersize = 16, strokewidth = 0,
+                               label = vi == 1 ? g.arm : nothing)
+            else
+                Makie.boxplot!(ax, fill(x, length(g.days)), g.days;
+                               width = 0.62, color = (col, 0.55), strokecolor = col,
+                               strokewidth = 1, markersize = 0,
+                               label = vi == 1 ? g.arm : nothing)
+            end
+            # Censored runs reached the horizon; an open marker says the run did not end
+            # there, the experiment did. The count is annotated so a partly-censored box is
+            # readable without counting whiskers.
+            0 < nc < length(g.days) &&
+                Makie.text!(ax, x, horizon * 1.03; text = string(nc), color = col,
+                            fontsize = 9, align = (:center, :bottom))
+        end
+    end
+    Makie.hlines!(ax, [horizon]; color = (fg, 0.25), linestyle = :dot, linewidth = 1)
+    Makie.ylims!(ax, 0, horizon * 1.15)
+
+    Makie.Legend(fig[1, 2], ax; framevisible = false, labelcolor = fg, labelsize = 11,
+                 patchsize = (18.0f0, 10.0f0), merge = true)
+    Makie.colsize!(fig.layout, 2, Makie.Auto(false))
+
+    mkpath(dirname(path))
+    for ext in ("pdf", "svg", "png")
+        Makie.save("$path.$ext", fig; backgroundcolor = :transparent)
+    end
+    return fig
+end
+
+"""
+    plot_sweep_bars(rows, key; path, theme, xlabel, arms, panels, size)
+
+Grouped bars per swept value: one bar per controller, one panel per metric.
+
+  - `rows` — checkpoints from [`load_sweep`](@ref)
+  - `key` — the swept field, e.g. `:sigma_nav_km`
+  - `path` — output path WITHOUT extension; writes `.pdf`, `.svg` and `.png`
+  - `theme` — `:light` or `:dark`; saved transparent so either background works
+  - `xlabel` — x-axis label
+  - `arms` — arms to draw, in order; `nothing` uses every arm present
+  - `panels` — metrics to stack, default survivors-only science then survival rate
+
+Returns the Makie `Figure`. Requires CairoMakie to be loaded by the caller.
+
+Bars rather than lines because the swept values are treated as separate conditions to
+compare across, not as a continuum to interpolate along — and because a controller with no
+survivors has no science to plot, which a missing bar states and a broken line does not.
+
+Defaults to `:science_survivors`: pooling survivors with failures averages two populations,
+so the pooled mean tracks the survival rate instead of the science a working controller
+collects. The survival panel carries the risk.
+"""
+function plot_sweep_bars(rows, key::Symbol;
+                         path::AbstractString = "figures/sweep_bars",
+                         theme::Symbol = :light,
+                         xlabel::AbstractString = String(key),
+                         arms = nothing,
+                         panels = (:science_survivors, :survival),
+                         size::Union{Nothing,Tuple{Int,Int}} = nothing)
+    Makie = get(Base.loaded_modules,
+                Base.PkgId(Base.UUID("13f3f980-e62b-5c42-98c6-ff1f3baf88f0"), "CairoMakie"),
+                nothing)
+    Makie === nothing && error(
+        "plot_sweep_bars needs CairoMakie loaded by the caller: `using CairoMakie` before " *
+        "calling. The library declares no plotting dependency.")
+
+    summ = sweep_summary(rows, key)
+    isempty(summ) && error("no checkpoints carrying the field $key")
+    vals = sort(unique(r.value for r in summ))
+    present = unique(r.arm for r in summ)
+    draw = arms === nothing ? present : [a for a in arms if a in present]
+
+    fg = theme === :dark ? Makie.RGBf(0.92, 0.92, 0.92) : Makie.RGBf(0.10, 0.10, 0.10)
+    palette = [Makie.RGBf(0.00, 0.45, 0.70), Makie.RGBf(0.90, 0.62, 0.00),
+               Makie.RGBf(0.00, 0.62, 0.45), Makie.RGBf(0.80, 0.47, 0.65),
+               Makie.RGBf(0.84, 0.37, 0.00), Makie.RGBf(0.35, 0.35, 0.35),
+               Makie.RGBf(0.58, 0.44, 0.86), Makie.RGBf(0.00, 0.62, 0.79)]
+    LABEL = Dict(:science_survivors => "Science reward\n(surviving runs)",
+                 :science => "Science reward", :survival => "Survival rate",
+                 :frac_degraded => "Fraction of passes\ndegraded",
+                 :dv => "Total dV (m/s)", :days_mean => "Mean survival\n(days)")
+
+    n_arm = length(draw)
+    figsize = size === nothing ? (170 * length(vals) + 210, 200 * length(panels) + 60) : size
+    fig = Makie.Figure(; size = figsize, backgroundcolor = :transparent,
+                       fonts = (; regular = "CMU Serif", bold = "CMU Serif Bold"))
+    centres = collect(eachindex(vals)) .* (n_arm + 2.0)
+    axes = Makie.Axis[]
+
+    for (pi, p) in enumerate(panels)
+        last_panel = pi == length(panels)
+        ax = Makie.Axis(fig[pi, 1];
+                        xlabel = last_panel ? xlabel : "",
+                        ylabel = get(LABEL, p, String(p)),
+                        xticks = (centres, string.(vals)),
+                        backgroundcolor = :transparent,
+                        xgridvisible = false, ygridvisible = true,
+                        xlabelcolor = fg, ylabelcolor = fg,
+                        xticklabelcolor = fg, yticklabelcolor = fg,
+                        leftspinecolor = fg, bottomspinecolor = fg,
+                        topspinevisible = false, rightspinevisible = false,
+                        xtickcolor = fg, ytickcolor = fg)
+        push!(axes, ax)
+
+        for (ai, arm) in enumerate(draw)
+            col = palette[mod1(ai, length(palette))]
+            xs = Float64[]; ys = Float64[]; los = Float64[]; his = Float64[]
+            for (vi, v) in enumerate(vals)
+                row = findfirst(r -> r.arm == arm && r.value == v, summ)
+                row === nothing && continue
+                y = Float64(getproperty(summ[row], p))
+                # No survivors means no science to report; skip the bar rather than
+                # drawing a zero, which would read as "collected nothing" instead of
+                # "never got there".
+                isfinite(y) || continue
+                push!(xs, centres[vi] - (n_arm + 1) / 2 + ai); push!(ys, y)
+                if p === :science_survivors
+                    sd = summ[row].science_survivors_sd
+                    push!(los, y - sd); push!(his, y + sd)
+                end
+            end
+            isempty(xs) && continue
+            Makie.barplot!(ax, xs, ys; width = 0.85, color = (col, 0.85),
+                           strokecolor = col, strokewidth = 0.5,
+                           label = pi == 1 ? arm : nothing)
+            isempty(los) ||
+                Makie.rangebars!(ax, xs, los, his; color = fg, whiskerwidth = 5,
+                                 linewidth = 0.9)
+        end
+        p === :survival && Makie.ylims!(ax, 0, 1.05)
+        last_panel || Makie.hidexdecorations!(ax; grid = false)
+    end
+
+    Makie.Legend(fig[1, 2], first(axes); framevisible = false, labelcolor = fg,
+                 labelsize = 11, patchsize = (14.0f0, 10.0f0))
+    Makie.colsize!(fig.layout, 2, Makie.Auto(false))
 
     mkpath(dirname(path))
     for ext in ("pdf", "svg", "png")

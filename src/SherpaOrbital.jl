@@ -187,6 +187,9 @@ export
     delivery_trace,
     plot_baseline_comparison,
     sweep_summary,
+    survival_days,
+    plot_survival_box,
+    plot_sweep_bars,
     plot_sweep,
     plot_sweep_timelines,
     # per-rollout checkpointing — written as each rollout completes, so a killed sweep
