@@ -200,6 +200,8 @@ export
     save_rollout,
     load_cell,
     load_sweep,
+    pack_sweep,
+    unpack_sweep,
     controller_type,
     controller_nav_sigma,
     load_policy,

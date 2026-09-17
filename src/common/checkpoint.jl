@@ -155,12 +155,16 @@ end
 
 Every checkpoint under a sweep root, across all arms and cells.
 
-  - `root` — the sweep root passed to [`cell_dir`](@ref)
+  - `root` — the sweep root passed to [`cell_dir`](@ref), or a file written by
+    [`pack_sweep`](@ref)
 
 Returns a flat Vector of Dicts; each carries its own `arm` and `theta`, so the cell
 structure is recoverable without walking the tree again.
 """
 function load_sweep(root::AbstractString)
+    # A packed file is accepted wherever a directory is, so a figure script does not care
+    # whether it is reading a live sweep or one copied off a cluster.
+    isfile(root) && endswith(root, ".jld2") && return unpack_sweep(root)
     isdir(root) || return Dict{String,Any}[]
     out = Dict{String,Any}[]
     for (dir, _, files) in walkdir(root)
@@ -168,4 +172,48 @@ function load_sweep(root::AbstractString)
         append!(out, load_cell(dir))
     end
     return out
+end
+
+"""
+    pack_sweep(root, path) -> String
+
+Collapse a sweep's per-rollout checkpoints into one file.
+
+  - `root` — the sweep root passed to [`cell_dir`](@ref)
+  - `path` — output `.jld2`
+
+Returns the path written.
+
+The per-rollout files exist so a run can be killed without losing what it flew; once it has
+finished they are thousands of small files, which is the wrong shape for copying off a
+cluster. This writes the same records as a single array, readable by [`unpack_sweep`](@ref)
+and directly by `load_sweep`.
+
+    # on the cluster
+    pack_sweep("artifacts/sweeps/sigma_nav_km", "nav_sweep.jld2")
+    # locally, after scp
+    rows = load_sweep("nav_sweep.jld2")
+"""
+function pack_sweep(root::AbstractString, path::AbstractString)
+    rows = load_sweep(root)
+    isempty(rows) && error("no checkpoints under $root")
+    mkpath(dirname(abspath(path)))
+    JLD2.jldsave(path; rows = rows, root = String(root), n = length(rows))
+    return path
+end
+
+"""
+    unpack_sweep(path) -> Vector{Dict}
+
+Read a file written by [`pack_sweep`](@ref) back into the same rows `load_sweep` returns.
+
+  - `path` — a packed `.jld2`
+
+Returns a Vector of Dicts.
+"""
+function unpack_sweep(path::AbstractString)
+    d = JLD2.load(path)
+    haskey(d, "rows") || error("$path is not a packed sweep (no `rows`); " *
+                               "pass a directory to load_sweep instead")
+    return d["rows"]
 end
