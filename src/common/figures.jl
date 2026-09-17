@@ -313,8 +313,14 @@ function sweep_summary(rows, key::Symbol)
         srv = [Float64(r["science"]) for r in rs if Bool(r["survived"])]
         push!(out, (arm = arm, value = v, n = length(rs),
                     days_mean = mean(dys),
+                    days_sd = length(dys) < 2 ? 0.0 : std(dys),
                     days_median = median(dys),
                     days_failed = isempty(fail) ? NaN : median(fail),
+                    # Mean over the runs that DIED. More sensitive to a long tail than the
+                    # median, so an arm with a few late failures reads higher; with one
+                    # failure in a cell the two coincide.
+                    days_failed_mean = isempty(fail) ? NaN : mean(fail),
+                    n_failed = length(fail),
                     science = mean(sci),
                     science_sd = length(sci) < 2 ? 0.0 : std(sci),
                     science_survivors = isempty(srv) ? NaN : mean(srv),
@@ -339,8 +345,14 @@ Plot a parameter sweep: one line per controller, the swept value on x.
   - `path` — output path WITHOUT extension; writes `.pdf`, `.svg` and `.png`
   - `theme` — `:light` or `:dark`; saved transparent so either background works
   - `xlabel` — x-axis label; defaults to the field name
-  - `panels` — which metrics to stack, from `(:science, :frac_degraded, :survival,
-    :dv, :misbin, :samples)`
+  - `arms` — arms to draw, in legend order; `nothing` uses every arm present
+  - `legend_below` — one horizontal row under the panels, for a single-column figure
+  - `bar_panels` — panels to draw as grouped bars rather than lines. Use it for a metric
+    that is flat across the swept axis, where a line invites reading a trend that is not
+    there, or whose sample size varies per point,
+    instead of a column beside them
+  - `panels` — which metrics to stack, from `(:science, :science_survivors,
+    :frac_degraded, :survival, :dv, :misbin, :samples)`
 
 NOTE: `:misbin` is near zero at realistic navigation error — the altitude regions are
 7-10 km wide, so a sub-kilometre read almost never lands in the wrong one. It is
@@ -366,6 +378,9 @@ function plot_sweep(rows, key::Symbol;
                     path::AbstractString = "figures/sweep",
                     theme::Symbol = :light,
                     xlabel::AbstractString = String(key),
+                    arms = nothing,
+                    legend_below::Bool = false,
+                    bar_panels = (),
                     panels = (:science, :frac_degraded, :survival, :dv),
                     size::Tuple{Int,Int} = (700, 200 * length(panels) + 60))
     Makie = get(Base.loaded_modules,
@@ -383,19 +398,25 @@ function plot_sweep(rows, key::Symbol;
                Makie.RGBf(0.00, 0.62, 0.45), Makie.RGBf(0.80, 0.47, 0.65),
                Makie.RGBf(0.84, 0.37, 0.00), Makie.RGBf(0.35, 0.35, 0.35),
                Makie.RGBf(0.58, 0.44, 0.86), Makie.RGBf(0.00, 0.62, 0.79)]
-    LABEL = Dict(:science => "Science reward", :frac_degraded => "Fraction of passes\ndegraded",
+    LABEL = Dict(:science => "Science reward, all\nruns (mean ± 1 sd)",
+                 :frac_degraded => "Fraction of passes\ndegraded",
                  :survival => "Survival rate", :misbin => "Region misbin rate",
                  :dv => "Total dV (m/s)", :samples => "Samples banked",
                  :days_mean => "Mean survival\n(days)",
                  :days_median => "Median survival\n(days)",
-                 :days_failed => "Median days to\nfailure (failed runs)",
-                 :science_survivors => "Science reward\n(surviving runs)")
+                 :days_failed => "Days to failure\n(median, failed runs)",
+                 :days_failed_mean => "Days to failure\n(mean, failed runs)",
+                 :science_survivors => "Science reward, surviving\nruns (mean ± 1 sd)")
 
     fig = Makie.Figure(; size = size, backgroundcolor = :transparent,
                        fonts = (; regular = "CMU Serif", bold = "CMU Serif Bold"))
-    arms = unique(r.arm for r in summ)
+    # Caller order, so the legend can lead with the arm the figure is about; `sweep_summary`
+    # sorts alphabetically, which buries it.
+    present = unique(r.arm for r in summ)
+    arms = arms === nothing ? present : [a for a in arms if a in present]
     axes = Makie.Axis[]
 
+    xall = sort(unique(r.value for r in summ))
     for (pi, p) in enumerate(panels)
         last_panel = pi == length(panels)
         ax = Makie.Axis(fig[pi, 1];
@@ -418,26 +439,84 @@ function plot_sweep(rows, key::Symbol;
             sty = occursin("MPC", arm) ? :dash : :solid
             x = [r.value for r in rs]
             y = [Float64(getproperty(r, p)) for r in rs]
-            if p === :science
-                sd = [r.science_sd for r in rs]
-                Makie.band!(ax, x, y .- sd, y .+ sd; color = (col, 0.15))
-            elseif p === :science_survivors
-                sd = [r.science_survivors_sd for r in rs]
-                Makie.band!(ax, x, y .- sd, y .+ sd; color = (col, 0.15))
+            # `days_failed` is NaN where nothing failed, and `science_survivors` NaN where
+            # nothing survived. Drop those points: a gap says "not defined here", a zero
+            # would claim a measurement.
+            if any(!isfinite, y)
+                ok = isfinite.(y)
+                x, y = x[ok], y[ok]
+                sdv_keep = ok
+            else
+                sdv_keep = trues(length(y))
             end
-            Makie.lines!(ax, x, y; color = col, linewidth = 2, linestyle = sty,
-                         label = pi == 1 ? arm : nothing)
-            Makie.scatter!(ax, x, y; color = col, markersize = 7)
+            isempty(x) && continue
+            # Band in the ARM's colour: a shared grey pools into an unreadable smudge once
+            # several arms overlap.
+            sdv = p === :science           ? [r.science_sd for r in rs] :
+                  p === :science_survivors ? [r.science_survivors_sd for r in rs] : nothing
+            # Per-arm colour at low alpha. A shared grey pools into one smudge, and the
+            # pooled-science sd is genuinely wide — it averages runs that died on day 3
+            # with runs that flew the full horizon — so the band cannot be made small
+            # without changing what is plotted. Use `:science_survivors` for a tight one.
+            if sdv !== nothing
+                lo, hi = y .- sdv[sdv_keep], y .+ sdv[sdv_keep]
+                Makie.band!(ax, x, lo, hi; color = (col, 0.10))
+                Makie.lines!(ax, x, lo; color = (col, 0.35), linewidth = 0.5)
+                Makie.lines!(ax, x, hi; color = (col, 0.35), linewidth = 0.5)
+            end
+            if p in bar_panels
+                # CATEGORICAL x: the swept values are unevenly spaced, so a bar sized in
+                # data units collapses to the smallest gap between them. Each value gets
+                # one integer slot and the arms are offset inside it.
+                slot = [Float64(findfirst(==(v), xall)) for v in x]
+                w    = 0.8 / max(length(arms), 1)
+                xs = slot .+ (ai - (length(arms) + 1) / 2) * w
+                Makie.barplot!(ax, xs, y;
+                               width = w * 0.9, color = (col, 0.85),
+                               strokecolor = col, strokewidth = 0.4,
+                               label = pi == 1 ? arm : nothing)
+                # Spread across rollouts, where the metric has one. CLAMPED TO THE
+                # SUPPORT: a survival time lives in [0, horizon], so an unclamped
+                # mean ± sd whisker claims runs lasted longer than the run did. The
+                # distribution is bimodal — a run either fails in days or reaches the
+                # horizon — so the sd is wide and the clamp bites on most arms.
+                bsd = p === :days_mean ? [r.days_sd for r in rs][sdv_keep] : nothing
+                if bsd !== nothing
+                    hi = maximum(r.days_mean for r in summ)   # the horizon, as flown
+                    Makie.rangebars!(ax, xs, max.(y .- bsd, 0.0), min.(y .+ bsd, hi);
+                                     color = fg, whiskerwidth = 5, linewidth = 1.1)
+                end
+            else
+                Makie.lines!(ax, x, y; color = col, linewidth = 2, linestyle = sty,
+                             label = pi == 1 ? arm : nothing)
+                Makie.scatter!(ax, x, y; color = col, markersize = 7)
+            end
+        end
+        if p in bar_panels
+            ax.xticks = (collect(eachindex(xall)), string.(xall))
+            Makie.xlims!(ax, 0.4, length(xall) + 0.6)
         end
         p in (:survival, :frac_degraded, :misbin) && Makie.ylims!(ax, -0.04, 1.04)
-        p in (:days_mean, :days_median, :days_failed) && Makie.ylims!(ax, low = 0)
-        last_panel || Makie.hidexdecorations!(ax; grid = false)
+        p in (:days_mean, :days_median, :days_failed, :days_failed_mean) &&
+            Makie.ylims!(ax, low = 0)
+        (last_panel || p in bar_panels) || Makie.hidexdecorations!(ax; grid = false)
     end
-    Makie.linkxaxes!(axes...)
+    # Only the line panels share the numeric x axis; a bar panel is categorical.
+    linkable = [ax for (ax, p) in zip(axes, panels) if !(p in bar_panels)]
+    length(linkable) > 1 && Makie.linkxaxes!(linkable...)
 
-    Makie.Legend(fig[1, 2], first(axes); framevisible = false, labelcolor = fg,
-                 labelsize = 11, patchsize = (18.0f0, 10.0f0))
-    Makie.colsize!(fig.layout, 2, Makie.Auto(false))
+    if legend_below
+        # One row under the panels: a side legend narrows them enough that the x axis
+        # crowds in a single-column figure.
+        Makie.Legend(fig[length(panels) + 1, 1], first(axes); framevisible = false,
+                     labelcolor = fg, labelsize = 10, patchsize = (16.0f0, 8.0f0),
+                     orientation = :horizontal, nbanks = 2, colgap = 10,
+                     tellheight = true, tellwidth = false)
+    else
+        Makie.Legend(fig[1, 2], first(axes); framevisible = false, labelcolor = fg,
+                     labelsize = 11, patchsize = (18.0f0, 10.0f0))
+        Makie.colsize!(fig.layout, 2, Makie.Auto(false))
+    end
 
     mkpath(dirname(path))
     for ext in ("pdf", "svg", "png")
@@ -754,6 +833,7 @@ function plot_sweep_bars(rows, key::Symbol;
     centres = collect(eachindex(vals)) .* (n_arm + 2.0)
     axes = Makie.Axis[]
 
+    xall = sort(unique(r.value for r in summ))
     for (pi, p) in enumerate(panels)
         last_panel = pi == length(panels)
         ax = Makie.Axis(fig[pi, 1];
@@ -795,7 +875,7 @@ function plot_sweep_bars(rows, key::Symbol;
                                  linewidth = 0.9)
         end
         p === :survival && Makie.ylims!(ax, 0, 1.05)
-        last_panel || Makie.hidexdecorations!(ax; grid = false)
+        (last_panel || p in bar_panels) || Makie.hidexdecorations!(ax; grid = false)
     end
 
     Makie.Legend(fig[1, 2], first(axes); framevisible = false, labelcolor = fg,

@@ -51,6 +51,10 @@ logs/
 # each at |S| = 5627.
 artifacts/policy.json
 artifacts/policy_*
+# Packed sweeps (`pack_sweep`) — one file per sweep, ~170 MB at 200 seeds. Copied off a
+# cluster for analysis, regenerable from the checkpoints.
+*_sweep*.jld2
+nav_sweep*.jld2
 
 # Claude Code project instructions (local only)
 CLAUDE.md
