@@ -190,6 +190,9 @@ function plot_baseline_comparison(runs, config::StationkeepingPOMDP;
                Makie.RGBf(0.58, 0.44, 0.86), Makie.RGBf(0.00, 0.62, 0.79)]
 
     fig = Makie.Figure(; size = size, backgroundcolor = :transparent,
+                       # Tight: the default 16pt margin is visible whitespace once the
+                       # figure is placed in a document that already has margins.
+                       figure_padding = (2, 4, 2, 2),
                        fonts = (; regular = "CMU Serif", bold = "CMU Serif Bold"))
 
     ax1 = Makie.Axis(fig[1, 1]; ylabel = "Cumulative science reward",
@@ -252,7 +255,7 @@ function plot_baseline_comparison(runs, config::StationkeepingPOMDP;
     Makie.hidexdecorations!(ax1; grid = false)
 
     Makie.Legend(fig[1, 2], ax1; framevisible = false, labelcolor = fg,
-                 labelsize = 11, patchsize = (18.0f0, 10.0f0))
+                 labelsize = 13, patchsize = (20.0f0, 10.0f0))
     Makie.colsize!(fig.layout, 2, Makie.Auto(false))
 
     mkpath(dirname(path))
@@ -409,6 +412,9 @@ function plot_sweep(rows, key::Symbol;
                  :science_survivors => "Science reward, surviving\nruns (mean ± 1 sd)")
 
     fig = Makie.Figure(; size = size, backgroundcolor = :transparent,
+                       # Tight: the default 16pt margin is visible whitespace once the
+                       # figure is placed in a document that already has margins.
+                       figure_padding = (2, 4, 2, 2),
                        fonts = (; regular = "CMU Serif", bold = "CMU Serif Bold"))
     # Caller order, so the legend can lead with the arm the figure is about; `sweep_summary`
     # sorts alphabetically, which buries it.
@@ -508,13 +514,17 @@ function plot_sweep(rows, key::Symbol;
     if legend_below
         # One row under the panels: a side legend narrows them enough that the x axis
         # crowds in a single-column figure.
+        #
+        # NOTE: this centres on the PLOT AREA, not the figure, so it sits slightly right
+        # of centre — the axis column is inset by the width of the y tick labels and the
+        # legend inherits that geometry. Cosmetic; left as is.
         Makie.Legend(fig[length(panels) + 1, 1], first(axes); framevisible = false,
-                     labelcolor = fg, labelsize = 10, patchsize = (16.0f0, 8.0f0),
-                     orientation = :horizontal, nbanks = 2, colgap = 10,
-                     tellheight = true, tellwidth = false)
+                     labelcolor = fg, labelsize = 13, patchsize = (22.0f0, 10.0f0),
+                     orientation = :horizontal, nbanks = 2, colgap = 14, rowgap = 2,
+                     halign = :center, tellheight = true, tellwidth = false)
     else
         Makie.Legend(fig[1, 2], first(axes); framevisible = false, labelcolor = fg,
-                     labelsize = 11, patchsize = (18.0f0, 10.0f0))
+                     labelsize = 13, patchsize = (20.0f0, 10.0f0))
         Makie.colsize!(fig.layout, 2, Makie.Auto(false))
     end
 
@@ -572,6 +582,7 @@ function plot_sweep_timelines(rows, key::Symbol;
 
     figsize = size === nothing ? (260 * length(vals) + 150, 300) : size
     fig = Makie.Figure(; size = figsize, backgroundcolor = :transparent,
+                       figure_padding = (2, 4, 2, 2),
                        fonts = (; regular = "CMU Serif", bold = "CMU Serif Bold"))
 
     # Shared y limit so panels are comparable by eye rather than each self-scaling.
@@ -625,7 +636,7 @@ function plot_sweep_timelines(rows, key::Symbol;
     Makie.linkaxes!(axes...)
 
     Makie.Legend(fig[1, length(vals) + 1], first(axes); framevisible = false,
-                 labelcolor = fg, labelsize = 11, patchsize = (18.0f0, 10.0f0))
+                 labelcolor = fg, labelsize = 13, patchsize = (20.0f0, 10.0f0))
     Makie.colsize!(fig.layout, length(vals) + 1, Makie.Auto(false))
 
     mkpath(dirname(path))
@@ -716,6 +727,9 @@ function plot_survival_box(rows, key::Symbol;
                Makie.RGBf(0.58, 0.44, 0.86), Makie.RGBf(0.00, 0.62, 0.79)]
 
     fig = Makie.Figure(; size = size, backgroundcolor = :transparent,
+                       # Tight: the default 16pt margin is visible whitespace once the
+                       # figure is placed in a document that already has margins.
+                       figure_padding = (2, 4, 2, 2),
                        fonts = (; regular = "CMU Serif", bold = "CMU Serif Bold"))
     # Arms are clustered within each swept value, so a group reads as "at this sigma, who
     # survives" rather than making the reader hop between panels.
@@ -762,8 +776,8 @@ function plot_survival_box(rows, key::Symbol;
     Makie.hlines!(ax, [horizon]; color = (fg, 0.25), linestyle = :dot, linewidth = 1)
     Makie.ylims!(ax, 0, horizon * 1.15)
 
-    Makie.Legend(fig[1, 2], ax; framevisible = false, labelcolor = fg, labelsize = 11,
-                 patchsize = (18.0f0, 10.0f0), merge = true)
+    Makie.Legend(fig[1, 2], ax; framevisible = false, labelcolor = fg, labelsize = 13,
+                 patchsize = (20.0f0, 10.0f0), merge = true)
     Makie.colsize!(fig.layout, 2, Makie.Auto(false))
 
     mkpath(dirname(path))
@@ -829,6 +843,7 @@ function plot_sweep_bars(rows, key::Symbol;
     n_arm = length(draw)
     figsize = size === nothing ? (170 * length(vals) + 210, 200 * length(panels) + 60) : size
     fig = Makie.Figure(; size = figsize, backgroundcolor = :transparent,
+                       figure_padding = (2, 4, 2, 2),
                        fonts = (; regular = "CMU Serif", bold = "CMU Serif Bold"))
     centres = collect(eachindex(vals)) .* (n_arm + 2.0)
     axes = Makie.Axis[]
@@ -879,7 +894,7 @@ function plot_sweep_bars(rows, key::Symbol;
     end
 
     Makie.Legend(fig[1, 2], first(axes); framevisible = false, labelcolor = fg,
-                 labelsize = 11, patchsize = (14.0f0, 10.0f0))
+                 labelsize = 13, patchsize = (18.0f0, 10.0f0))
     Makie.colsize!(fig.layout, 2, Makie.Auto(false))
 
     mkpath(dirname(path))
