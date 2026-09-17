@@ -12,6 +12,9 @@ Options are environment variables, so a new sweep is one line:
     KEY     swept config field                      (default sigma_nav_km)
     VALS    comma-separated values                   (default 0,0.1,0.3,1,2)
     SEEDS   rollouts per cell                        (default 3)
+    WORKERS, WORKER
+            split seeds across WORKERS processes;     (default 1, 0)
+            this one is WORKER (0-based)
     ARMS    comma-separated controller labels        (default all)
     DAYS    rollout horizon in days                  (default 30)
     PLUME   plume_gradient, when not the swept key   (default 1.5)
@@ -25,6 +28,13 @@ if already on disk, so:
   - rerunning with more VALS calibrates, solves and flies only the new levels
 
 so a coarse sweep can be filled in later without redoing any of it.
+
+To split a level across PROCESSES, run N workers over the same command with WORKER = 0..N-1;
+each takes every Nth seed. See `experiments/cluster/run_sweep.sh`, which solves once and then
+fans the rollouts out.
+
+    WORKERS=8 WORKER=0 KEY=sigma_nav_km VALS=0.3 SEEDS=100 julia ... &
+    WORKERS=8 WORKER=1 KEY=sigma_nav_km VALS=0.3 SEEDS=100 julia ... &
 
 Per level, for a recalibration axis: ~3 min calibrate + ~9 min solve + ~1 min rollouts.
 `needs_recalibration` decides — `sigma_nav_km`, `thruster_sigma_pct` and `noisy_thruster`
@@ -42,6 +52,14 @@ using Printf, Random, Statistics
 const KEY   = Symbol(get(ENV, "KEY", "sigma_nav_km"))
 const VALS  = parse.(Float64, split(get(ENV, "VALS", "0,0.1,0.3,1,2"), ","))
 const SEEDS = parse(Int, get(ENV, "SEEDS", "3"))
+# Seed shard, for splitting one level across several PROCESSES. Launch N workers with
+# WORKER = 0..N-1 and each takes every Nth seed, so they write disjoint checkpoint files and
+# need no locking. Striding rather than blocking keeps the shards balanced when rollout cost
+# varies with the seed — a block of early seeds is not systematically cheaper than a block
+# of late ones, but a run that escapes on pass 3 costs far less than one that flies 60.
+const WORKERS = parse(Int, get(ENV, "WORKERS", "1"))
+const WORKER  = parse(Int, get(ENV, "WORKER", "0"))
+0 <= WORKER < WORKERS || error("WORKER must be in 0:$(WORKERS - 1), got $WORKER")
 const DAYS  = parse(Float64, get(ENV, "DAYS", "30"))
 const PLUME = parse(Float64, get(ENV, "PLUME", "1.5"))
 const OUT   = get(ENV, "OUT", joinpath("artifacts", "sweeps", String(KEY)))
@@ -126,6 +144,9 @@ end
 @printf("arms: %s\n", join(ARMS, ", "))
 @printf("%d seeds, %.0f d, plume=%.1f, recalibrate=%s -> %s\n",
         SEEDS, DAYS, PLUME, RECAL, OUT)
+WORKERS > 1 && @printf("worker %d of %d: seeds %s\n", WORKER, WORKERS,
+                       join(WORKER:WORKERS:min(SEEDS - 1, WORKER + 4WORKERS), ",") *
+                       (WORKER + 4WORKERS < SEEDS - 1 ? ",..." : ""))
 flush(stdout)
 
 t_start = time()
@@ -138,12 +159,19 @@ for v in VALS
 
     for arm in ARMS
         dir  = cell_dir(OUT, NamedTuple{(KEY,)}((v,)), arm)
-        done = n_checkpoints(dir)
-        if done >= SEEDS
-            @printf("  %-11s %d/%d banked, skipping\n", arm, done, SEEDS); flush(stdout)
+        # Resume per SEED, not per count: with several processes sharding one cell the
+        # checkpoints do not arrive in order, so a count says nothing about which seeds this
+        # shard still owes.
+        # Resume per SEED, not per count: with several workers sharding one cell the
+        # checkpoints do not arrive in order, so a count says nothing about which seeds
+        # this worker still owes.
+        todo = [k for k in WORKER:WORKERS:(SEEDS - 1)
+                if !isfile(joinpath(dir, rollout_filename(k)))]
+        if isempty(todo)
+            @printf("  %-11s shard banked, skipping\n", arm); flush(stdout)
             continue
         end
-        for k in done:(SEEDS - 1)
+        for k in todo
             t0 = time()
             res = run_rollout(build_arm(arm, cfg, policy, tbl), state0, cr3bp_j2_eom!,
                               period_s, horizon;

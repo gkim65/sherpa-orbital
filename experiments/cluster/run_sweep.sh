@@ -27,6 +27,12 @@ VALS_ALL="${VALS_ALL:-0.0 0.015 0.05 0.1 0.2 0.3 0.4 1.0}"
 SEEDS="${SEEDS:-100}"
 DAYS="${DAYS:-30}"
 PLUME="${PLUME:-1.5}"
+# Rollout processes per level. Each takes every WORKERS-th seed and writes disjoint
+# checkpoint files. Memory is the limit rather than cores: a SARSOPController rebuilds T,
+# which is |S|^2 |A| floats — about 1 GB at |S| = 5627 — so budget ~2 GB per worker.
+WORKERS="${WORKERS:-8}"
+OUT="${OUT:-artifacts/sweeps/$KEY}"
+ARMS="${ARMS:-}"
 
 cd "$(dirname "$0")/../.."     # repo root, wherever this was invoked from
 mkdir -p logs
@@ -36,7 +42,7 @@ SUMMARY="logs/sweep_${STAMP}_summary.log"
 
 {
   echo "sweep $KEY = $VALS_ALL"
-  echo "$SEEDS seeds, $DAYS d, plume $PLUME"
+  echo "$SEEDS seeds across $WORKERS workers, $DAYS d, plume $PLUME"
   echo "host $(hostname), started $(date)"
   echo
 } | tee "$SUMMARY"
@@ -47,12 +53,28 @@ for V in $VALS_ALL; do
   echo "=== $KEY = $V  ->  $LOG  ($(date +%H:%M:%S)) ===" | tee -a "$SUMMARY"
   t0=$SECONDS
 
-  KEY="$KEY" VALS="$V" SEEDS="$SEEDS" DAYS="$DAYS" PLUME="$PLUME" \
+  # Pass 1: ONE process, one seed, to calibrate and solve. Every worker calls cell_policy,
+  # so without this all WORKERS of them would solve the same policy at once — and solving
+  # is the expensive step (9-40 min) while rollouts are seconds.
+  KEY="$KEY" VALS="$V" SEEDS=1 DAYS="$DAYS" PLUME="$PLUME" OUT="$OUT" ARMS="$ARMS" \
     julia --project=experiments -t auto experiments/sweep.jl > "$LOG" 2>&1
   rc=$?
 
+  # Pass 2: fan the remaining seeds across processes. Each finds the kernels and the .out
+  # already on disk and goes straight to flying.
+  if [ "$rc" -eq 0 ] && [ "$SEEDS" -gt 1 ]; then
+    for w in $(seq 0 $((WORKERS - 1))); do
+      KEY="$KEY" VALS="$V" SEEDS="$SEEDS" DAYS="$DAYS" PLUME="$PLUME" OUT="$OUT" \
+      ARMS="$ARMS" WORKERS="$WORKERS" WORKER="$w" \
+        julia --project=experiments experiments/sweep.jl > "${LOG%.log}_w${w}.log" 2>&1 &
+    done
+    # Fail the level if ANY worker failed, so the summary does not report success on a
+    # partially-flown cell.
+    for job in $(jobs -p); do wait "$job" || rc=$?; done
+  fi
+
   mins=$(( (SECONDS - t0) / 60 ))
-  n=$(find "artifacts/sweeps/$KEY" -path "*${KEY}=${V}*" -name '*.jld2' 2>/dev/null | wc -l)
+  n=$(find "$OUT" -path "*${KEY}=${V}*" -name '*.jld2' 2>/dev/null | wc -l)
   if [ $rc -eq 0 ]; then
     echo "    done in ${mins} min, ${n} rollouts" | tee -a "$SUMMARY"
   else
@@ -60,11 +82,12 @@ for V in $VALS_ALL; do
     echo "    FAILED rc=$rc after ${mins} min, ${n} rollouts — see $LOG" | tee -a "$SUMMARY"
     # The ERROR line, not the tail: a Julia stack trace ends in `_start()`, so tailing a
     # failed log shows the least informative part of it.
-    grep -m1 -A4 "^ERROR" "$LOG" | sed 's/^/      /' | tee -a "$SUMMARY"
+    grep -m1 -A4 "^ERROR" "$LOG" "${LOG%.log}"_w*.log 2>/dev/null |
+      head -6 | sed 's/^/      /' | tee -a "$SUMMARY"
   fi
 done
 
 echo | tee -a "$SUMMARY"
 echo "all levels finished in $(( (SECONDS - t_all) / 60 )) min at $(date)" | tee -a "$SUMMARY"
-echo "checkpoints: $(find "artifacts/sweeps/$KEY" -name '*.jld2' 2>/dev/null | wc -l)" | tee -a "$SUMMARY"
-echo "analyse with: load_sweep(\"artifacts/sweeps/$KEY\")" | tee -a "$SUMMARY"
+echo "checkpoints: $(find "$OUT" -name '*.jld2' 2>/dev/null | wc -l)" | tee -a "$SUMMARY"
+echo "analyse with: load_sweep(\"$OUT\")" | tee -a "$SUMMARY"
