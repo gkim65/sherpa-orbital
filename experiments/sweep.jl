@@ -65,7 +65,12 @@ const PLUME = parse(Float64, get(ENV, "PLUME", "1.5"))
 const OUT   = get(ENV, "OUT", joinpath("artifacts", "sweeps", String(KEY)))
 const ALL_ARMS = ["POMDP", "Threshold", "Cyclic k=1", "Cyclic k=2", "Cyclic k=3",
                   "Greedy", "MPC hold"]
-const ARMS  = haskey(ENV, "ARMS") ? split(ENV["ARMS"], ",") : ALL_ARMS
+# An EMPTY `ARMS` means "all", not "one arm with no name": a shell driver that always
+# forwards the variable passes "" when the caller did not set it, and `haskey` is true for
+# that, so splitting it yields a single empty arm and the run dies on the first cell.
+const ARMS  = let a = strip(get(ENV, "ARMS", ""))
+    isempty(a) ? ALL_ARMS : [strip(x) for x in split(a, ",") if !isempty(strip(x))]
+end
 const RECAL = needs_recalibration(KEY)
 
 state0   = nondim_to_cr3bp(collect(PERIOD1_SOUTH_IC_ND))

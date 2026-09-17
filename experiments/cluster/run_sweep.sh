@@ -32,7 +32,7 @@ PLUME="${PLUME:-1.5}"
 # which is |S|^2 |A| floats — about 1 GB at |S| = 5627 — so budget ~2 GB per worker.
 WORKERS="${WORKERS:-8}"
 OUT="${OUT:-artifacts/sweeps/$KEY}"
-ARMS="${ARMS:-}"
+ARMS="${ARMS:-}"     # empty = every arm; sweep.jl treats "" as unset
 
 cd "$(dirname "$0")/../.."     # repo root, wherever this was invoked from
 mkdir -p logs
