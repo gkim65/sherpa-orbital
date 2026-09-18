@@ -903,3 +903,145 @@ function plot_sweep_bars(rows, key::Symbol;
     end
     return fig
 end
+
+"""
+    action_bands(rows, key, value; arm = "POMDP", actions = nothing) -> (M, n, nroll)
+
+Fraction of rollouts choosing each action at each pass, for one sweep cell.
+
+  - `rows` — checkpoints from [`load_sweep`](@ref)
+  - `key` — the swept field, e.g. `:sigma_nav_km`
+  - `value` — the swept value to select
+  - `arm` — which controller's traces to measure
+  - `actions` — action order, top to bottom; `nothing` orders by commanded altitude
+
+Returns `M[action, pass]`, the number of passes `n`, and the number of rollouts `nroll`.
+
+`n` is the LONGEST trace, and each column is normalised by how many rollouts were still
+flying at that pass. Truncating to the shortest trace instead would let a single early
+death collapse the whole cell: at 200 seeds with one rollout lost at pass 7, a
+shortest-trace strip shows 7 passes of a 60-pass episode and reads as a clean short
+pattern.
+
+`alive[p]` is returned alongside, since a column late in the horizon may rest on very few
+rollouts.
+
+NOTE: a policy is a function of belief, not of pass number, so a column being unanimous
+means every rollout arrived at the same belief by that pass — not that the policy is
+open-loop. Unanimity decaying with pass is the belief distribution spreading.
+"""
+function action_bands(rows, key::Symbol, value::Real;
+                      arm::AbstractString = "POMDP", actions = nothing)
+    k = String(key)
+    cell = filter(r -> r["arm"] == arm && haskey(r, k) &&
+                       Float64(r[k]) == Float64(value), rows)
+    isempty(cell) && return (M = zeros(0, 0), n = 0, nroll = 0)
+    acts = actions === nothing ?
+        ["EXCURSE_HIGH", "CORRECT", "EXCURSE_MID", "EXCURSE_LOW"] : collect(actions)
+    n = maximum(length(r["actions"]) for r in cell)
+    n == 0 && return (M = zeros(length(acts), 0), n = 0, nroll = length(cell),
+                      alive = Int[])
+    alive = [count(r -> length(r["actions"]) >= p, cell) for p in 1:n]
+    M = [alive[p] == 0 ? 0.0 :
+         count(r -> length(r["actions"]) >= p && r["actions"][p] == a, cell) / alive[p]
+         for a in acts, p in 1:n]
+    return (M = M, n = n, nroll = length(cell), alive = alive)
+end
+
+"""
+    plot_action_bands(rows, key; path, theme, values, arm, size)
+
+Action chosen per pass, one row of strips per swept value.
+
+  - `rows` — checkpoints from [`load_sweep`](@ref)
+  - `key` — the swept field, e.g. `:sigma_nav_km`
+  - `path` — output path WITHOUT extension; writes `.pdf`, `.svg` and `.png`
+  - `theme` — `:light` or `:dark`; saved transparent so either background works
+  - `values` — swept values to draw, top to bottom; `nothing` uses all present
+  - `arm` — which controller to measure
+
+Returns the Makie `Figure`. Requires CairoMakie to be loaded by the caller.
+
+One heatmap strip per action, shaded in that action's own colour with opacity carrying the
+fraction of rollouts that chose it. Rows are ordered by commanded altitude, so the vertical
+position of the shading reads directly as "how low is it flying".
+
+Stacking one row per swept value shows how the policy's behaviour changes with the
+uncertainty it was solved for — the campaign structure at low noise against whatever
+replaces it at high noise.
+"""
+function plot_action_bands(rows, key::Symbol;
+                           path::AbstractString = "figures/action_bands",
+                           theme::Symbol = :light,
+                           values = nothing,
+                           arm::AbstractString = "POMDP",
+                           size::Union{Nothing,Tuple{Int,Int}} = nothing)
+    Makie = get(Base.loaded_modules,
+                Base.PkgId(Base.UUID("13f3f980-e62b-5c42-98c6-ff1f3baf88f0"), "CairoMakie"),
+                nothing)
+    Makie === nothing && error(
+        "plot_action_bands needs CairoMakie loaded by the caller: `using CairoMakie` " *
+        "before calling. The library declares no plotting dependency.")
+
+    k = String(key)
+    vals = values === nothing ?
+        sort(unique(Float64(r[k]) for r in rows if haskey(r, k))) : collect(values)
+    # Top to bottom by commanded altitude, so the shading's height reads as altitude.
+    ACTS = ["EXCURSE_HIGH", "CORRECT", "EXCURSE_MID", "EXCURSE_LOW"]
+    ALTS = ["46.0", "37.2", "30.5", "23.5"]
+    fg = theme === :dark ? Makie.RGBf(0.92, 0.92, 0.92) : Makie.RGBf(0.10, 0.10, 0.10)
+    ACOL = [Makie.RGBf(0.93, 0.47, 0.20), Makie.RGBf(0.62, 0.62, 0.62),
+            Makie.RGBf(0.13, 0.53, 0.20), Makie.RGBf(0.27, 0.47, 0.67)]
+
+    cells = [(v, action_bands(rows, key, v; arm = arm, actions = ACTS)) for v in vals]
+    cells = [(v, c) for (v, c) in cells if c.n > 0]
+    isempty(cells) && error("no traces for $arm at any requested value of $key")
+
+    nr = length(cells)
+    figsize = size === nothing ? (520, 108 * nr + 58) : size
+    fig = Makie.Figure(; size = figsize, backgroundcolor = :transparent,
+                       figure_padding = (2, 4, 2, 2),
+                       fonts = (; regular = "CMU Serif", bold = "CMU Serif Bold"))
+
+    for (r, (v, c)) in enumerate(cells)
+        ax = Makie.Axis(fig[r, 1];
+                        yticks = (1:4, ["$(a)\n($(h) km)" for (a, h) in zip(ACTS, ALTS)]),
+                        xlabel = r == nr ? "Periapsis pass" : "",
+                        xticklabelsvisible = r == nr,
+                        ylabel = "", yticklabelsize = 8,
+                        title = "$(key) = $(v)    N=$(c.nroll)" *
+                                (isempty(c.alive) ? "" :
+                                 "  (still flying at last pass: $(c.alive[end]))"),
+                        titlealign = :left, titlesize = 10, titlecolor = fg,
+                        backgroundcolor = :transparent,
+                        xgridvisible = false, ygridvisible = false,
+                        xlabelcolor = fg, xticklabelcolor = fg, yticklabelcolor = fg,
+                        leftspinecolor = fg, bottomspinecolor = fg,
+                        topspinevisible = false, rightspinevisible = false,
+                        xtickcolor = fg, ytickcolor = fg)
+        for a in 1:length(ACTS)
+            # A transparent-to-solid ramp in the action's own colour. `cgrad` on
+            # (colour, alpha) tuples reads them as colourscheme stops and throws, so the
+            # stops are built as RGBA directly.
+            Makie.heatmap!(ax, 1:c.n, [a - 0.5, a + 0.5], reshape(c.M[a, :], :, 1);
+                           colormap = Makie.cgrad([
+                               Makie.RGBAf(Makie.red(ACOL[a]), Makie.green(ACOL[a]),
+                                           Makie.blue(ACOL[a]), 0.0f0),
+                               Makie.RGBAf(Makie.red(ACOL[a]), Makie.green(ACOL[a]),
+                                           Makie.blue(ACOL[a]), 1.0f0)]),
+                           colorrange = (0, 1))
+        end
+        Makie.hlines!(ax, [1.5, 2.5, 3.5]; color = (fg, 0.25), linewidth = 0.6)
+        # REVERSED: ACTS runs top-to-bottom by altitude but Makie counts y upward, so
+        # without this EXCURSE_HIGH would land at the bottom and the altitude ordering
+        # would read upside down.
+        Makie.ylims!(ax, 4.5, 0.5)
+        Makie.xlims!(ax, 0.5, c.n + 0.5)
+    end
+
+    mkpath(dirname(path))
+    for ext in ("pdf", "svg", "png")
+        Makie.save("$path.$ext", fig; backgroundcolor = :transparent)
+    end
+    return fig
+end

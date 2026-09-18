@@ -192,6 +192,8 @@ export
     plot_sweep_bars,
     plot_sweep,
     plot_sweep_timelines,
+    action_bands,
+    plot_action_bands,
     # per-rollout checkpointing — written as each rollout completes, so a killed sweep
     # keeps what it flew and resumes from disk
     cell_dir,
