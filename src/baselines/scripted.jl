@@ -3,9 +3,9 @@ baselines/scripted.jl — scripted high-level controllers sharing the POMDP's lo
 
 Each baseline answers the same question the POMDP does — which maneuver objective to attempt
 this pass — with a rule instead of a policy. They fly the identical hierarchy otherwise: the
-same `solve_burn` planner, the same persistent excursion reference, the same commanded band
-altitudes, and the same OBSERVED-altitude coverage banking under nav noise. That makes the
-comparison single-variable: only the top layer changes.
+same `solve_burn` planner, the same targeting modes, the same commanded band altitudes, and
+the same OBSERVED-altitude coverage banking under nav noise. That makes the comparison
+single-variable: only the top layer changes.
 
   - [`CyclicController`](@ref)    — a fixed LOW/MID/HIGH rotation with `k` corrections between
   - [`GreedyController`](@ref)    — always excurse to the least-sampled band
@@ -24,14 +24,15 @@ band has saturated, so it is close to open-loop; `MPCController` implements no
 therefore not evidence of robustness for those two — they barely consume the swept
 variable. Compare the policy against the closed-loop baselines.
 
-NOTE: `controller_command` receives the TRUE state, so every controller plans its burn
-against truth and nav noise never corrupts a maneuver, only a decision. In flight the
-planner would target from the navigation solution instead. This understates what navigation
-error costs, uniformly across arms.
+NOTE: `controller_command` plans from a navigation ESTIMATE when the controller reports a
+nonzero `controller_nav_sigma`, so nav error lands as a targeting miss as well as a decision
+error. A controller left at the `0.0` default plans from truth and is an oracle by
+comparison; set it to match the arm being compared.
 
-NOTE: excursion commands are PERSISTENT here too — an `EXCURSE_*` sets the active reference
-and it stays set until a `CORRECT` clears it. Single-impulse authority is poor, so a band is
-reached by settling over several passes.
+NOTE: an excursion is a ONE-PASS command, not a held reference. `active_band` records the
+last band commanded but nothing reads it, so every pass solves fresh from the current state.
+Single-impulse authority is poor, so reaching a commanded altitude takes several passes —
+which happens only when the controller keeps choosing that band.
 """
 
 # ── Shared scripted-controller state ──────────────────────────────────────────
@@ -71,6 +72,7 @@ Base.@kwdef mutable struct ScriptedCore
     # Live state, mirroring SARSOPController's.
     visits::Vector{Int} = Int[]
     residual::String = "R_OK"
+    # Last band commanded. Trace state only — nothing reads it.
     active_band::String = ""
     pass::Int = 0
     r_peri_nom::Union{Nothing,Vector{Float64}} = nothing

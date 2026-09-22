@@ -290,9 +290,8 @@ mutable struct SARSOPController <: AbstractController
     # The damage bin the LAST pass's onboard solve produced. Starts `:R_OK` — the vehicle
     # begins on the reference orbit, where the solve is clean.
     residual::String
-    # PERSISTENT excursion reference: the band currently being aimed at, or "" for the
-    # nominal orbit. This is what makes EXCURSE_* a multi-pass command rather than a
-    # one-pass dip — see `controller_command`.
+    # Band commanded on the last step, or "" for the nominal orbit. Trace state only —
+    # nothing reads it, and each pass re-solves from the current state.
     active_band::String
     r_peri_nom::Union{Nothing,Vector{Float64}}
     r_apo_nom::Union{Nothing,Vector{Float64}}
@@ -615,9 +614,8 @@ function controller_command(c::SARSOPController, shell_state::AbstractVector, pe
     action = policy_action(c)
 
     if action == "CORRECT"
-        # CORRECT CLEARS the active excursion and re-aims at the ORIGINAL reference orbit.
-        # It is the only way back to nominal, which is what makes the excursion reference
-        # persistent rather than one-pass.
+        # Re-aim at the ORIGINAL reference orbit. `active_band` is trace state only —
+        # nothing reads it, so each pass solves fresh from the current state.
         c.active_band = ""
         b = solve_burn(shell_state, period_s; eom! = cr3bp_eom!,
                        mode = :position,
@@ -627,12 +625,12 @@ function controller_command(c::SARSOPController, shell_state::AbstractVector, pe
                                 peri_err_km = b.peri_err_km)
     end
 
-    # EXCURSE_<BAND>: SET the active reference to that band and aim at it.
+    # EXCURSE_<BAND>: aim at that band's commanded altitude.
     #
-    # A PERSISTENT command, not a one-pass dip: the band stays the reference until CORRECT
-    # clears it, so choosing the same EXCURSE again continues the approach. Single-impulse
-    # authority is poor, so settling over several passes is what actually reaches a
-    # commanded altitude.
+    # Single-impulse authority is poor, so one burn does not reach a commanded altitude.
+    # Re-choosing the same EXCURSE on the next pass solves again from the state that burn
+    # produced, which is how a band is reached — by settling over several passes. That
+    # repetition comes from the POLICY choosing the action again, not from stored state.
     #
     # `:altitude_position` constrains the periapsis by ALTITUDE — the quantity actually
     # commanded — while keeping the apoapsis-position constraints that pin the orientation.

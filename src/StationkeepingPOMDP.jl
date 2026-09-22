@@ -109,8 +109,8 @@ Base.@kwdef struct StationkeepingPOMDP
     # cannot be a science objective.
     band_bins::NTuple{3,Symbol}     = (:A20_27, :A27_34, :ABOVE_44)
     # Commanded periapsis altitude per band (km). All three are realisable halo-family
-    # members, and the excursion reference PERSISTS until CORRECT clears it — so a band is
-    # reached by settling over several passes, not in one impulse.
+    # members. One impulse does not deliver a band, so reaching one takes several passes of
+    # the same EXCURSE — driven by the policy re-choosing it, not by a held reference.
     #
     # EACH COMMAND SITS IN ITS BIN'S INTERIOR, AWAY FROM THE EDGES. Delivery is ~0.2 km,
     # so a command placed on a boundary lands close enough to it that nav noise misbins the

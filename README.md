@@ -63,9 +63,9 @@ from the same region and reports `P(lost) ≈ 0` for the maneuver that loses the
 Conditioned on `ρ`, correcting from LOW at `R_CRITICAL` measures `P(lost) = 0.82` against
 `0.0` at moderate and high altitude.
 
-**Actions.** Every action commands a maneuver; there is no null action. `EXCURSE_*` sets a
-persistent reference held until a `CORRECT` clears it, so a band is reached over several
-passes rather than one impulse.
+**Actions.** Every action commands a maneuver; there is no null action. One impulse does not
+deliver a band, so reaching one takes several passes of the same `EXCURSE_*` — each solving
+afresh from the state the previous burn produced, driven by the policy re-choosing it.
 
 **Reward.** `f` is the coverage increment, falling to `repeat_factor` once a region saturates
 or a pass lands outside every science region. `u(i′) ∈ {0.30, 0.65, 1.00}` scales with
