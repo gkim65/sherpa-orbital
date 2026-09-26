@@ -48,8 +48,8 @@ keep = filter(r -> Float64(r["sigma_nav_km"]) in (0.0, 0.1, 0.2, 0.3, 0.4), rows
 plot_sweep(keep, :sigma_nav_km;
            path      = "figures/paper_3panel",
            xlabel    = "Navigation noise σ (km)",
-           arms      = ["POMDP", "MPC hold", "Greedy",
-                        "Cyclic k=1", "Cyclic k=2", "Cyclic k=3", "Threshold"],
+           arms      = ["POMDP", "Safety", "MPC hold", "Greedy",
+                        "Cyclic k=2", "Cyclic k=3"],
            panels    = (:science_survivors, :survival, :days_mean),
            bar_panels = (:days_mean,),
            legend_below = true,
@@ -58,10 +58,10 @@ plot_sweep(keep, :sigma_nav_km;
 
 Science is reported over SURVIVING runs. Pooling survivors with failures averages two
 populations — a run that dies on day 3 banks almost nothing — so the pooled mean tracks the
-survival rate rather than the science a working controller collects. Measured at σ = 0.3,
-Threshold pools to 54.7 ± 31.0 while its survivors are 92.4 ± 3.9 against the policy's
-100.2 ± 4.6: an 8% gap, not the 2x the pooled numbers imply. The survival panel carries the
-risk instead.
+survival rate rather than the science a working controller collects. Measured at sigma = 0.3,
+`Greedy` survives 25.8% of runs but its survivors bank 91.8, against the policy's 103.9 over
+all 1000 — pooling would report Greedy at roughly a quarter of its science and read as a
+science gap rather than the survival gap it is. The survival panel carries the risk instead.
 
 ## 2. Policy behaviour — `policy_panel`
 

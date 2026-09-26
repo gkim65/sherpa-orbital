@@ -220,7 +220,7 @@ core = scripted_core(config; ref_ic = ic)
 
 CyclicController(core, 2)                          # LOW, CORRECT×2, MID, ... then hold
 GreedyController(core)                             # excurse to the least-sampled band
-ThresholdController(core; max_residual = "R_OK")   # excurse only from a clean orbit
+SafetyController(core)                             # excurse from a clean orbit, never deep
 MPCController(; ref_ic = ic, mode = :position, nav_sigma_km = config.sigma_nav_km)
 ```
 
