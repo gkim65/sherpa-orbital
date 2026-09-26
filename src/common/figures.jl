@@ -309,7 +309,7 @@ function sweep_summary(rows, key::Symbol)
         # Science among the runs that SURVIVED. Pooling survivors with failures averages two
         # populations: a run that dies on day 3 banks almost nothing, so the mixed mean
         # tracks the survival rate rather than the science a working controller collects.
-        # Measured at sigma = 0.3: Threshold pools to 54.7 +/- 31.0, but its three survivors
+        # Measured at sigma = 0.3: the safety rule pools to 54.7 +/- 31.0, but its survivors
         # are 92.4 +/- 3.9 against the policy's 100.2 +/- 4.6 — an 8% gap, not a 2x one.
         # NaN when nothing survived; there is no science to report, which a gap in the plot
         # states more honestly than a zero.
@@ -401,7 +401,7 @@ function plot_sweep(rows, key::Symbol;
                Makie.RGBf(0.00, 0.62, 0.45), Makie.RGBf(0.80, 0.47, 0.65),
                Makie.RGBf(0.84, 0.37, 0.00), Makie.RGBf(0.35, 0.35, 0.35),
                Makie.RGBf(0.58, 0.44, 0.86), Makie.RGBf(0.00, 0.62, 0.79)]
-    LABEL = Dict(:science => "Science reward, all\nruns (mean ± 1 sd)",
+    LABEL = Dict(:science => "Science reward\n(mean, std)",
                  :frac_degraded => "Fraction of passes\ndegraded",
                  :survival => "Survival rate", :misbin => "Region misbin rate",
                  :dv => "Total dV (m/s)", :samples => "Samples banked",
@@ -409,7 +409,7 @@ function plot_sweep(rows, key::Symbol;
                  :days_median => "Median survival\n(days)",
                  :days_failed => "Days to failure\n(median, failed runs)",
                  :days_failed_mean => "Days to failure\n(mean, failed runs)",
-                 :science_survivors => "Science reward, surviving\nruns (mean ± 1 sd)")
+                 :science_survivors => "Science reward,\nsurviving runs (std)")
 
     fig = Makie.Figure(; size = size, backgroundcolor = :transparent,
                        # Tight: the default 16pt margin is visible whitespace once the

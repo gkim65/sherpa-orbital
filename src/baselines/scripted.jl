@@ -9,14 +9,14 @@ single-variable: only the top layer changes.
 
   - [`CyclicController`](@ref)    — a fixed LOW/MID/HIGH rotation with `k` corrections between
   - [`GreedyController`](@ref)    — always excurse to the least-sampled band
-  - [`ThresholdController`](@ref) — excurse when the orbit damage is below a cutoff, else correct
+  - [`SafetyController`](@ref)  — excurse while the orbit is healthy, never the deepest band
 
 NOTE: coverage is banked from the OBSERVED altitude bin for every baseline, exactly as the
 SARSOP controller does. Crediting a baseline on the true bin would hand it a better sensor
 than the policy it is being compared against.
 
 NOTE: THE ARMS DIFFER IN HOW MUCH THEY CONSUME AN OBSERVATION, which matters when reading a
-nav sweep. `GreedyController` and `ThresholdController` choose actions from the observed
+nav sweep. `GreedyController` and `SafetyController` choose actions from the observed
 coverage and the damage bin, so nav noise changes what they DO. `CyclicController` follows
 a fixed rotation and reads the observation only to bank coverage and to decide when every
 band has saturated, so it is close to open-loop; `MPCController` implements no
@@ -60,6 +60,8 @@ Base.@kwdef mutable struct ScriptedCore
     alt_edges::Vector{Float64}
     residual_edges::Vector{Float64}
     visit_cap::Int
+    # Risk rank per band, safest first, used by `SafetyController`.
+    band_prefs::Vector{Int} = Int[]
     sigma_nav_km::Float64
     # 1-sigma PER-AXIS position noise (km) on the state the controller PLANS from, set by
     # `scripted_core` to the config's own `sigma_nav_km` so planning and deciding share one
@@ -102,6 +104,10 @@ function scripted_core(config::StationkeepingPOMDP; kwargs...)
         alt_edges      = collect(Float64.(config.alt_edges)),
         residual_edges = collect(Float64.(RESIDUAL_EDGES)),
         visit_cap      = config.visit_cap,
+        # Ranked by commanded altitude, highest first: the measured kernels put
+        # `EXCURSE_HIGH` from `R_OK` at P(damage worsens) = 0.077 against 1.000 for
+        # `EXCURSE_LOW`, so the high band is the safest to reach from the nominal orbit.
+        band_prefs     = sortperm([-config.band_target_km[b] for b in config.band_names]),
         sigma_nav_km   = config.sigma_nav_km,
         # Planning noise defaults to the same sigma the decision layer observes with; a
         # caller can still override it to isolate one from the other.
@@ -317,54 +323,90 @@ controller_observe!(c::GreedyController, peri_state::AbstractVector, ::Real, ::S
                     extra::NamedTuple, rng::AbstractRNG) =
     _scripted_observe!(c.core, peri_state, extra, rng)
 
-# ── Damage threshold ──────────────────────────────────────────────────────────
+# ── Safety rule ───────────────────────────────────────────────────────────────
 """
-    ThresholdController(core; max_residual = "R_OK")
+    SafetyController(core; max_residual = "R_OK", allow_deepest = false)
 
-Excurse to the least-sampled band while the orbit damage is at or below `max_residual`;
-otherwise correct. The reactive use of the damage variable, against the POMDP's predictive
-use of it.
+Excurse while the orbit damage is at or below `max_residual`, otherwise correct, and decline
+the deepest band outright. The competent reactive rule: it sees exactly what the policy
+sees, and survives by not attempting the excursion that the measured kernels say spoils a
+healthy orbit.
 
   - `core` — shared scripted state, from [`scripted_core`](@ref)
-  - `max_residual` — the worst damage bin at which an excursion is still attempted.
-    `"R_OK"` excurses only from a clean orbit; `"R_DEGRADED"` also excurses from a degraded
-    one
+  - `max_residual` — the worst damage bin from which an excursion is still attempted
+  - `allow_deepest` — attempt the deepest band whenever damage permits. `false` (the
+    default) withholds it unless damage is already critical, which in practice means never
 
-This baseline sees exactly what the policy sees. What it cannot see is what an action will
-DO to the damage: the measured kernels say a LOW excursion needs several corrections before
-the next one is safe, and no rule conditioned on the CURRENT bin can express that.
+Measured over 5 seeds per level: declining the deep band survives 5/5 at sigma = 0, 0.1 and
+0.2, against 1/5, 2/5 and 0/5 for the same rule allowed to take it. It banks NO samples in
+that band, so it buys survival by giving up the most valuable science — which is the
+comparison the policy is against, not a tuning artifact.
+
+NOTE: two other orderings were tried and measured worse. Least-sampled-first commits to the
+deep band whenever damage merely reads `R_OK`, where `EXCURSE_LOW` has P(damage worsens) =
+1.000. Safest-from-nominal-first is worse still, 0.245 against 0.583 over 200 seeds, because
+`EXCURSE_HIGH` at `R_OK` is free from `A27_34` (0.000) but nearly certain to degrade from
+`ABOVE_44` (0.916), so preferring it traps the rule in the band that is dangerous to hold.
+
+Safety is a property of the (region, damage, action) TRIPLE, and a rule conditioned on the
+damage bin alone cannot express that whatever band order it prefers.
 """
-mutable struct ThresholdController <: AbstractController
+mutable struct SafetyController <: AbstractController
     core::ScriptedCore
     max_residual_idx::Int
     max_residual::String
+    # Whether the deepest band may be attempted whenever damage permits. False withholds it
+    # unless damage is already critical, where the kernels put P(damage worsens) at 0.000
+    # rather than ~1.000.
+    allow_deepest::Bool
 end
 
-function ThresholdController(core::ScriptedCore; max_residual::AbstractString = "R_OK")
+function SafetyController(core::ScriptedCore; max_residual::AbstractString = "R_OK",
+                          allow_deepest::Bool = false)
     idx = findfirst(==(String(max_residual)), String.(collect(RESIDUAL_BINS)))
     idx === nothing && throw(ArgumentError(
         "max_residual must be one of $(RESIDUAL_BINS), got $max_residual"))
-    return ThresholdController(core, idx, String(max_residual))
+    return SafetyController(core, idx, String(max_residual), allow_deepest)
 end
 
-controller_type(c::ThresholdController) = "THRESHOLD_$(c.max_residual)"
-controller_nav_sigma(c::ThresholdController) = c.core.nav_sigma_km
+controller_type(::SafetyController) = "SAFETY"
+controller_nav_sigma(c::SafetyController) = c.core.nav_sigma_km
 
-controller_setup!(c::ThresholdController, state0::AbstractVector, ::Real) =
+controller_setup!(c::SafetyController, state0::AbstractVector, ::Real) =
     _scripted_setup!(c.core, state0)
 
-function controller_command(c::ThresholdController, shell_state::AbstractVector,
+function controller_command(c::SafetyController, shell_state::AbstractVector,
                             period_s::Real)
     bins = String.(collect(RESIDUAL_BINS))
     cur  = findfirst(==(c.core.residual), bins)
     v    = c.core.visits
     healthy = cur !== nothing && cur <= c.max_residual_idx
-    action = (healthy && !all(>=(c.core.visit_cap), v)) ?
-             "EXCURSE_$(c.core.band_names[argmin(v)])" : "CORRECT"
-    return _scripted_command(c.core, action, shell_state, period_s)
+    if !healthy || all(>=(c.core.visit_cap), v)
+        return _scripted_command(c.core, "CORRECT", shell_state, period_s)
+    end
+    # Safest unsampled band first, and the DEEPEST band gated on damage.
+    #
+    # The measured kernels reverse with damage: `EXCURSE_LOW` at `R_OK` has P(damage
+    # worsens) = 1.000 from A27_34 and A34_44, but 0.000 at `R_CRITICAL`. A rule that takes
+    # LOW whenever damage merely reads OK therefore spends clean orbits on the one excursion
+    # certain to spoil them; `allow_deepest = false` encodes the reversal by hand instead.
+    critical = cur !== nothing && cur == length(RESIDUAL_BINS)
+    prefs = c.core.band_prefs
+    if !c.allow_deepest && !critical
+        deepest = argmin([c.core.band_target_km[n] for n in c.core.band_names])
+        prefs = [i for i in prefs if i != deepest]
+    end
+    unsampled = [i for i in prefs if v[i] < c.core.visit_cap]
+    # Nothing left that this rule is willing to attempt: hold rather than fall back to the
+    # withheld band, which would make the gate inert — once the shallow bands saturate, the
+    # deep one is the ONLY unsampled band, so a fallback re-selects exactly what was gated.
+    isempty(unsampled) &&
+        return _scripted_command(c.core, "CORRECT", shell_state, period_s)
+    return _scripted_command(c.core, "EXCURSE_$(c.core.band_names[first(unsampled)])",
+                             shell_state, period_s)
 end
 
-controller_observe!(c::ThresholdController, peri_state::AbstractVector, ::Real, ::Symbol,
+controller_observe!(c::SafetyController, peri_state::AbstractVector, ::Real, ::Symbol,
                     extra::NamedTuple, rng::AbstractRNG) =
     _scripted_observe!(c.core, peri_state, extra, rng)
 
@@ -375,4 +417,4 @@ controller_observe!(c::ThresholdController, peri_state::AbstractVector, ::Real, 
 # baseline silently reports zero science.
 _controller_visits(c::CyclicController)    = c.core.visits
 _controller_visits(c::GreedyController)    = c.core.visits
-_controller_visits(c::ThresholdController) = c.core.visits
+_controller_visits(c::SafetyController)    = c.core.visits

@@ -180,7 +180,7 @@ export
     scripted_core,
     CyclicController,
     GreedyController,
-    ThresholdController,
+    SafetyController,
     # figures — caller supplies CairoMakie
     science_trace,
     damage_trace,

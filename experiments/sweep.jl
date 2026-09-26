@@ -63,7 +63,7 @@ const WORKER  = parse(Int, get(ENV, "WORKER", "0"))
 const DAYS  = parse(Float64, get(ENV, "DAYS", "30"))
 const PLUME = parse(Float64, get(ENV, "PLUME", "1.5"))
 const OUT   = get(ENV, "OUT", joinpath("artifacts", "sweeps", String(KEY)))
-const ALL_ARMS = ["POMDP", "Threshold", "Cyclic k=1", "Cyclic k=2", "Cyclic k=3",
+const ALL_ARMS = ["POMDP", "Safety", "Cyclic k=2", "Cyclic k=3",
                   "Greedy", "MPC hold"]
 # An EMPTY `ARMS` means "all", not "one arm with no name": a shell driver that always
 # forwards the variable passes "" when the caller did not set it, and `haskey` is true for
@@ -138,8 +138,9 @@ function build_arm(arm::AbstractString, cfg, policy, tbl)
     arm == "MPC hold"  && return MPCController(; ref_ic = state0, mode = :position,
                                                nav_sigma_km = cfg.sigma_nav_km)
     arm == "Greedy"    && return GreedyController(scripted_core(cfg; ref_ic = state0))
-    arm == "Threshold" && return ThresholdController(scripted_core(cfg; ref_ic = state0);
-                                                     max_residual = "R_OK")
+    arm == "Safety" &&
+        return SafetyController(scripted_core(cfg; ref_ic = state0);
+                                max_residual = "R_OK")
     m = match(r"Cyclic k=(\d+)", arm)
     m === nothing && error("unknown arm $arm; known: $(join(ALL_ARMS, ", "))")
     return CyclicController(scripted_core(cfg; ref_ic = state0), parse(Int, m[1]))
