@@ -127,9 +127,9 @@ Delivery error is distinct from the observation misbin rate: nav noise mis-ATTRI
 pass, while this is the pass not going where it was commanded. Both cost coverage, and a
 science total is only interpretable with each reported.
 
-NOTE: an excursion reference PERSISTS until a `CORRECT` clears it, so consecutive
-`EXCURSE_*` steps are one multi-pass approach settling onto the band, not independent
-attempts. Early passes in a run of them are expected to show large error.
+NOTE: one impulse does not deliver a band, so consecutive `EXCURSE_*` steps read as one
+multi-pass approach settling onto it — each pass re-solves from the state the previous burn
+produced. Early passes in a run of them are expected to show large error.
 """
 function delivery_trace(result, config::StationkeepingPOMDP)
     t_days = Float64[]; cmd = Float64[]; ach = Float64[]
@@ -915,7 +915,8 @@ Fraction of rollouts choosing each action at each pass, for one sweep cell.
   - `arm` — which controller's traces to measure
   - `actions` — action order, top to bottom; `nothing` orders by commanded altitude
 
-Returns `M[action, pass]`, the number of passes `n`, and the number of rollouts `nroll`.
+Returns `M[action, pass]`, the number of passes `n`, the number of rollouts `nroll`, the
+count still flying at each pass, and the median elapsed time per pass.
 
 `n` is the LONGEST trace, and each column is normalised by how many rollouts were still
 flying at that pass. Truncating to the shortest trace instead would let a single early
@@ -942,10 +943,15 @@ function action_bands(rows, key::Symbol, value::Real;
     n == 0 && return (M = zeros(length(acts), 0), n = 0, nroll = length(cell),
                       alive = Int[])
     alive = [count(r -> length(r["actions"]) >= p, cell) for p in 1:n]
+    # Median elapsed time at each pass, so the strip can be drawn against days. The passes
+    # are near-periodic, so the spread across rollouts is small; the median keeps one run
+    # that coasted long from stretching the axis.
+    t_days = [median(Float64(r["t_days"][p]) for r in cell if length(r["t_days"]) >= p)
+              for p in 1:n]
     M = [alive[p] == 0 ? 0.0 :
          count(r -> length(r["actions"]) >= p && r["actions"][p] == a, cell) / alive[p]
          for a in acts, p in 1:n]
-    return (M = M, n = n, nroll = length(cell), alive = alive)
+    return (M = M, n = n, nroll = length(cell), alive = alive, t_days = t_days)
 end
 
 """
@@ -959,6 +965,9 @@ Action chosen per pass, one row of strips per swept value.
   - `theme` — `:light` or `:dark`; saved transparent so either background works
   - `values` — swept values to draw, top to bottom; `nothing` uses all present
   - `arm` — which controller to measure
+  - `label` — how to name the swept quantity in each row title
+  - `unit` — unit appended to the swept value in each row title
+  - `xaxis` — `:days` for elapsed mission time, `:pass` for the periapsis index
 
 Returns the Makie `Figure`. Requires CairoMakie to be loaded by the caller.
 
@@ -975,6 +984,9 @@ function plot_action_bands(rows, key::Symbol;
                            theme::Symbol = :light,
                            values = nothing,
                            arm::AbstractString = "POMDP",
+                           label::AbstractString = String(key),
+                           unit::AbstractString = "",
+                           xaxis::Symbol = :days,
                            size::Union{Nothing,Tuple{Int,Int}} = nothing)
     Makie = get(Base.loaded_modules,
                 Base.PkgId(Base.UUID("13f3f980-e62b-5c42-98c6-ff1f3baf88f0"), "CairoMakie"),
@@ -988,11 +1000,14 @@ function plot_action_bands(rows, key::Symbol;
         sort(unique(Float64(r[k]) for r in rows if haskey(r, k))) : collect(values)
     # Top to bottom by commanded altitude, so the shading's height reads as altitude.
     ACTS = ["EXCURSE_HIGH", "CORRECT", "EXCURSE_MID", "EXCURSE_LOW"]
-    ALTS = ["46.0", "37.2", "30.5", "23.5"]
+    # Tick labels drop the EXCURSE_ prefix and carry the commanded altitude on ONE line —
+    # a two-line label collides with its neighbour at this row height.
+    TICKS = ["HIGH (46 km)", "CORRECT (37 km)", "MID (30 km)", "LOW (24 km)"]
     fg = theme === :dark ? Makie.RGBf(0.92, 0.92, 0.92) : Makie.RGBf(0.10, 0.10, 0.10)
     ACOL = [Makie.RGBf(0.93, 0.47, 0.20), Makie.RGBf(0.62, 0.62, 0.62),
             Makie.RGBf(0.13, 0.53, 0.20), Makie.RGBf(0.27, 0.47, 0.67)]
 
+    rowtitle(v) = isempty(unit) ? "$label = $v" : "$label = $v $unit"
     cells = [(v, action_bands(rows, key, v; arm = arm, actions = ACTS)) for v in vals]
     cells = [(v, c) for (v, c) in cells if c.n > 0]
     isempty(cells) && error("no traces for $arm at any requested value of $key")
@@ -1005,13 +1020,12 @@ function plot_action_bands(rows, key::Symbol;
 
     for (r, (v, c)) in enumerate(cells)
         ax = Makie.Axis(fig[r, 1];
-                        yticks = (1:4, ["$(a)\n($(h) km)" for (a, h) in zip(ACTS, ALTS)]),
-                        xlabel = r == nr ? "Periapsis pass" : "",
+                        yticks = (1:4, TICKS),
+                        xlabel = r == nr ?
+                            (xaxis === :days ? "Mission time (days)" : "Periapsis pass") : "",
                         xticklabelsvisible = r == nr,
                         ylabel = "", yticklabelsize = 8,
-                        title = "$(key) = $(v)    N=$(c.nroll)" *
-                                (isempty(c.alive) ? "" :
-                                 "  (still flying at last pass: $(c.alive[end]))"),
+                        title = rowtitle(v),
                         titlealign = :left, titlesize = 10, titlecolor = fg,
                         backgroundcolor = :transparent,
                         xgridvisible = false, ygridvisible = false,
@@ -1019,11 +1033,14 @@ function plot_action_bands(rows, key::Symbol;
                         leftspinecolor = fg, bottomspinecolor = fg,
                         topspinevisible = false, rightspinevisible = false,
                         xtickcolor = fg, ytickcolor = fg)
+        # Strip edges: in days, a pass spans the interval between its neighbours' midpoints
+        # rather than one unit, so the cells are placed at their actual times.
+        xs = xaxis === :days ? c.t_days : collect(1.0:c.n)
         for a in 1:length(ACTS)
             # A transparent-to-solid ramp in the action's own colour. `cgrad` on
             # (colour, alpha) tuples reads them as colourscheme stops and throws, so the
             # stops are built as RGBA directly.
-            Makie.heatmap!(ax, 1:c.n, [a - 0.5, a + 0.5], reshape(c.M[a, :], :, 1);
+            Makie.heatmap!(ax, xs, [a - 0.5, a + 0.5], reshape(c.M[a, :], :, 1);
                            colormap = Makie.cgrad([
                                Makie.RGBAf(Makie.red(ACOL[a]), Makie.green(ACOL[a]),
                                            Makie.blue(ACOL[a]), 0.0f0),
@@ -1036,8 +1053,191 @@ function plot_action_bands(rows, key::Symbol;
         # without this EXCURSE_HIGH would land at the bottom and the altitude ordering
         # would read upside down.
         Makie.ylims!(ax, 4.5, 0.5)
-        Makie.xlims!(ax, 0.5, c.n + 0.5)
+        if xaxis === :days
+            Makie.xlims!(ax, 0.0, maximum(xs))
+        else
+            Makie.xlims!(ax, 0.5, c.n + 0.5)
+        end
     end
+
+    mkpath(dirname(path))
+    for ext in ("pdf", "svg", "png")
+        Makie.save("$path.$ext", fig; backgroundcolor = :transparent)
+    end
+    return fig
+end
+
+"""
+    band_orbits(config; eom! = cr3bp_j2_eom!, n_rev = 1, family_table = nothing)
+
+Propagate one revolution of the nominal orbit and of each science band's halo member.
+
+  - `config` — the scenario, supplying `band_target_km` and `correct_bin`
+  - `eom!` — dynamics to propagate under; the truth model by default
+  - `n_rev` — revolutions to trace
+  - `family_table` — prebuilt family; `nothing` continues one, which costs ~80 s cold
+
+Returns a Vector of `(label, alt_km, xyz)` in Enceladus-centred km, nominal orbit first.
+
+Each band is a genuine member of the continued L1 halo family at that periapsis altitude,
+not the nominal orbit scaled — a radially scaled apse vector is not a solution of the
+dynamics and would draw an orbit the spacecraft could not fly.
+"""
+function band_orbits(config::StationkeepingPOMDP = StationkeepingPOMDP();
+                     eom! = cr3bp_j2_eom!, n_rev::Real = 1,
+                     family_table = nothing)
+    table = family_table === nothing ? halo_family_table_cached() : family_table
+    nominal_alt = config.alt_rep_km[config.correct_bin]
+    want = [("Nominal", nominal_alt)]
+    for b in config.band_names
+        push!(want, (string(b), config.band_target_km[b]))
+    end
+
+    out = NamedTuple[]
+    for (lbl, alt) in want
+        m = retarget_to_altitude(table, alt)
+        m === nothing && continue
+        sol = propagate(eom!, m.ic, (0.0, n_rev * PERIOD1_TRIPLE_PERIOD_S);
+                        saveat = range(0, n_rev * PERIOD1_TRIPLE_PERIOD_S; length = 600))
+        # Enceladus-centred, which is the frame the altitudes are quoted in.
+        xyz = reduce(hcat, [_enc_relative(u[1:3]) for u in sol.u])
+        push!(out, (label = lbl, alt_km = alt, xyz = xyz))
+    end
+    return out
+end
+
+"""
+    plot_orbit_geometry(config; path, theme, texture, elevation, azimuth, size)
+
+The halo orbits the mission chooses between, around Enceladus with its south-polar plume.
+
+  - `config` — the scenario
+  - `path` — output path WITHOUT extension; writes `.pdf`, `.svg` and `.png`
+  - `theme` — `:light` or `:dark`; saved transparent so either background works
+  - `texture` — image to wrap the moon in; `nothing` draws a plain sphere
+  - `elevation`, `azimuth` — camera angles (radians). Negative elevation looks up at the
+    south pole, which is where the plume and every periapsis are
+  - `inset` — add a periapsis-region panel. The bands differ by ~23 km on a ~1200 km orbit,
+    so at a scale that shows the orbit they overlap and the inset is what makes the
+    altitude separation visible
+
+Returns the Makie `Figure`. Requires CairoMakie to be loaded by the caller.
+
+Shows why the decision problem exists: the science bands are separate orbits at different
+periapsis altitudes over the south pole, the plume is densest low down, and the nominal
+stationkeeping orbit sits outside every band, so sampling requires leaving it.
+"""
+function plot_orbit_geometry(config::StationkeepingPOMDP = StationkeepingPOMDP();
+                             path::AbstractString = "figures/orbit_geometry",
+                             theme::Symbol = :light,
+                             texture = nothing,
+                             elevation::Real = 0.12,
+                             azimuth::Real = 1.15,
+                             inset::Bool = true,
+                             orbits = nothing,
+                             size::Tuple{Int,Int} = (560, 480))
+    Makie = get(Base.loaded_modules,
+                Base.PkgId(Base.UUID("13f3f980-e62b-5c42-98c6-ff1f3baf88f0"), "CairoMakie"),
+                nothing)
+    Makie === nothing && error(
+        "plot_orbit_geometry needs CairoMakie loaded by the caller: `using CairoMakie` " *
+        "before calling. The library declares no plotting dependency.")
+
+    orb = orbits === nothing ? band_orbits(config) : orbits
+    fg = theme === :dark ? Makie.RGBf(0.92, 0.92, 0.92) : Makie.RGBf(0.10, 0.10, 0.10)
+    # Nominal in grey, bands warm-to-cool by depth so the lowest reads as the "deepest".
+    COL = Dict("Nominal" => Makie.RGBf(0.45, 0.45, 0.45),
+               "HIGH"    => Makie.RGBf(0.93, 0.47, 0.20),
+               "MID"     => Makie.RGBf(0.13, 0.53, 0.20),
+               "LOW"     => Makie.RGBf(0.27, 0.47, 0.67))
+
+    fig = Makie.Figure(; size = size, backgroundcolor = :transparent,
+                       figure_padding = (2, 4, 2, 2),
+                       fonts = (; regular = "CMU Serif", bold = "CMU Serif Bold"))
+    ax = Makie.Axis3(fig[1, 1]; aspect = :data,
+                     xlabel = "x (km)", ylabel = "y (km)", zlabel = "z (km)",
+                     elevation = elevation, azimuth = azimuth,
+                     backgroundcolor = :transparent,
+                     xlabelcolor = fg, ylabelcolor = fg, zlabelcolor = fg,
+                     xticklabelcolor = fg, yticklabelcolor = fg, zticklabelcolor = fg,
+                     xgridcolor = (fg, 0.12), ygridcolor = (fg, 0.12),
+                     zgridcolor = (fg, 0.12),
+                     xspinecolor_1 = (fg, 0.3), yspinecolor_1 = (fg, 0.3),
+                     zspinecolor_1 = (fg, 0.3))
+
+    # Enceladus. A textured sphere when an image is supplied; the UV sphere is built
+    # explicitly because the default `Sphere` primitive carries no texture coordinates.
+    nu, nv = 72, 36
+    θs = range(0, 2pi; length = nu)
+    φs = range(0, pi; length = nv)
+    X = [R_ENCELADUS * cos(θ) * sin(φ) for θ in θs, φ in φs]
+    Y = [R_ENCELADUS * sin(θ) * sin(φ) for θ in θs, φ in φs]
+    Z = [R_ENCELADUS * cos(φ) for θ in θs, φ in φs]
+    if texture === nothing
+        Makie.surface!(ax, X, Y, Z; color = fill(Makie.RGBAf(0.72, 0.74, 0.78, 0.92),
+                                                 nu, nv), shading = Makie.NoShading)
+    else
+        Makie.surface!(ax, X, Y, Z; color = texture, shading = Makie.NoShading,
+                       transparency = true, alpha = 0.95)
+    end
+
+    # South-polar plume, as a translucent cone. Illustrative geometry, not a measured
+    # density profile — Cassini transits do not resolve yield against altitude here.
+    pu, pv = 40, 24
+    ph = range(0, 120.0; length = pv)
+    pθ = range(0, 2pi; length = pu)
+    PX = [0.45 * h * cos(t) for t in pθ, h in ph]
+    PY = [0.45 * h * sin(t) for t in pθ, h in ph]
+    PZ = [-R_ENCELADUS - h for t in pθ, h in ph]
+    Makie.surface!(ax, PX, PY, PZ;
+                   color = [Makie.RGBAf(0.55, 0.75, 0.95, 0.30 * (1 - h / 130))
+                            for t in pθ, h in ph],
+                   shading = Makie.NoShading, transparency = true)
+
+    for o in orb
+        c = get(COL, o.label, fg)
+        Makie.lines!(ax, o.xyz[1, :], o.xyz[2, :], o.xyz[3, :];
+                     color = c, linewidth = o.label == "Nominal" ? 2.4 : 1.8,
+                     linestyle = o.label == "Nominal" ? :dash : :solid,
+                     label = "$(o.label) ($(round(o.alt_km; digits = 1)) km)")
+    end
+
+    # Periapsis zoom. The whole point of the science bands is a ~23 km spread on a
+    # ~1200 km orbit, which is invisible at the scale that shows the orbit.
+    if inset
+        ax2 = Makie.Axis(fig[1, 2];
+                         xlabel = "Cross-track (km)", ylabel = "Altitude (km)",
+                         title = "Periapsis, south pole", titlesize = 10,
+                         backgroundcolor = :transparent,
+                         titlecolor = fg, xlabelcolor = fg, ylabelcolor = fg,
+                         xticklabelcolor = fg, yticklabelcolor = fg,
+                         leftspinecolor = fg, bottomspinecolor = fg,
+                         topspinevisible = false, rightspinevisible = false,
+                         xtickcolor = fg, ytickcolor = fg, xgridvisible = false)
+        # Surface, then each band's periapsis altitude as a level.
+        Makie.hlines!(ax2, [0.0]; color = (fg, 0.7), linewidth = 1.5)
+        Makie.band!(ax2, [-60.0, 60.0], [-14.0, -14.0], [0.0, 0.0];
+                    color = (Makie.RGBf(0.72, 0.74, 0.78), 0.9))
+        Makie.text!(ax2, 0.0, -8.0; text = "Enceladus", color = fg, fontsize = 8,
+                    align = (:center, :center))
+        for o in orb
+            c = get(COL, o.label, fg)
+            Makie.hlines!(ax2, [o.alt_km]; color = c, linewidth = 2,
+                          linestyle = o.label == "Nominal" ? :dash : :solid)
+            Makie.text!(ax2, -56.0, o.alt_km + 1.2; text = o.label, color = c,
+                        fontsize = 9, align = (:left, :bottom))
+        end
+        # Plume density falling off with altitude, as a shaded wedge.
+        Makie.band!(ax2, [-60.0, 60.0], [0.0, 0.0], [55.0, 55.0];
+                    color = (Makie.RGBf(0.55, 0.75, 0.95), 0.10))
+        Makie.xlims!(ax2, -60, 60); Makie.ylims!(ax2, -16, 56)
+        Makie.colsize!(fig.layout, 2, Makie.Relative(0.34))
+    end
+
+    Makie.Legend(fig[2, 1:(inset ? 2 : 1)], ax; framevisible = false, labelcolor = fg,
+                 labelsize = 11, patchsize = (18.0f0, 8.0f0),
+                 orientation = :horizontal, nbanks = 2,
+                 tellheight = true, tellwidth = false)
 
     mkpath(dirname(path))
     for ext in ("pdf", "svg", "png")

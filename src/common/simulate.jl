@@ -784,6 +784,14 @@ function run_rollout(
     rtol_truth::Real = RTOL_TRUTH,
     atol_truth::Real = ATOL_TRUTH,
     max_steps::Integer = 2000,
+    # Points per coast arc to record, for figures that draw the flown geometry. 0 stores
+    # nothing, which is the default: a 60-pass rollout at 80 points per arc is ~29k floats,
+    # wanted by a trajectory plot and by nothing else.
+    #
+    # NOTE: the arcs are the ONLY record of where the spacecraft actually went. The
+    # per-step `peri_pos` is one barycentre-frame point per pass, and re-propagating from a
+    # stored state cannot reproduce the path because the burns are not in it.
+    n_arc::Integer = 0,
     verbose::Bool = false,
 )
     state     = collect(float.(state0))
@@ -795,6 +803,12 @@ function run_rollout(
     n_burns      = 0
     min_peri_alt = Inf
     steps        = NamedTuple[]
+    # Per-pass flown geometry, when `n_arc > 0`. Empty otherwise, so the common path
+    # allocates nothing.
+    arcs  = NamedTuple[]
+    # The action whose burn produced the coast currently being flown. The first inbound
+    # coast is flown under no burn at all, so it carries the initial orbit's label.
+    prev_label = :INITIAL
 
     # Failed-solve bookkeeping. A non-converged solve_burn returns ΔV = 0, which is
     # INDISTINGUISHABLE from a deliberate decision not to burn — so a run whose every burn
@@ -844,6 +858,10 @@ function run_rollout(
         peri_lats_deg   = [s.peri_lat_deg for s in steps],
         max_dev_trans_km = isempty(steps) ? NaN :
             maximum(s -> isfinite(s.dev_transverse_km) ? s.dev_transverse_km : -Inf, steps),
+        # Flown geometry per pass, when `n_arc > 0` — the only record of where the
+        # spacecraft actually went. Re-propagating from a stored state cannot reproduce it,
+        # because the burns are not in that state.
+        arcs            = arcs,
         science_visits  = _controller_visits(controller),
         n_bands         = count(>(0), _controller_visits(controller)),
         n_samples       = sum(_controller_visits(controller)),
@@ -857,11 +875,12 @@ function run_rollout(
 
     while t_now < horizon_s
         length(steps) >= max_steps && return finish(:max_steps, t_now, false)
+        arc_pre = Matrix{Float64}(undef, 3, 0)
 
         # 1. Coast under TRUTH to the control shell.
         shell = _coast_to(truth_eom!, state, horizon_s - t_now,
                           _terminal_shell_callback, CONTROL_ALT_KM;
-                          rtol = rtol_truth, atol = atol_truth)
+                          rtol = rtol_truth, atol = atol_truth, n_arc = n_arc)
         if shell.outcome !== :ok
             shell.outcome === :crash && (min_peri_alt = min(min_peri_alt, PERIAPSIS_CRASH_ALT))
             # `:none` — never came back inbound before the horizon: survived, but idle.
@@ -869,6 +888,7 @@ function run_rollout(
             return finish(shell.outcome, t_now + shell.t, false)
         end
         t_now += shell.t
+        arc_pre = shell.arc
 
         # 2. Ask the controller for a command (ONBOARD planning only).
         #
@@ -903,7 +923,7 @@ function run_rollout(
         # 4. Coast under TRUTH past the shell to the next periapsis (re-arms the trigger).
         peri = _coast_to(truth_eom!, state_post, horizon_s - t_now,
                           _terminal_periapsis_callback_arg, nothing;
-                          rtol = rtol_truth, atol = atol_truth)
+                          rtol = rtol_truth, atol = atol_truth, n_arc = n_arc)
         if peri.outcome !== :ok
             peri.outcome === :crash && (min_peri_alt = min(min_peri_alt, PERIAPSIS_CRASH_ALT))
             # Record the step that led to the loss before returning.
@@ -926,6 +946,19 @@ function run_rollout(
         end
         t_now += peri.t
         state  = copy(peri.u)
+        # The flown geometry, as TWO arcs per pass rather than one.
+        #
+        # NOTE: the inbound coast to the shell was flown under the PREVIOUS pass's burn, so
+        # it belongs to that action, not this one. Concatenating the two and labelling the
+        # result with this pass's action mis-attributes half of every pass — visible as an
+        # arc whose two halves disagree in colour.
+        if n_arc > 0
+            size(arc_pre, 2) > 0 &&
+                push!(arcs, (action = prev_label, phase = :inbound, xyz = arc_pre))
+            size(peri.arc, 2) > 0 &&
+                push!(arcs, (action = label, phase = :outbound, xyz = peri.arc))
+            prev_label = label
+        end
 
         # 5. Measure, and let the controller update its internal state.
         min_peri_alt = min(min_peri_alt, altitude(state))
@@ -987,14 +1020,15 @@ place the three-way "which condition ended this leg?" dispatch is written, so bo
 baselines inherit identical crash and escape semantics.
 """
 function _coast_to(eom!, state::AbstractVector{<:Real}, horizon::Real,
-                   make_primary, arg; rtol::Real, atol::Real)
+                   make_primary, arg; rtol::Real, atol::Real,
+                   n_arc::Integer = 0)
     primary = _EventRecord()
     crash   = _EventRecord()
     esc     = _EventRecord()
 
     primary_cb = arg === nothing ? make_primary(primary) : make_primary(arg, primary)
 
-    propagate(
+    sol = propagate(
         eom!, state, (0.0, float(horizon));
         callback = CallbackSet(
             primary_cb,
@@ -1006,10 +1040,20 @@ function _coast_to(eom!, state::AbstractVector{<:Real}, horizon::Real,
 
     # Ordering matters: escape and crash are terminal failures and take precedence over a
     # primary event that may have fired at a very similar time.
-    esc.fired   && return (outcome = :escape, t = esc.t,   u = esc.u)
-    crash.fired && return (outcome = :crash,  t = crash.t, u = crash.u)
-    primary.fired && return (outcome = :ok,   t = primary.t, u = primary.u)
-    return (outcome = :none, t = float(horizon), u = Float64[])
+    out, t, u = esc.fired     ? (:escape, esc.t, esc.u) :
+                crash.fired   ? (:crash, crash.t, crash.u) :
+                primary.fired ? (:ok, primary.t, primary.u) :
+                                (:none, float(horizon), Float64[])
+
+    # The dense arc, only when asked for: sampling it costs an interpolation per point and
+    # the geometry is wanted by figures, not by the rollout itself. Sampled up to the event
+    # time rather than the horizon, so the arc ends where the coast ended.
+    arc = if n_arc <= 0 || t <= 0
+        Matrix{Float64}(undef, 3, 0)
+    else
+        reduce(hcat, [sol(τ)[1:3] for τ in range(0.0, t; length = n_arc)])
+    end
+    return (outcome = out, t = t, u = u, arc = arc)
 end
 
 """Adapter so the periapsis callback has the same `(arg, record)` shape as the shell one."""

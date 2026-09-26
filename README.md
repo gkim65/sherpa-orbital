@@ -275,15 +275,11 @@ walk shares an RNG, so `rng_seed` does not pin it.
 ```julia
 using SherpaOrbital, CairoMakie      # the caller supplies the plotting package
 
-# one run, over the horizon
-plot_baseline_comparison(["POMDP" => res_pomdp, "MPC hold" => res_mpc], config;
-                         path = "figures/baselines")
-
-# a sweep: metrics against the swept value, and per-level science timelines
 rows = load_sweep("artifacts/sweeps/sigma_nav_km")
 plot_sweep(rows, :sigma_nav_km; path = "figures/nav_sweep",
-           xlabel = "Navigation error σ (km)")
-plot_sweep_timelines(rows, :sigma_nav_km; path = "figures/nav_timelines")
+           xlabel = "Navigation noise σ (km)")
+plot_action_bands(rows, :sigma_nav_km; path = "figures/actions",
+                  values = (0.0, 0.05, 0.1), label = "σ", unit = "km")
 ```
 
 All write PDF, SVG and PNG, transparent, with a `theme = :dark` option. Science and risk are
@@ -295,7 +291,16 @@ science_trace(res, config)    # (t_days, cumulative)
 damage_trace(res)             # residual, level, n_degraded, frac_degraded, lost_day
 delivery_trace(res, config)   # commanded vs. achieved periapsis, per excursion
 sweep_summary(rows, :sigma_nav_km)
+action_bands(rows, :sigma_nav_km, 0.1)   # fraction choosing each action, per pass
 ```
+
+3D trajectory views are drawn in Python, from arcs exported by
+`experiments/export_arcs.jl`. CairoMakie has no depth buffer, so a surface cannot occlude a
+line behind it, and any alpha below 1 on a surface emits a PDF soft mask per quad — 2.3 MB
+for one moon against matplotlib's 204 KB. The 2D figures stay in Julia.
+
+**See [FIGURES.md](FIGURES.md)** for the exact commands behind each paper figure, including
+which sweep has to exist first.
 
 ## Repository layout
 

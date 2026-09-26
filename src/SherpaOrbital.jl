@@ -194,6 +194,8 @@ export
     plot_sweep_timelines,
     action_bands,
     plot_action_bands,
+    band_orbits,
+    plot_orbit_geometry,
     # per-rollout checkpointing — written as each rollout completes, so a killed sweep
     # keeps what it flew and resumes from disk
     cell_dir,
