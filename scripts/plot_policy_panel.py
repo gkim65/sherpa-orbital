@@ -481,7 +481,20 @@ def main() -> None:
                               args.context_azim, args.context_span, None, 1.0,
                               inset_box=args.span_km)
         fig.canvas.draw()
-        right_edge = max(right_edge, ink.x1, _ink_bbox(fig, axc).x1)
+        inkc = _ink_bbox(fig, axc)
+        right_edge = max(right_edge, ink.x1, inkc.x1)
+
+        if k == n - 1:
+            # Same boxed treatment as the level labels, so the two kinds of annotation
+            # read as one family. `dx` nudges a label off its ink centre: mplot3d leaves
+            # asymmetric dead margin, so the drawn orbit does not sit centred in its
+            # measured extent.
+            for bb, text, dx in ((ink, "Periapsis (zoom)", 0.0),
+                                 (inkc, "3D orbit", -0.012)):
+                fig.text(0.5 * (bb.x0 + bb.x1) + dx, row.y0 - 0.055, text,
+                         ha="center", va="top", fontsize=FONT_BASE - 1.0,
+                         bbox=dict(boxstyle="round,pad=0.42", facecolor="0.91",
+                                   edgecolor="0.72", linewidth=0.6))
 
     FIG_DIR.mkdir(exist_ok=True)
     for ext in ("pdf", "svg", "png"):
