@@ -401,15 +401,17 @@ function plot_sweep(rows, key::Symbol;
                Makie.RGBf(0.00, 0.62, 0.45), Makie.RGBf(0.80, 0.47, 0.65),
                Makie.RGBf(0.84, 0.37, 0.00), Makie.RGBf(0.35, 0.35, 0.35),
                Makie.RGBf(0.58, 0.44, 0.86), Makie.RGBf(0.00, 0.62, 0.79)]
-    LABEL = Dict(:science => "Science reward\n(mean, std)",
-                 :frac_degraded => "Fraction of passes\ndegraded",
+    # One line each: at this panel height a wrapped label eats horizontal space the axes
+    # need, and every one of these fits on a single line.
+    LABEL = Dict(:science => "Science reward",
+                 :frac_degraded => "Degraded passes",
                  :survival => "Survival rate", :misbin => "Region misbin rate",
                  :dv => "Total dV (m/s)", :samples => "Samples banked",
-                 :days_mean => "Mean survival\n(days)",
-                 :days_median => "Median survival\n(days)",
-                 :days_failed => "Days to failure\n(median, failed runs)",
-                 :days_failed_mean => "Days to failure\n(mean, failed runs)",
-                 :science_survivors => "Science reward,\nsurviving runs (std)")
+                 :days_mean => "Survival (days)",
+                 :days_median => "Median survival (days)",
+                 :days_failed => "Days to failure",
+                 :days_failed_mean => "Days to failure",
+                 :science_survivors => "Science reward")
 
     fig = Makie.Figure(; size = size, backgroundcolor = :transparent,
                        # Tight: the default 16pt margin is visible whitespace once the
@@ -835,10 +837,10 @@ function plot_sweep_bars(rows, key::Symbol;
                Makie.RGBf(0.00, 0.62, 0.45), Makie.RGBf(0.80, 0.47, 0.65),
                Makie.RGBf(0.84, 0.37, 0.00), Makie.RGBf(0.35, 0.35, 0.35),
                Makie.RGBf(0.58, 0.44, 0.86), Makie.RGBf(0.00, 0.62, 0.79)]
-    LABEL = Dict(:science_survivors => "Science reward\n(surviving runs)",
+    LABEL = Dict(:science_survivors => "Science reward",
                  :science => "Science reward", :survival => "Survival rate",
-                 :frac_degraded => "Fraction of passes\ndegraded",
-                 :dv => "Total dV (m/s)", :days_mean => "Mean survival\n(days)")
+                 :frac_degraded => "Degraded passes",
+                 :dv => "Total dV (m/s)", :days_mean => "Survival (days)")
 
     n_arm = length(draw)
     figsize = size === nothing ? (170 * length(vals) + 210, 200 * length(panels) + 60) : size
