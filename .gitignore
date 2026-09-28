@@ -15,9 +15,15 @@
 *.pdf
 
 # ── Generated figure outputs (regenerate via the plotting scripts) ────────────
+# Scoped to where renders land rather than a blanket *.png: committed doc assets live in
+# doc/, and a blanket rule cannot be un-ignored by a later negation.
 figures/
-*.png
-*.svg
+artifacts/**/*.png
+artifacts/**/*.svg
+scratch/**/*.png
+scratch/**/*.svg
+# Output of legacy/russell-lara/reproduce_rl_fig9.py, written beside the script.
+legacy/**/*.png
 
 # ── Docs / session logs ───────────────────────────────────────────────────────
 # Working notes stay LOCAL. Do not commit docs unless explicitly asked.

@@ -1,5 +1,7 @@
 # Regenerating the figures
 
+See [GUIDE.md](GUIDE.md) for the model itself and [README.md](README.md) for installation.
+
 Every figure is derived from a sweep's per-rollout checkpoints, so reproducing one means
 reproducing the sweep that fed it. Nothing here needs a solver rerun if the artifacts are
 already on disk.
