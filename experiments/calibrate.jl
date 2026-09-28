@@ -7,13 +7,11 @@ The artifact path FOLLOWS the config (`tables_path_for`): noise-free writes `tab
 `sigma_pct = 2.0` writes `tables_noisy_gaussian2.0.json`. So a noisy run never clobbers the
 noise-free kernels, and each noise level gets its own file for a sweep.
 
-This is the generator for `artifacts/tables.json`. Before 2026-08-30 that artifact held
-hand-transcribed numbers and this step did not exist, so the committed kernels could drift
-from the run that produced them with nothing to detect it. Run this whenever the state
-space, the bands, the orbit, or the truth model changes — the kernels are conditional on
-all four.
+This is the generator for `artifacts/tables.json`. The committed kernels are measured, not
+transcribed, and carry their own provenance in `meta`. Run this whenever the state space,
+the bands, the orbit, or the truth model changes — the kernels are conditional on all four.
 
-⚠️ `-t auto` MATTERS. The action tree is threaded (see `tree_walk!`); single-threaded it
+NOTE: `-t auto` matters. The action tree is threaded (see `tree_walk!`); single-threaded it
 still works, just several times slower (measured at depth 7: 181 s threaded, 364 s serial).
 
 NOTE: the two give BIT-IDENTICAL output only for a NOISE-FREE config. Under
@@ -22,7 +20,7 @@ pin the artifact and successive runs disagree about which rows are measured — 
 reproducibility NOTE on `tree_walk!`. Use `-t 1` for a noisy artifact meant to be
 reproduced.
 
-⚠️ THE DEPTH IS AN ARGUMENT, so exploring it never needs a throwaway script. It used to be
+NOTE: the depth is an argument, so exploring it never needs a throwaway script. It used to be
 reachable only by editing `CALIBRATION_EFFORT`, which is why depth experiments kept getting
 run from `scratch/` — and those scripts do not call `write_tables`, so the measurement was
 thrown away every time. Pass the depth here and the artifact is always written.
@@ -65,7 +63,7 @@ println("  writes         : ", tables_path_for(config))
 println("  tree depth     : ", tree_depth, "   threads: ", Threads.nthreads())
 println()
 
-# ⚠️ THE CONFIG IS THE ONLY SOURCE OF θ (2026-08-31). This used to hand-map `alt_edges` /
+# NOTE: the config is the only source of θ. This used to hand-map `alt_edges` /
 # `band_names` / `band_target_km` across one by one, against `calibrate_tables` defaults
 # that silently DISAGREED with the struct's — so forgetting one argument measured kernels
 # keyed to the wrong bins with no error. Effort knobs come from `CALIBRATION_EFFORT`.
@@ -191,7 +189,7 @@ validate_tables(tables)
 
 unmeasured = tables.meta["unmeasured_rows"]
 if !isempty(unmeasured)
-    println("\n⚠️  ", length(unmeasured), " row(s) UNMEASURED and filled: ",
+    println("\nNOTE: ", length(unmeasured), " row(s) unmeasured and filled: ",
             join(unmeasured, ", "))
     println("    The policy's behaviour in those bins is not supported by measurement.")
 end

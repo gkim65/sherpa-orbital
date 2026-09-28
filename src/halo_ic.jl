@@ -975,9 +975,9 @@ function characterise_orbit(ic::AbstractVector{<:Real}, period_s::Real; verbose:
         @printf("  Periapsis lon  : %+.3f deg\n", peri_lon)
         peri_ok = PERIAPSIS_ALT_MIN <= peri_alt <= PERIAPSIS_ALT_MAX
         apo_ok  = APOAPSIS_ALT_MIN  <= apo_alt  <= APOAPSIS_ALT_MAX
-        println("  Periapsis OK   : ", peri_ok ? "✓" : "✗")
-        println("  Apoapsis OK    : ", apo_ok  ? "✓" : "✗")
-        println("  Hemisphere OK  : ", peri_lat < 0 ? "✓" : "✗")
+        println("  Periapsis OK   : ", peri_ok ? "yes" : "NO")
+        println("  Apoapsis OK    : ", apo_ok  ? "yes" : "NO")
+        println("  Hemisphere OK  : ", peri_lat < 0 ? "yes" : "NO")
     end
 
     return (

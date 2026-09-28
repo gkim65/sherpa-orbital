@@ -99,8 +99,8 @@ function _bin_sample_alts(bin::Symbol, e::NTuple{4,<:Real}, n::Integer)
     elseif bin === :A34_44
         (e[3], e[4])
     else
-        # ABOVE_44 is open-ended but NOT holdable far above ~46 km (55 and 60 km escape by
-        # pass 3, measured 2026-08-30), so spread over a narrow survivable window.
+        # ABOVE_44 is open-ended but NOT holdable far above ~46 km — 55 and 60 km escape by
+        # pass 3 — so departures spread over a narrow survivable window.
         (e[4] + 0.5, 48.0)
     end
     inset = 0.15 * (hi - lo)
@@ -760,9 +760,8 @@ function calibrate_tables(;
     tree_passes, tree_nodes = tree_stats.passes, tree_stats.nodes
 
     # ── PRIMARY WALKS from the nominal limit cycle, one per action ─────────────
-    # CORRECT goes through the SAME walker as the excursions now. `n_steps` is its pass
-    # budget (it used to be the length of a single sustained loop); with restarts it is
-    # spread over many fresh departures instead, exactly as the EXCURSE budget is.
+    # CORRECT goes through the SAME walker as the excursions. `n_steps` is its pass budget,
+    # spread over many fresh departures via restarts, exactly as the EXCURSE budget is.
     action_walk!(:CORRECT, copy(base), n_steps;
                  mode_ = mode, rp = collect(r_peri_nom), ra = collect(r_apo_nom))
 
@@ -774,7 +773,7 @@ function calibrate_tables(;
             verbose && @info "excurse: no family member at $(target) km for $band — skipped"
             continue
         end
-        # `:altitude_position` (2026-08-30): the periapsis is commanded as an ALTITUDE, so
+        # Under `:altitude_position` the periapsis is commanded as an ALTITUDE, so
         # the family member's role is only to confirm the band is a realisable orbit — the
         # radius no longer has to be smuggled in through a scaled position vector, and the
         # phase-matching problem noted at the top of this file does not arise for the
@@ -962,7 +961,7 @@ function tables_from_rows(rows::Dict{Symbol,Dict{KernelKey,CalibrationRow}},
     unmeasured = String[]
 
     # Whatever action keys `calibrate_tables` produced — `:CORRECT` plus one
-    # `:EXCURSE_<BAND>` per band as of 2026-08-30 (previously a single pooled `:EXCURSE`).
+    # `:EXCURSE_<BAND>` per band.
     for a in sort(collect(keys(rows)))
         kernels[a] = Dict{KernelKey,Vector{Float64}}()
         trials[string(a)] = Dict{String,Int}()
@@ -1021,9 +1020,8 @@ function tables_from_rows(rows::Dict{Symbol,Dict{KernelKey,CalibrationRow}},
             "Noise-free unless the run was configured otherwise, so any survival number " *
             "derived from these kernels is an UPPER BOUND, not feasibility.",
             "Rows are conditioned on the RESIDUAL (orbit-damage) bin as well as the " *
-            "altitude bin, so the row count is 3x what it was before 2026-08-31 and the " *
-            "SAME trial budget is spread across all of them. Expect thinner rows; check " *
-            "meta.trials rather than assuming the previous counts carried over.",
+            "altitude bin, so one trial budget is spread across three times as many rows. " *
+            "Expect thin rows; check meta.trials per row rather than assuming a count.",
         ],
     )
     # Split into the CORRECT kernel and the per-action EXCURSE kernels.

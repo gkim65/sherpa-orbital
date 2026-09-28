@@ -359,7 +359,7 @@ artifact before the error reaches the solver as a subtly wrong policy.
 """
 function validate_tables(tables::AltTables)
     # Flatten the two-level excurse kernel into ("excurse/ACTION", rows) pairs so every
-    # per-action row gets the same checks the pooled one used to get.
+    # per-action row gets the same checks.
     groups = Pair{String,Dict{KernelKey,Vector{Float64}}}[("correct" => tables.correct)]
     for (a, k) in tables.excurse
         push!(groups, "excurse/$a" => k)

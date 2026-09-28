@@ -160,8 +160,8 @@ function controller_setup!(c::MPCController, state0::AbstractVector, period_s::R
 
         # Retargeting path (opt-in). The reference must be a REAL family member: a radially
         # scaled apse vector is not a solution of the dynamics and does not produce a
-        # holdable orbit (measured 2026-08-26 — every scaled attempt escaped, two with
-        # negative periapsis). Throw rather than silently fall back to the pinned reference,
+        # holdable orbit — every scaled attempt escaped, two with negative periapsis.
+        # Throw rather than silently fall back to the pinned reference,
         # which would report a plausible run that ignored the command.
         # `:altitude_position` commands the periapsis ALTITUDE directly, so it needs no
         # family member for the periapsis half — the scalar target IS the command, and
@@ -219,8 +219,8 @@ model or depending on a solver.
 Per step: query the greedy action from the current belief, realize it as a commanded ΔV
 (`CORRECT` → `solve_burn` toward the nominal apses; `EXCURSE_<BAND>` → `solve_burn` toward
 that band's COMMANDED ALTITUDE via `mode = :altitude_position`), then fold a noisy altitude
-observation into the belief. Every action burns — there is no `OBSERVE` (removed
-2026-08-30; see [`actions`](@ref)).
+observation into the belief. Every action burns — there is no `OBSERVE` (see
+[`actions`](@ref)).
 
 NOTE: both onboard halves — the discrete belief filter and `solve_burn`'s CR3BP
 prediction — are onboard-only. Neither sees `truth_eom!`.
@@ -248,7 +248,7 @@ NOTE: a policy solved against waypoint dynamics and rolled out with `retarget_ba
 tests the targeting mechanism, not a matched policy — the kernels describe the behaviour the
 policy was solved against. Re-solve rather than mixing them.
 
-Coverage is banked from the OBSERVED periapsis altitude (2026-08-30), not from which action
+Coverage is banked from the OBSERVED periapsis altitude, not from which action
 was commanded — so `CORRECT` banks its own band passively and a missed excursion banks
 nothing. Counts saturate at `visit_cap`, so a revisit keeps paying until the cap.
 """
@@ -281,7 +281,7 @@ mutable struct SARSOPController <: AbstractController
     # from truth. NOTE: the measured kernels were calibrated planning from truth, so a
     # nonzero value here is a model mismatch for this arm until they are re-measured.
     nav_sigma_km::Float64
-    # Band-retargeting toggle. `false` (default) = the pre-2026-08-29 waypoint behaviour.
+    # Band-retargeting toggle. `false` (the default) is the waypoint behaviour.
     retarget_bands::Bool
     family_table::Union{Nothing,Vector{NamedTuple}}
     # Live state.
@@ -342,13 +342,13 @@ function SARSOPController(policy_data::AbstractDict;
 
     band_names = String.(d["band_names"])
 
-    # The residual dimension is REQUIRED (2026-08-31). A policy artifact without it was
+    # The residual dimension is REQUIRED. A policy artifact without it was
     # solved against a state space that cannot represent orbit damage, so rolling it out
     # here would silently index the wrong states. Reject rather than default, for the same
     # reason `load_policy` rejects a stale action set.
     haskey(d, "state_residual") || error(
         "this policy artifact has no \"state_residual\" — it was solved against the " *
-        "PRE-2026-08-31 state space, which carries no orbit-damage dimension. Re-solve " *
+        "an older state space that carries no orbit-damage dimension. Re-solve " *
         "(experiments/calibrate.jl, then experiments/example.jl) rather than rolling it out.")
 
     return SARSOPController(
@@ -1226,8 +1226,8 @@ end
 """
     simulate(args...; kwargs...)
 
-Deprecated alias for [`run_rollout`](@ref). Renamed 2026-08-31 because `POMDPs.simulate`
-exists and the collision breaks any consumer doing `using POMDPs` alongside
+Deprecated alias for [`run_rollout`](@ref). Renamed because `POMDPs.simulate` exists and
+the collision breaks any consumer doing `using POMDPs` alongside
 `using SherpaOrbital`. Not exported; use [`run_rollout`](@ref) in new code.
 """
 simulate(args...; kwargs...) = run_rollout(args...; kwargs...)

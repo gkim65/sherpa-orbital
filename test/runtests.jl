@@ -32,12 +32,10 @@ end
 
     # MODEL-LAYER INVARIANTS ONLY.
     #
-    # The pinning tests that used to live here (|S| == 26, size(T) == (26,5,26), an exact
-    # action-list equality) were deliberately DROPPED on 2026-08-30. They asserted the
-    # current shape, so they broke on every redesign while catching nothing — the state
-    # space changing is the intended edit, not a regression. What remains are properties
-    # that stay true across redesigns and whose violation is SILENT: a malformed kernel
-    # produces a confidently wrong policy with no error anywhere.
+    # These assert PROPERTIES, not shapes. A test pinning |S| or an exact action list
+    # breaks on every intended redesign while catching nothing; what earns a test here is a
+    # violation that would be silent, because a malformed kernel produces a confidently
+    # wrong policy with no error anywhere.
     @maybe_testset "T and O are valid distributions" begin
         T, O = model_tables(CFG)
         S = SherpaOrbital.states(CFG)
@@ -105,9 +103,8 @@ end
         @test length(visit_tuples(CFG)) == SherpaOrbital.n_visit_combos(CFG)
     end
 
-    # Science is now EXPECTED over T and keyed on the SUCCESSOR's visit count, not on the
-    # action. This is the subtlest change in the 2026-08-30 redesign: get it wrong and the
-    # policy is quietly miscalibrated rather than broken.
+    # Science is an EXPECTATION over T, keyed on the SUCCESSOR's visit count rather than on
+    # the action. Get this wrong and the policy is quietly miscalibrated rather than broken.
     @maybe_testset "rewards" begin
         T, _ = model_tables(CFG)
         r    = SherpaOrbital.reward_function(CFG, T)
@@ -127,11 +124,11 @@ end
         # OBSERVE to be indifferent), so a positive weight must strictly lower every
         # action's reward relative to a zero weight.
         #
-        # ⚠️ BOTH WEIGHTS ARE NOW EXPLICIT. `fuel_weight` defaults to 0.0 as of 2026-08-30
-        # (the study is science yield, not fuel feasibility), so comparing against `CFG`
-        # would compare zero to zero and assert `>` on four equal numbers. The fuel
-        # machinery is intact and this test is what proves it — it must not silently pass
-        # by both sides being unweighted.
+        # NOTE: both weights are set explicitly. `fuel_weight` defaults to 0.0 (the study
+        # is science yield, not fuel feasibility), so comparing against the default config
+        # would compare zero to zero and assert `>` on four equal numbers. This test is
+        # what proves the fuel machinery is intact, so it must not pass by both sides
+        # being unweighted.
         cfg0 = StationkeepingPOMDP(; fuel_weight = 0.0)
         cfgF = StationkeepingPOMDP(; fuel_weight = 1.0)
         r0   = SherpaOrbital.reward_function(cfg0, model_tables(cfg0)[1])
@@ -157,11 +154,10 @@ end
         # Rising θ tilts DEEPER bins toward high intensity and shallower ones away from it.
         # Bands are (LOW, MID, HIGH) so band 1 is the deepest band, band 3 the shallowest.
         #
-        # ⚠️ DEPTH IS NORMALIZED OVER EVERY ALTITUDE BIN, NOT JUST THE BANDS (2026-08-31),
-        # so the LOW band is no longer depth 1.0 — `BELOW_20` sits below it and takes the
-        # 1.0 endpoint. This used to assert `depth(band 1) ≈ 1.0`, which pinned the old
-        # band-only scale and would now fail at 0.804. What must hold is the ORDERING and
-        # the endpoints of the full bin range.
+        # NOTE: depth is normalized over every altitude bin, not just the science bands, so
+        # the LOW band is not depth 1.0 — `BELOW_20` sits below it and takes the 1.0
+        # endpoint (LOW is 0.804). What must hold is the ordering and the endpoints of the
+        # full bin range.
         steep = StationkeepingPOMDP(; plume_gradient = 3.0, plume_levels = 3)
         @test plume_band_depth(steep, :BELOW_20) ≈ 1.0   # lowest bin overall
         @test plume_band_depth(steep, :ABOVE_44) ≈ 0.0   # highest bin overall
@@ -193,11 +189,10 @@ end
 
         # Intensity values are ordered and span [intensity_value_min, 1].
         #
-        # ⚠️ THE FLOOR IS NONZERO AND THAT IS THE POINT (changed 2026-08-31). This used to
-        # assert `plume_intensity_value(k5, 1) == 0.0`, which pinned a real defect: the
-        # weakest level paid NOTHING, so a weak sample in a science band scored the same as
-        # no sample, and — because `transition.jl` marked every non-band pass with level 1 —
-        # a `CORRECT` pass earned exactly zero science however the reward was tuned.
+        # NOTE: the floor is nonzero and that is the point. With a zero floor the weakest
+        # level pays nothing, so a weak sample in a science band scores the same as no
+        # sample — and because `transition.jl` marks every non-band pass with level 1, a
+        # `CORRECT` pass would earn exactly zero science however the reward was tuned.
         # Anything × 0.0 is 0.0. See `plume_intensity_value`.
         k5 = StationkeepingPOMDP(; plume_levels = 5)
         @test plume_intensity_value(k5, 1) == k5.intensity_value_min
@@ -216,8 +211,8 @@ end
         @test length(SherpaOrbital.states(k5)) == SherpaOrbital.n_states(k5)
 
         # EVERY altitude bin has a depth and an intensity distribution, not just the three
-        # science bands (2026-08-31). Sampling is passive — the spacecraft collects by
-        # flying through the plume region — so a pass outside every band still yields.
+        # science bands. Sampling is passive — the spacecraft collects by flying through the
+        # plume region — so a pass outside every band still yields.
         every = StationkeepingPOMDP()
         for bin in ALT_BINS
             d = SherpaOrbital.plume_band_depth(every, bin)
@@ -271,10 +266,10 @@ end
               r_s(SKState(:A27_34, allcap, 1), :CORRECT)
     end
 
-    # OBSERVE was REMOVED as an action on 2026-08-30 (a no-burn coast loses this orbit —
-    # see `actions`). Assert it is gone everywhere, because a stale reference would not
-    # error: `alt_kernel` would fall through to the EXCURSE kernel and quietly mis-price a
-    # coast as an excursion.
+    # There is no OBSERVE action: a no-burn coast loses this orbit (see `actions`). Assert
+    # it is absent everywhere, because a stale reference would not error — `alt_kernel`
+    # would fall through to the EXCURSE kernel and quietly mis-price a coast as an
+    # excursion.
     @maybe_testset "OBSERVE is not an action" begin
         @test :OBSERVE ∉ SherpaOrbital.actions(CFG)
         @test SherpaOrbital.n_actions(CFG) == length(SherpaOrbital.actions(CFG))
@@ -307,15 +302,14 @@ end
         tables = load_tables()
         @test validate_tables(tables)
 
-        # ⚠️ INVERTED 2026-08-30, AND THE OLD ASSERTION WAS PINNING A DEFECT. It used to
-        # require alt_kernel(:EXCURSE_LOW) == alt_kernel(:EXCURSE_HIGH), i.e. that aiming
-        # at a band does not change where you land — which makes the three EXCURSE actions
-        # identical in T and leaves nothing in the model able to steer altitude. Aiming at
-        # different bands MUST give different successor distributions.
-        # ⚠️ ROWS ARE NOW KEYED (altitude, residual) and columns are the JOINT successor
-        # (2026-08-31) — the kernel is conditioned on ORBIT DAMAGE, because keyed on
-        # altitude alone a row averages a fresh departure with a degraded one and reports
-        # P(loss) = 0 for the transition that actually loses the vehicle.
+        # Aiming at different bands MUST give different successor distributions: equal
+        # kernels would make the three EXCURSE actions identical in T and leave nothing in
+        # the model able to steer altitude.
+        #
+        # NOTE: rows are keyed (altitude, residual) and columns are the joint successor, so
+        # the kernel is conditioned on orbit damage. Keyed on altitude alone a row averages
+        # a fresh departure with a degraded one and reports P(loss) = 0 for the transition
+        # that actually loses the vehicle.
         key = SherpaOrbital.KernelKey(:A34_44, :R_OK)
         @test SherpaOrbital.alt_kernel(tables, :EXCURSE_LOW, key) !=
               SherpaOrbital.alt_kernel(tables, :EXCURSE_HIGH, key)
@@ -345,10 +339,10 @@ end
         @test build_pomdp(CFG) !== nothing
     end
 
-    # Orbit geometry. These pin the 2026-08-29 findings: the shipped IC is period-1 (not
-    # period-3) and NORTH-polar, and the z-mirror of it is the south-polar science orbit.
-    # Without the latitude assertions an IC in the wrong hemisphere is invisible — which is
-    # exactly how the north-polar orbit survived several sessions of measurement.
+    # Orbit geometry. The shipped IC is period-1 (not period-3) and NORTH-polar; its
+    # z-mirror is the south-polar science orbit. The latitude assertions matter because an
+    # IC in the wrong hemisphere is otherwise invisible: every apse altitude and period
+    # comes out identical.
     @maybe_testset "orbit geometry and hemisphere" begin
         ic_n = nondim_to_cr3bp(collect(PERIOD1_NORTH_IC_ND))
         ic_s = nondim_to_cr3bp(collect(PERIOD1_SOUTH_IC_ND))
@@ -426,7 +420,7 @@ end
         @test tbl[1].ic_nd ≈ collect(PERIOD1_SOUTH_IC_ND) atol = 1e-9
 
         # Retargeting hits a commanded altitude inside the span, to far better than the
-        # ~1 km targeting tolerance. Measured 2026-08-29: better than 0.0003 km.
+        # ~1 km targeting tolerance — measured better than 0.0003 km.
         target = 0.5 * (alts[1] + alts[end])
         m = retarget_to_altitude(tbl, target)
         @test m !== nothing
@@ -453,9 +447,8 @@ end
         tbl = halo_family_table(; n_steps = 14)
         mid = 0.5 * (tbl[1].info.periapsis_alt_km + tbl[end].info.periapsis_alt_km)
 
-        # DEFAULT IS PINNED. target_alt_km = nothing must leave the pre-2026-08-29 behaviour
-        # untouched: targets come from ref_ic and no family member is looked up. Every
-        # measurement before that date depends on this staying true.
+        # NOTE: `target_alt_km = nothing` is the pinned default — targets come from
+        # `ref_ic` and no family member is looked up. The reported MPC numbers assume it.
         c_pinned = MPCController(; ref_ic = collect(ic), mode = :position)
         @test c_pinned.target_alt_km === nothing
         SherpaOrbital.controller_setup!(c_pinned, ic, PERIOD1_TRIPLE_PERIOD_S)
@@ -510,7 +503,7 @@ end
         # ~2 km away and cannot be commanded at all.
         @test SherpaOrbital.altitude(s) ≈ 35.0 atol = 1.0
 
-        # ⚠️ `converged` is NOT the delivery test here: the apoapsis POSITION block dominates
+        # NOTE: `converged` is not the delivery test here: the apoapsis position block dominates
         # the total residual and does not clear TARGET_TOL_KM from a drifted state. That is
         # what `peri_err_km` exists to report, and conflating the two would read a working
         # excursion as a dead ΔV = 0 solve.
@@ -540,10 +533,9 @@ end
     @maybe_testset "SARSOPController retarget_bands toggle" begin
         # Skip cleanly if no COMPATIBLE policy has been exported — the toggle is structural
         # and should not make the suite depend on a solved artifact being present.
-        # ⚠️ The `state_alt` check is not redundant with `isfile`: the committed policy may
-        # predate the 2026-08-30 (alt, visits) redesign, in which case it parses fine and
-        # then fails deep inside the constructor on a missing key. A stale artifact should
-        # skip this test, not error it.
+        # NOTE: the `state_alt` check is not redundant with `isfile`. A policy artifact from
+        # an older state space parses fine and then fails deep inside the constructor on a
+        # missing key; a stale artifact should skip this test, not error it.
         _pol_ok = isfile(SherpaOrbital.DEFAULT_POLICY_PATH) &&
                   haskey(JSON.parsefile(SherpaOrbital.DEFAULT_POLICY_PATH), "state_alt")
         if !_pol_ok
@@ -552,8 +544,8 @@ end
             ic  = nondim_to_cr3bp(collect(PERIOD1_SOUTH_IC_ND))
             pol = load_policy()
 
-            # DEFAULT IS THE WAYPOINT BEHAVIOUR. Every pre-2026-08-29 SARSOP number depends
-            # on this staying the default.
+            # NOTE: the waypoint behaviour is the default, and the reported SARSOP numbers
+            # assume it.
             c_wp = SARSOPController(pol; ref_ic = collect(ic))
             @test c_wp.retarget_bands == false
             SherpaOrbital.controller_setup!(c_wp, ic, PERIOD1_TRIPLE_PERIOD_S)
