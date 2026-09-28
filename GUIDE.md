@@ -304,13 +304,7 @@ scripts/                  Python figures (matplotlib 3D; see FIGURES.md)
 artifacts/                tables*.json committed; solver output and sweeps gitignored
 test/                     runtests.jl
 doc/                      committed README assets
-legacy/                   frozen Python, deliberately not ported
 ```
-
-`legacy/` holds the pre-Julia prototypes, kept only as a provenance record: the
-`russell-lara/` scripts reproduce a published figure that validated the non-spherical
-gravity model, and `figures-reference/` holds the matplotlib versions of early figures. No
-Julia code path calls into it, and nothing in it is maintained.
 
 The library declares no solver dependency — SARSOP lives only in `experiments/Project.toml`.
 
