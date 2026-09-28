@@ -29,8 +29,10 @@ calibration cannot overwrite the noise-free `tables.json` and each σ gets its o
   - `dir` — directory holding the artifact (defaults to the packaged `artifacts/`)
 
 Returns an absolute path: `tables.json` when noise-free, else
-`tables_noisy_gaussian<sigma>.json` — e.g. `tables_noisy_gaussian2.0.json` at B-24
-Model 2, `tables_noisy_gaussian0.7.json` at Model 1.
+`tables_noisy_gaussian<sigma>.json` — e.g. `tables_noisy_gaussian0.7.json` at B-24 Model 1.
+
+Two artifacts ship with the package: `tables.json` and `tables_noisy_gaussian0.7.json`, the
+shipped thruster law. Any other sigma is measured on demand by `experiments/calibrate.jl`.
 
 Pass `dir` to keep a sweep out of the package — the artifact only has to live in
 `artifacts/` if a git-URL dependent needs to resolve it from the package cache.
