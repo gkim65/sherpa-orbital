@@ -82,14 +82,14 @@ const PERIAPSIS_CRASH_ALT = 5.0    # km  below this → terminal state
 
 # Optical navigation noise (1σ, km).
 #
-# NOTE: this is ~20x MacKenzie's predicted performance. Exhibit C-8 (p. 152) reports a
-# steady-state OD error "on the order of 300 m in position and several centimeters per
-# second in velocity" at 3σ, i.e. 1σ ≈ 0.1 km. 2.0 km is a deliberately conservative
-# stand-in, not a mission spec — sweep it for anything quoted. At the sourced 0.1 km the
-# 10 km altitude bins are essentially exactly observed rather than noisy.
+# MacKenzie's predicted performance. Exhibit C-8 (p. 152) reports a steady-state OD error
+# "on the order of 300 m in position and several centimeters per second in velocity" at 3σ,
+# i.e. 1σ ≈ 0.1 km. At this level the 10 km altitude bins are close to exactly observed, so
+# it is the optimistic end of the nav family rather than a hard case — sweep it for anything
+# quoted, and see `experiments/sweep.jl` for the axis.
 #
 # Reference: MacKenzie, S. M. et al. (2020), Enceladus Orbilander, Exhibit C-8 §C.1.
-const SIGMA_NAV_POS = 2.0          # km
+const SIGMA_NAV_POS = 0.1          # km
 
 # Optical navigation VELOCITY noise (1σ, km/s), per axis.
 #

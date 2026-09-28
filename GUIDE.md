@@ -106,9 +106,9 @@ The struct is the configuration ([src/StationkeepingPOMDP.jl](src/Stationkeeping
   * `visit_cap::Int` — samples counted per region, default `4`. \|S\| grows as `(cap+1)^3`
   * `correct_bin::Symbol` — region the `CORRECT` cycle settles in, default `:A34_44`
 * **uncertainty (sweep axes)**
-  * `sigma_nav_km::Float64` — 1σ navigation error (km), default `2.0`. Drives both the
-    observation model and planner noise. MacKenzie Exhibit C-8 implies ~0.1 km.
-    **Recalibration axis**
+  * `sigma_nav_km::Float64` — 1σ navigation error (km), default `0.1`, the performance
+    MacKenzie Exhibit C-8 projects for this mission. Drives both the observation model and
+    planner noise. **Recalibration axis**
   * `noisy_thruster::Bool` — default `true`. **Recalibration axis**
   * `thruster_sigma_pct::Float64` — 1σ burn-magnitude error (%), default `0.7` (Exhibit B-24
     Model 1; Model 2 is `2.0`). **Recalibration axis**

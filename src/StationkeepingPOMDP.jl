@@ -53,9 +53,9 @@ km/s, m/s (ΔV costs), matching the Python truth model's conventions.
   would be 9261 and needs a different encoding, not a bigger cap.
 
 # Noise hyperparameters (swept)
-- `sigma_nav_km`: 1σ Gaussian nav noise on the measured altitude (km). Deliberately
-  conservative — see `SIGMA_NAV_POS` in `constants.jl`. Drives the coverage misbin rate,
-  see `alt_bin`.
+- `sigma_nav_km`: 1σ Gaussian nav noise on the measured altitude (km). Defaults to the
+  performance MacKenzie projects for this mission (Exhibit C-8, 1σ ≈ 0.1 km); see
+  `SIGMA_NAV_POS` in `constants.jl`. Drives the coverage misbin rate, see `alt_bin`.
 - `noisy_thruster`: whether burns execute with error. `false` applies commanded ΔV exactly;
   `true` routes through `apply_dv_noisy`. NOTE: recalibration axis — changing it requires
   re-running `calibrate_tables`, unlike `sigma_nav_km`/`plume_gradient` which are analytic.
@@ -141,23 +141,23 @@ Base.@kwdef struct StationkeepingPOMDP
     correct_bin::Symbol             = :A34_44
 
     # -- noise hyperparameters (swept) ----------------------------------------
-    sigma_nav_km::Float64           = 2.0
+    sigma_nav_km::Float64           = 0.1
     # Whether calibration burns execute with error, and at what 1σ magnitude error.
     #
     # NOTE: recalibration axis — changing either forces a fresh `calibrate_tables` run, see
     # `needs_recalibration`. Noise-free is the optimistic corner of the family, not the
     # deployment environment.
     #
-    # What noise actually costs, at the default B-24 Model 2 law: survival barely moves
-    # (per-row P(lost or crashed) shifts by -0.008 to +0.104), but the successor
+    # What execution noise costs, measured at the B-24 Model 2 law (2%): survival barely
+    # moves (per-row P(lost or crashed) shifts by -0.008 to +0.104), but the successor
     # distribution moves a lot — total-variation distance exceeds 0.10 on 24 of 60 rows.
     # The mechanism is that burns stop REPAIRING the orbit, not that they crash it:
     # EXCURSE_HIGH from A34_44|R_DEGRADED arrives R_OK 100% of the time noise-free but only
-    # 40% at 2%, so damage accumulates into R_CRITICAL, where P(lost) really is ~0.7. The
-    # sharp across-the-board P(LOST) rise on record came from a since-removed uniform law.
-    # DEFAULT IS NOISY, at B-24 Model 1. Execution error is the deployment environment,
-    # not an option — noise-free is the optimistic corner of the family and is kept
-    # reachable (`noisy_thruster = false`) for the mismatch-free reference only.
+    # 40% at 2%, so damage accumulates into R_CRITICAL, where P(lost) really is ~0.7.
+    #
+    # The default is noisy, at Model 1. Execution error is the deployment environment, not
+    # an option — noise-free is kept reachable (`noisy_thruster = false`) for the
+    # mismatch-free reference only.
     noisy_thruster::Bool            = true
     # 1σ burn-magnitude error in percent. THE sweep knob for execution error: set it to
     # anything, then re-run `experiments/calibrate.jl` to measure kernels at that level.
